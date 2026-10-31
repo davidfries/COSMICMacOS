@@ -50,6 +50,8 @@ AFTER=/tmp/cosmicmac-vm-after.json
 
 # Shell fragment executed remotely. $HOME must be expanded by the remote shell.
 REMOTE_CTL="\"\$HOME/$REMOTE_BIN/cosmic-mac-ctl\" --socket \"\$HOME/Library/Application Support/cosmic/cosmic-mac-wm.sock\""
+# Synthetic key chords (Super = Command) for the keybinding phase; see examples/send-key.rs.
+REMOTE_SENDKEY="\"\$HOME/$REMOTE_BIN/send-key\""
 
 STARTED_DAEMON=0
 DAEMON_STOPPED=0
@@ -261,7 +263,7 @@ build_and_deploy() {
     if [[ -f "$ROOT/crates/cosmic-mac-wm/Cargo.toml" ]]; then
         if [[ "$BUILD" -eq 1 ]]; then
             step "build cosmic-mac-wm (host, optional)"
-            if (cd "$ROOT" && cargo build --release -p cosmic-mac-wm); then
+            if (cd "$ROOT" && cargo build --release -p cosmic-mac-wm --bins --example send-key); then
                 [[ -x "$daemon" ]] && binaries+=("$daemon")
             else
                 warn "cosmic-mac-wm did not build; continuing with the CLI only"
@@ -270,6 +272,10 @@ build_and_deploy() {
             binaries+=("$daemon")
         fi
     fi
+
+    # Synthetic key injection for the keybinding phase (built with the daemon above).
+    local sendkey="$ROOT/target/release/examples/send-key"
+    [[ -x "$sendkey" ]] && binaries+=("$sendkey")
 
     step "sign deployed binaries (best effort)"
     "$ROOT/scripts/sign.sh" --verify "${binaries[@]}" \
@@ -406,7 +412,16 @@ case "${1:-}" in
     close-test-windows)
         close_test_windows
         ;;
+    wake-display)
+        # A sleeping virtual display enumerates as zero displays (CGGetActiveDisplayList),
+        # and a daemon started then falls back to a bogus 1920x1080 work area.  Simulated
+        # user activity wakes it; vm-prep's `pmset displaysleep 0` makes this unnecessary.
+        caffeinate -u -t 3
+        sleep 2
+        ;;
     start-daemon)
+        caffeinate -u -t 3
+        sleep 2
         if [[ ! -x "$BIN/cosmic-mac-wm" ]]; then
             echo "no daemon binary at $BIN/cosmic-mac-wm" >&2
             exit 1
@@ -686,8 +701,10 @@ def tree_focus(tree, from_wid, direction):
     Walks the ancestors of `from_wid`'s leaf; at the first group whose orientation matches
     the direction's axis, the adjacent sibling is chosen and descended into on the near
     edge.  When no ancestor has a sibling, focus wraps to the opposite tree edge (only when
-    the root splits along the same axis).  Returns None when `from_wid` is not in the tree
-    (e.g. it floats) — the caller then falls back to the spatial oracle.
+    the root splits along the same axis); otherwise the direction has no neighbour and the
+    layout leaves focus where it is, so `from_wid` itself is returned.  Returns None only
+    when `from_wid` is not in the tree (e.g. it floats) — the caller then falls back to the
+    spatial oracle, exactly like `Layout::act_focus`.
     """
     if tree is None:
         return None
@@ -708,9 +725,11 @@ def tree_focus(tree, from_wid, direction):
         target = position + 1 if forward else position - 1
         if 0 <= target < len(children):
             return tree_leaf_wid(tree_descend_near(children[target], forward))
-    # No sibling at any level: wrap to the opposite edge of the root.
+    # No sibling at any level: wrap to the opposite edge of the root, but only when the
+    # root splits along this axis.  Otherwise the screen edge is not a neighbour and the
+    # focus does not move (a perpendicular direction, matching cosmic-comp).
     if tree["kind"] != "group" or tree["orientation"] != handles:
-        return None
+        return from_wid
     return tree_leaf_wid(tree_descend_edge(tree, FORWARD[OPPOSITE[direction]]))
 
 
@@ -877,6 +896,13 @@ def main():
             fail("expected active workspace %d, got %d" % (want, active[0]["index"]))
         return
 
+    if mode == "workspace-count":
+        want = int(sys.argv[2])
+        workspaces = read()
+        if len(workspaces) != want:
+            fail("expected %d workspaces, got %d" % (want, len(workspaces)))
+        return
+
     if mode == "maximized":
         tiles = visible_tiled(read())
         if len(tiles) < 2:
@@ -1035,6 +1061,11 @@ action() {
     run_remote "action: $*" "$REMOTE_CTL action $*"
 }
 
+# Post one key chord through the HID event stream and give the tap time to deliver it.
+key() {
+    run_remote "key: $*" "$REMOTE_SENDKEY $* && sleep 0.5"
+}
+
 snapshot_geometry() {
     run_remote "snapshot geometry to $BEFORE" "$REMOTE_CTL list-windows --json > $BEFORE"
 }
@@ -1051,6 +1082,7 @@ step "preflight"
 remote_assert "python3 is available in the VM" "command -v python3 >/dev/null"
 remote_assert "cosmic-mac-ctl is deployed" "test -x \"\$HOME/$REMOTE_BIN/cosmic-mac-ctl\""
 
+run_remote "wake the VM display (a sleeping display enumerates as none)" "bash $HELPER wake-display"
 run_remote "close leftover test windows" "bash $HELPER close-test-windows"
 
 if dry; then
@@ -1144,7 +1176,12 @@ assert_windows "one window is still parked on workspace 2" "visible $((COUNT - 1
 
 action workspace 2
 action move-to-workspace 1
-assert_workspaces "the empty trailing workspace 2 is removed" "workspace 1"
+# Emptying the active workspace keeps the user on it (cosmic-comp semantics); the empty
+# trailing workspace is trimmed only when the user leaves it.
+assert_workspaces "emptying the active workspace 2 keeps it active" "workspace 2"
+assert_windows "workspace 2 is empty after the move" "visible 0"
+action workspace 1
+assert_workspaces "leaving the empty workspace 2 trims it" "workspace-count 1"
 assert_windows "all windows are back on workspace 1" "visible $COUNT"
 
 action toggle-tiling
@@ -1190,6 +1227,60 @@ assert_windows "the workspace still tiles after orientation" "tiled $COUNT"
 
 action swap-window
 assert_windows "swap-window leaves a valid tiling" "tiled $COUNT"
+
+# --- keybindings: the same actions driven through the CGEventTap -----------------------------
+# The chords below are COSMIC defaults (Super = Command).  Each is verified by the effect the
+# bound action has on the layout, so a chord that the tap does not see or swallow fails the
+# assertion rather than silently passing through to the focused app.
+if remote_ok "send-key is deployed" "test -x \"\$HOME/$REMOTE_BIN/send-key\""; then
+    step "keybindings via the event tap"
+    key Super+y
+    assert_windows "Super+Y (ToggleTiling) floats the workspace" "floating $COUNT"
+    key Super+y
+    assert_windows "Super+Y again re-tiles the workspace" "tiled $COUNT"
+
+    key Super+s
+    assert_windows "Super+S (ToggleStacking) forms a stack" "stacked"
+    screenshot "vm-test-07-key-stack"
+    key Super+s
+    assert_windows "Super+S again unstacks" "unstacked"
+    assert_windows "windows tile again after the key-driven unstack" "tiled $COUNT"
+
+    key Super+2
+    assert_workspaces "Super+2 switches to workspace 2" "workspace 2"
+    assert_windows "workspace 2 shows no test windows" "visible 0"
+    key Super+1
+    assert_workspaces "Super+1 switches back to workspace 1" "workspace 1"
+    assert_windows "windows are visible again on workspace 1" "visible $COUNT"
+
+    key Super+Shift+2
+    assert_workspaces "Super+Shift+2 (MoveToWorkspace) does not follow the window" "workspace 1"
+    assert_windows "Super+Shift+2 moved one window away" "visible $((COUNT - 1))"
+    key Super+2
+    key Super+Shift+1
+    assert_workspaces "Super+Shift+1 empties workspace 2 but stays on it" "workspace 2"
+    key Super+1
+    assert_workspaces "Super+1 leaves and trims the empty workspace 2" "workspace-count 1"
+    assert_windows "all windows are back on workspace 1" "visible $COUNT"
+
+    snapshot_focus
+    key Super+Left
+    assert_windows "Super+Left (Focus) picks the window the oracle expects" \
+        "focus-leftmost $FOCUS_BEFORE $FOCUS_TREE"
+    snapshot_focus
+    key Super+Right
+    assert_windows "Super+Right (Focus) picks the window the oracle expects" \
+        "focus-rightmost $FOCUS_BEFORE $FOCUS_TREE"
+
+    key Super+m
+    assert_windows "Super+M (Maximize) fills the work area" "maximized"
+    key Super+m
+    assert_windows "Super+M again restores the tiling" "tiled $COUNT"
+    # Super+Q is deliberately not exercised here: if the tap missed it, Cmd+Q would reach
+    # the single-document TextEdit instance and quit it, which looks identical to Close.
+else
+    warn "send-key is not deployed; skipping the keybinding phase"
+fi
 
 action focus left
 action close

@@ -58,7 +58,9 @@ BINARIES=()
 for candidate in \
     "$ROOT/target/release/examples/ax-status" \
     "$ROOT/target/release/examples/spike-b" \
-    "$ROOT/target/release/examples/spike-c"; do
+    "$ROOT/target/release/examples/spike-c" \
+    "$ROOT/target/release/examples/send-key" \
+    "$ROOT/target/release/examples/socket-probe"; do
     [[ -f "$candidate" ]] && BINARIES+=("$candidate")
 done
 while IFS= read -r candidate; do
