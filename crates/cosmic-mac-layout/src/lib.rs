@@ -250,6 +250,7 @@ impl Layout {
             &workspace.tree,
             root,
             &frames.nodes,
+            &frames.all,
             &self.infos,
         ))
     }
@@ -640,6 +641,7 @@ impl Layout {
             &self.workspaces[index].tree,
             self.work_area,
             self.config.gaps,
+            &self.infos,
         );
         self.workspaces[index].tree.resize_node(
             node,
@@ -683,6 +685,7 @@ impl Layout {
                 &self.workspaces[index].tree,
                 self.work_area,
                 self.config.gaps,
+                &self.infos,
             );
             let wids = self.workspaces[index].tree.windows_in_order();
             for wid in wids {
@@ -756,9 +759,14 @@ impl Layout {
         if workspace.tree.node_for_window(wid).is_none() {
             return;
         }
-        let geometry = geometry::compute(&workspace.tree, self.work_area, self.config.gaps);
+        let geometry = geometry::compute(
+            &workspace.tree,
+            self.work_area,
+            self.config.gaps,
+            &self.infos,
+        );
         let frame = if let Some((stack_id, _)) = workspace.tree.stack_containing(wid) {
-            geometry.nodes.get(&stack_id).copied()
+            geometry.stacks.get(&stack_id).copied()
         } else {
             geometry.frames.get(&wid).copied()
         }
@@ -1119,6 +1127,7 @@ impl Layout {
                         &self.workspaces[index].tree,
                         self.work_area,
                         self.config.gaps,
+                        &self.infos,
                     );
                     geometry
                         .nodes
@@ -1139,7 +1148,12 @@ impl Layout {
 
     fn workspace_frames(&self, index: usize) -> WorkspaceFrames {
         let workspace = &self.workspaces[index];
-        let geometry = geometry::compute(&workspace.tree, self.work_area, self.config.gaps);
+        let geometry = geometry::compute(
+            &workspace.tree,
+            self.work_area,
+            self.config.gaps,
+            &self.infos,
+        );
         let mut visible = geometry.frames;
         let mut all = visible.clone();
         for (stack_id, frame) in &geometry.stacks {
@@ -1378,17 +1392,18 @@ fn snapshot_node(
     tree: &Tree,
     id: NodeId,
     nodes: &BTreeMap<NodeId, Rect>,
+    frames: &BTreeMap<WindowId, Rect>,
     infos: &BTreeMap<WindowId, ToplevelInfo>,
 ) -> TreeNode {
-    let frame = nodes.get(&id).copied().unwrap_or(Rect::ZERO);
+    let tile = nodes.get(&id).copied().unwrap_or(Rect::ZERO);
     match tree.kind(id) {
         NodeKind::Group(group) => TreeNode::Group {
             orientation: group.orientation,
-            frame,
+            frame: tile,
             children: group
                 .children
                 .iter()
-                .map(|child| snapshot_node(tree, *child, nodes, infos))
+                .map(|child| snapshot_node(tree, *child, nodes, frames, infos))
                 .collect(),
         },
         NodeKind::Window(wid) => TreeNode::Window {
@@ -1397,10 +1412,13 @@ fn snapshot_node(
                 .get(wid)
                 .map(|info| info.title.clone())
                 .unwrap_or_default(),
-            frame,
+            frame: frames.get(wid).copied().unwrap_or(tile),
         },
         NodeKind::Stack(stack) => TreeNode::Stack {
-            frame,
+            frame: stack
+                .active_window()
+                .and_then(|wid| frames.get(&wid).copied())
+                .unwrap_or(tile),
             active: stack.active,
             tabs: tabs_for(stack, infos),
         },

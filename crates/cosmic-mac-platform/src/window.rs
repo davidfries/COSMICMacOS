@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::Retained;
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
@@ -25,8 +25,9 @@ use objc2_core_graphics::{
 use objc2_foundation::NSString;
 
 use crate::ax::{
-    ACTION_PRESS, ACTION_RAISE, ATTR_CLOSE_BUTTON, ATTR_MINIMIZED, ATTR_POSITION, ATTR_ROLE,
-    ATTR_SIZE, ATTR_SUBROLE, ATTR_TITLE, ATTR_WINDOWS, AxElement,
+    ACTION_PRESS, ACTION_RAISE, ATTR_CLOSE_BUTTON, ATTR_MAX_SIZE, ATTR_MAXIMUM_SIZE,
+    ATTR_MINIMIZED, ATTR_POSITION, ATTR_ROLE, ATTR_SIZE, ATTR_SUBROLE, ATTR_TITLE, ATTR_WINDOWS,
+    AxElement,
 };
 use crate::error::{PlatformError, Result};
 use crate::geometry::{Point, Rect, Size};
@@ -84,6 +85,262 @@ impl WindowInfo {
     /// from `is_dialog`, `resizable`, bundle id and title.
     pub fn is_normal(&self) -> bool {
         self.level == 0 && !self.is_minimized
+    }
+}
+
+/// How an application responded to one requested dimension of a geometry change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DimensionOutcome {
+    /// The application applied the requested value (within [`FRAME_TOLERANCE`]).
+    Applied,
+    /// The application applied a different value: it has a minimum or maximum on this axis.
+    Clamped,
+    /// The application ignored the change entirely; the dimension is frozen.
+    Frozen,
+}
+
+/// Result of a geometry operation: what was asked for and what the window actually became.
+///
+/// macOS applications silently clamp or ignore `AXSize` / `AXPosition` changes.  Returning the
+/// read-back frame lets the daemon learn the real constraint instead of assuming the requested
+/// rectangle was applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AppliedFrame {
+    /// The frame that was requested.
+    pub requested: Rect,
+    /// The frame read back after the operation (and one corrective retry, for `set_frame`).
+    pub applied: Rect,
+    /// Per-axis outcome for the width.
+    pub width: DimensionOutcome,
+    /// Per-axis outcome for the height.
+    pub height: DimensionOutcome,
+    /// Outcome for the top-left origin (all components together).
+    pub position: DimensionOutcome,
+    /// True when any part of the applied frame differs from the request.
+    pub clamped: bool,
+}
+
+impl AppliedFrame {
+    /// Classify a read-back frame against the request and the frame before the operation.
+    fn from_frames(requested: Rect, applied: Rect, previous: Option<Rect>) -> Self {
+        let width = classify_dimension(
+            requested.size.width,
+            applied.size.width,
+            previous.map(|frame| frame.size.width),
+        );
+        let height = classify_dimension(
+            requested.size.height,
+            applied.size.height,
+            previous.map(|frame| frame.size.height),
+        );
+        let position = classify_position(
+            requested.origin,
+            applied.origin,
+            previous.map(|frame| frame.origin),
+        );
+        AppliedFrame {
+            requested,
+            applied,
+            width,
+            height,
+            position,
+            clamped: width != DimensionOutcome::Applied
+                || height != DimensionOutcome::Applied
+                || position != DimensionOutcome::Applied,
+        }
+    }
+
+    /// True when the window ended up exactly where it was asked to go.
+    pub fn matches_requested(&self) -> bool {
+        !self.clamped
+    }
+
+    /// True when the width or height differs from the request.
+    pub fn size_clamped(&self) -> bool {
+        self.width != DimensionOutcome::Applied || self.height != DimensionOutcome::Applied
+    }
+
+    /// True when the origin differs from the request.
+    pub fn position_clamped(&self) -> bool {
+        self.position != DimensionOutcome::Applied
+    }
+}
+
+/// Per-axis constraint discovered by [`AxWindow::probe_size_constraints`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum AxisConstraint {
+    /// The axis followed the request; no minimum was detected.
+    #[default]
+    Free,
+    /// The application refused to change this dimension at all.
+    Frozen {
+        /// The value the dimension is stuck at.
+        value: f64,
+    },
+    /// The application refused to shrink below this value.
+    Min {
+        /// Smallest accepted value in logical pixels.
+        min: f64,
+    },
+}
+
+impl AxisConstraint {
+    /// Smallest accepted value on this axis (`0.0` when free).
+    pub fn minimum(self) -> f64 {
+        match self {
+            AxisConstraint::Free => 0.0,
+            AxisConstraint::Frozen { value } => value,
+            AxisConstraint::Min { min } => min,
+        }
+    }
+
+    /// Largest accepted value on this axis, if the axis is frozen.
+    pub fn maximum(self) -> Option<f64> {
+        match self {
+            AxisConstraint::Frozen { value } => Some(value),
+            AxisConstraint::Free | AxisConstraint::Min { .. } => None,
+        }
+    }
+
+    /// True when no constraint was detected.
+    pub fn is_free(self) -> bool {
+        matches!(self, AxisConstraint::Free)
+    }
+}
+
+/// Minimum and maximum size an application accepts.
+///
+/// The probe detects the minimum by momentarily shrinking the window; an application that
+/// exposes `AXMaxSize` / `AXMaximumSize` also reports its maximum without a grow probe.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SizeConstraints {
+    /// Minimum accepted size.  `None` when no axis has a minimum.
+    pub min: Option<Size>,
+    /// Maximum accepted size.  `None` when no axis has a maximum.  A free axis is
+    /// `f64::MAX` ("unbounded").
+    pub max: Option<Size>,
+    /// Width constraint as detected by the probe.
+    pub width: AxisConstraint,
+    /// Height constraint as detected by the probe.
+    pub height: AxisConstraint,
+}
+
+impl SizeConstraints {
+    /// Build a result for a window whose probe target equalled its current size.
+    fn unconstrained(max: Option<Size>) -> Self {
+        SizeConstraints {
+            min: None,
+            max,
+            width: AxisConstraint::Free,
+            height: AxisConstraint::Free,
+        }
+    }
+
+    /// Pure logic behind the probe: classify the applied size and merge a declared maximum.
+    ///
+    /// `original` is the size before probing, `probe` the requested tiny size and `applied`
+    /// the size the application actually produced.
+    fn from_probe(original: Size, probe: Size, applied: Size, declared_max: Option<Size>) -> Self {
+        let width = classify_axis(original.width, probe.width, applied.width);
+        let height = classify_axis(original.height, probe.height, applied.height);
+        let min = if width.is_free() && height.is_free() {
+            None
+        } else {
+            Some(Size::new(width.minimum(), height.minimum()))
+        };
+        let max = merge_max(width, height, declared_max);
+        SizeConstraints {
+            min,
+            max,
+            width,
+            height,
+        }
+    }
+}
+
+/// Tolerance used when comparing requested and applied geometry, in logical pixels.
+pub const FRAME_TOLERANCE: f64 = 1.0;
+
+/// Size the probe shrinks to before reading back the application's minimum.
+const PROBE_SIZE: f64 = 1.0;
+
+fn approx_equal(a: f64, b: f64) -> bool {
+    (a - b).abs() <= FRAME_TOLERANCE
+}
+
+fn frame_differs(a: Rect, b: Rect) -> bool {
+    !approx_equal(a.origin.x, b.origin.x)
+        || !approx_equal(a.origin.y, b.origin.y)
+        || !approx_equal(a.size.width, b.size.width)
+        || !approx_equal(a.size.height, b.size.height)
+}
+
+/// Classify one requested dimension against what the application applied and what it was
+/// before the operation.
+fn classify_dimension(requested: f64, applied: f64, previous: Option<f64>) -> DimensionOutcome {
+    if approx_equal(applied, requested) {
+        DimensionOutcome::Applied
+    } else if previous.is_some_and(|previous| approx_equal(applied, previous)) {
+        DimensionOutcome::Frozen
+    } else {
+        DimensionOutcome::Clamped
+    }
+}
+
+/// Classify the origin as a whole (both coordinates must match for `Applied`).
+fn classify_position(
+    requested: Point,
+    applied: Point,
+    previous: Option<Point>,
+) -> DimensionOutcome {
+    let applied_ok = approx_equal(applied.x, requested.x) && approx_equal(applied.y, requested.y);
+    if applied_ok {
+        return DimensionOutcome::Applied;
+    }
+    if previous.is_some_and(|previous| {
+        approx_equal(applied.x, previous.x) && approx_equal(applied.y, previous.y)
+    }) {
+        DimensionOutcome::Frozen
+    } else {
+        DimensionOutcome::Clamped
+    }
+}
+
+fn classify_axis(original: f64, probe: f64, applied: f64) -> AxisConstraint {
+    if approx_equal(applied, probe) {
+        AxisConstraint::Free
+    } else if approx_equal(applied, original) {
+        AxisConstraint::Frozen { value: original }
+    } else {
+        AxisConstraint::Min {
+            min: applied.max(0.0),
+        }
+    }
+}
+
+fn merge_max(
+    width: AxisConstraint,
+    height: AxisConstraint,
+    declared_max: Option<Size>,
+) -> Option<Size> {
+    let width_max = match (width.maximum(), declared_max.map(|size| size.width)) {
+        (Some(frozen), Some(declared)) => Some(frozen.min(declared)),
+        (Some(frozen), None) => Some(frozen),
+        (None, Some(declared)) => Some(declared),
+        (None, None) => None,
+    };
+    let height_max = match (height.maximum(), declared_max.map(|size| size.height)) {
+        (Some(frozen), Some(declared)) => Some(frozen.min(declared)),
+        (Some(frozen), None) => Some(frozen),
+        (None, Some(declared)) => Some(declared),
+        (None, None) => None,
+    };
+    match (width_max, height_max) {
+        (None, None) => None,
+        (width, height) => Some(Size::new(
+            width.unwrap_or(f64::MAX),
+            height.unwrap_or(f64::MAX),
+        )),
     }
 }
 
@@ -423,10 +680,12 @@ impl AxWindow {
     /// Windows with resizing constraints (Terminal, TextEdit with a fixed wrap
     /// width, many Electron apps) refuse or clamp a size that is applied before
     /// the window has been moved to its target display. Applying the size first,
-    /// then the position, then the size again converges for those windows. The
-    /// final frame is read back and one more position+size pass is attempted
-    /// when AppKit clamped the result.
-    pub fn set_frame(&self, frame: Rect) -> Result<()> {
+    /// then the position, then the size again converges for those windows. After
+    /// one corrective pass the frame is read back **again** and returned, so the
+    /// caller can see what the application actually applied instead of assuming
+    /// the request succeeded.
+    pub fn set_frame(&self, frame: Rect) -> Result<AppliedFrame> {
+        let previous = self.frame()?;
         self.element.set_size_attribute(ATTR_SIZE, frame.size)?;
         self.element
             .set_point_attribute(ATTR_POSITION, frame.origin)?;
@@ -434,34 +693,138 @@ impl AxWindow {
 
         // Read back. AppKit can clamp a size after the move (screen edges,
         // aspect ratio); one corrective pass is enough in practice.
-        if let Ok(Some(actual)) = self.frame() {
-            let off = (actual.origin.x - frame.origin.x).abs() > 1.0
-                || (actual.origin.y - frame.origin.y).abs() > 1.0
-                || (actual.size.width - frame.size.width).abs() > 1.0
-                || (actual.size.height - frame.size.height).abs() > 1.0;
-            if off {
-                log::debug!(
-                    "set_frame({}) requested {:?}, got {:?}; retrying",
-                    self.wid,
-                    frame,
-                    actual
-                );
-                self.element
-                    .set_point_attribute(ATTR_POSITION, frame.origin)?;
-                self.element.set_size_attribute(ATTR_SIZE, frame.size)?;
-            }
+        let mut applied = self.current_frame()?;
+        if frame_differs(applied, frame) {
+            log::debug!(
+                "set_frame({}) requested {:?}, got {:?}; retrying",
+                self.wid,
+                frame,
+                applied
+            );
+            self.element
+                .set_point_attribute(ATTR_POSITION, frame.origin)?;
+            self.element.set_size_attribute(ATTR_SIZE, frame.size)?;
+            applied = self.current_frame()?;
         }
-        Ok(())
+        Ok(AppliedFrame::from_frames(frame, applied, previous))
     }
 
     /// Move without resizing.
-    pub fn set_position(&self, point: Point) -> Result<()> {
-        self.element.set_point_attribute(ATTR_POSITION, point)
+    ///
+    /// Returns the frame the application actually applied; a window that refuses
+    /// to move reports [`DimensionOutcome::Frozen`] for its position.
+    pub fn set_position(&self, point: Point) -> Result<AppliedFrame> {
+        let previous = self.frame()?;
+        self.element.set_point_attribute(ATTR_POSITION, point)?;
+        let applied = self.current_frame()?;
+        let size = previous.unwrap_or(applied).size;
+        let requested = Rect::new(point.x, point.y, size.width, size.height);
+        Ok(AppliedFrame::from_frames(requested, applied, previous))
     }
 
     /// Resize without moving.
-    pub fn set_size(&self, size: Size) -> Result<()> {
-        self.element.set_size_attribute(ATTR_SIZE, size)
+    ///
+    /// Returns the frame the application actually applied.  This is how a caller
+    /// detects a silently clamped dimension.
+    pub fn set_size(&self, size: Size) -> Result<AppliedFrame> {
+        let previous = self.frame()?;
+        self.element.set_size_attribute(ATTR_SIZE, size)?;
+        let applied = self.current_frame()?;
+        let origin = previous.unwrap_or(applied).origin;
+        let requested = Rect::new(origin.x, origin.y, size.width, size.height);
+        Ok(AppliedFrame::from_frames(requested, applied, previous))
+    }
+
+    /// Discover the minimum (and, when the app exposes it, maximum) size.
+    ///
+    /// **This momentarily resizes the window** — it shrinks the window to 1×1 for
+    /// roughly 50–100 ms, reads back what the application actually allowed, and
+    /// restores the original frame.  The platform layer never calls this
+    /// automatically; the daemon decides when a probe is worth the visible
+    /// flicker (for example once after a window is first managed, or after a
+    /// `SetFrame` was clamped).
+    ///
+    /// Applications can respond in three ways per dimension, reported through
+    /// [`AxisConstraint`]:
+    ///
+    /// * the requested probe size is applied → [`AxisConstraint::Free`];
+    /// * something between the probe and the original is applied → the application
+    ///   has a minimum on that axis ([`AxisConstraint::Min`]);
+    /// * the original size is unchanged → the dimension is frozen
+    ///   ([`AxisConstraint::Frozen`]), which System Settings does with its width.
+    ///
+    /// A maximum is read directly from `AXMaxSize` / `AXMaximumSize` when the
+    /// application publishes it; the probe never grows a window to find a maximum.
+    pub fn probe_size_constraints(&self) -> Result<SizeConstraints> {
+        if !crate::ax::is_process_trusted() {
+            return Err(PlatformError::AccessibilityDenied);
+        }
+        let original = self.current_frame()?;
+        let declared_max = self.declared_max_size();
+        let probe = Size::new(
+            if original.size.width > PROBE_SIZE + FRAME_TOLERANCE {
+                PROBE_SIZE
+            } else {
+                original.size.width
+            },
+            if original.size.height > PROBE_SIZE + FRAME_TOLERANCE {
+                PROBE_SIZE
+            } else {
+                original.size.height
+            },
+        );
+        if probe == original.size {
+            // Nothing to learn without growing the window.
+            return Ok(SizeConstraints::unconstrained(declared_max));
+        }
+
+        let applied = self.set_frame(Rect::new(
+            original.origin.x,
+            original.origin.y,
+            probe.width,
+            probe.height,
+        ))?;
+        // Always try to restore, even if the probe itself looked odd.
+        match self.set_frame(original) {
+            Ok(restored) => {
+                if restored.size_clamped() {
+                    log::debug!(
+                        "probe({}): restore requested {:?}, got {:?}",
+                        self.wid,
+                        original,
+                        restored.applied
+                    );
+                }
+            }
+            Err(err) => log::warn!("probe({}): could not restore frame: {err}", self.wid),
+        }
+        Ok(SizeConstraints::from_probe(
+            original.size,
+            probe,
+            applied.applied.size,
+            declared_max,
+        ))
+    }
+
+    /// Read an application-declared maximum size, if one of the known attribute
+    /// spellings is supported.
+    fn declared_max_size(&self) -> Option<Size> {
+        for name in [ATTR_MAX_SIZE, ATTR_MAXIMUM_SIZE] {
+            if let Ok(Some(size)) = self.element.size_attribute(name)
+                && size.width > 0.0
+                && size.height > 0.0
+            {
+                return Some(size);
+            }
+        }
+        None
+    }
+
+    /// Read the current frame or report that the window has no AX geometry.
+    fn current_frame(&self) -> Result<Rect> {
+        self.frame()?.ok_or_else(|| {
+            PlatformError::Other(format!("window {} has no AXPosition/AXSize", self.wid))
+        })
     }
 
     /// Minimize.
@@ -507,19 +870,78 @@ pub fn ax_window(wid: u32) -> Result<AxWindow> {
     Err(PlatformError::WindowNotFound(wid))
 }
 
-/// Move and resize a window.
-pub fn set_frame(wid: u32, frame: Rect) -> Result<()> {
+/// Move and resize a window, returning the frame the application actually applied.
+pub fn set_frame(wid: u32, frame: Rect) -> Result<AppliedFrame> {
     ax_window(wid)?.set_frame(frame)
 }
 
-/// Move a window without resizing.
-pub fn set_position(wid: u32, point: Point) -> Result<()> {
+/// Move a window without resizing, returning the applied frame.
+pub fn set_position(wid: u32, point: Point) -> Result<AppliedFrame> {
     ax_window(wid)?.set_position(point)
 }
 
-/// Resize a window without moving it.
-pub fn set_size(wid: u32, size: Size) -> Result<()> {
+/// Resize a window without moving it, returning the applied frame.
+pub fn set_size(wid: u32, size: Size) -> Result<AppliedFrame> {
     ax_window(wid)?.set_size(size)
+}
+
+fn constraint_cache() -> &'static Mutex<HashMap<u32, SizeConstraints>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, SizeConstraints>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Probe a window's size constraints, caching the result per window id.
+///
+/// **The first call momentarily resizes the window** (see
+/// [`AxWindow::probe_size_constraints`]).  Subsequent calls return the cached
+/// result until [`forget_size_constraints`] or [`clear_size_constraint_cache`]
+/// is called.  The cache is process-local and therefore reset when the daemon
+/// restarts.
+pub fn probe_size_constraints(wid: u32) -> Result<Option<SizeConstraints>> {
+    if let Some(cached) = constraint_cache()
+        .lock()
+        .expect("constraint cache poisoned")
+        .get(&wid)
+        .copied()
+    {
+        return Ok(Some(cached));
+    }
+    let constraints = ax_window(wid)?.probe_size_constraints()?;
+    constraint_cache()
+        .lock()
+        .expect("constraint cache poisoned")
+        .insert(wid, constraints);
+    Ok(Some(constraints))
+}
+
+/// The window's minimum accepted size, probing only when not cached.
+///
+/// `None` means no minimum was detected.  See [`probe_size_constraints`] for the
+/// momentary resize this may perform.
+pub fn min_size(wid: u32) -> Result<Option<Size>> {
+    Ok(probe_size_constraints(wid)?.and_then(|constraints| constraints.min))
+}
+
+/// The window's maximum accepted size, if the application declares one.
+pub fn max_size(wid: u32) -> Result<Option<Size>> {
+    Ok(probe_size_constraints(wid)?.and_then(|constraints| constraints.max))
+}
+
+/// Drop a cached probe result (for example after the window was resized by the
+/// user or its app changed constraints).
+pub fn forget_size_constraints(wid: u32) {
+    constraint_cache()
+        .lock()
+        .expect("constraint cache poisoned")
+        .remove(&wid);
+}
+
+/// Drop every cached probe result.
+pub fn clear_size_constraint_cache() {
+    constraint_cache()
+        .lock()
+        .expect("constraint cache poisoned")
+        .clear();
 }
 
 /// Raise a window.
@@ -724,5 +1146,129 @@ impl ParkStore {
             }
         }
         errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dimension_classification_distinguishes_applied_clamped_and_frozen() {
+        // Exact request honoured.
+        assert_eq!(
+            classify_dimension(800.0, 800.0, Some(500.0)),
+            DimensionOutcome::Applied
+        );
+        // Application clamped to a different value.
+        assert_eq!(
+            classify_dimension(800.0, 642.0, Some(500.0)),
+            DimensionOutcome::Clamped
+        );
+        // Application ignored the request: value stayed where it was.
+        assert_eq!(
+            classify_dimension(800.0, 715.0, Some(715.0)),
+            DimensionOutcome::Frozen
+        );
+        // Sub-pixel differences are still "applied".
+        assert_eq!(
+            classify_dimension(833.0, 833.4, Some(700.0)),
+            DimensionOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn applied_frame_reports_per_axis_outcome_and_clamped_flag() {
+        let requested = Rect::new(100.0, 50.0, 800.0, 600.0);
+        let previous = Rect::new(10.0, 20.0, 700.0, 500.0);
+        let applied = Rect::new(100.0, 50.0, 642.0, 600.0);
+        let result = AppliedFrame::from_frames(requested, applied, Some(previous));
+        assert_eq!(result.width, DimensionOutcome::Clamped);
+        assert_eq!(result.height, DimensionOutcome::Applied);
+        assert_eq!(result.position, DimensionOutcome::Applied);
+        assert!(result.clamped);
+        assert!(result.size_clamped());
+        assert!(!result.position_clamped());
+        assert!(!result.matches_requested());
+    }
+
+    #[test]
+    fn applied_frame_reports_frozen_position() {
+        let requested = Rect::new(100.0, 50.0, 800.0, 600.0);
+        let previous = Rect::new(10.0, 20.0, 800.0, 600.0);
+        let applied = Rect::new(10.0, 20.0, 800.0, 600.0);
+        let result = AppliedFrame::from_frames(requested, applied, Some(previous));
+        assert_eq!(result.position, DimensionOutcome::Frozen);
+        assert!(result.position_clamped());
+        assert!(!result.size_clamped());
+    }
+
+    #[test]
+    fn probe_logic_detects_free_min_and_frozen_axes() {
+        let original = Size::new(800.0, 600.0);
+        let probe = Size::new(1.0, 1.0);
+
+        let free = SizeConstraints::from_probe(original, probe, probe, None);
+        assert_eq!(free.width, AxisConstraint::Free);
+        assert_eq!(free.height, AxisConstraint::Free);
+        assert_eq!(free.min, None);
+        assert_eq!(free.max, None);
+
+        let width_min = SizeConstraints::from_probe(original, probe, Size::new(642.0, 1.0), None);
+        assert_eq!(width_min.width, AxisConstraint::Min { min: 642.0 });
+        assert_eq!(width_min.height, AxisConstraint::Free);
+        assert_eq!(width_min.min, Some(Size::new(642.0, 0.0)));
+
+        let frozen = SizeConstraints::from_probe(
+            Size::new(715.0, 600.0),
+            probe,
+            Size::new(715.0, 1.0),
+            None,
+        );
+        assert_eq!(frozen.width, AxisConstraint::Frozen { value: 715.0 });
+        assert_eq!(frozen.min, Some(Size::new(715.0, 0.0)));
+        assert_eq!(frozen.max, Some(Size::new(715.0, f64::MAX)));
+    }
+
+    #[test]
+    fn declared_maximum_is_used_without_growing_the_window() {
+        let original = Size::new(800.0, 600.0);
+        let probe = Size::new(1.0, 1.0);
+        let declared = Size::new(4000.0, 3000.0);
+        let constraints = SizeConstraints::from_probe(original, probe, probe, Some(declared));
+        assert_eq!(constraints.max, Some(declared));
+        assert_eq!(constraints.min, None);
+
+        // A frozen axis is at most its frozen value, even if AXMaxSize is larger.
+        let frozen = SizeConstraints::from_probe(
+            original,
+            probe,
+            Size::new(800.0, 1.0),
+            Some(Size::new(4000.0, 3000.0)),
+        );
+        assert_eq!(frozen.max, Some(Size::new(800.0, 3000.0)));
+    }
+
+    #[test]
+    fn probe_target_equal_to_current_size_reports_no_constraint() {
+        let original = Size::new(1.0, 1.0);
+        let constraints = SizeConstraints::from_probe(original, original, original, None);
+        assert!(constraints.width.is_free());
+        assert!(constraints.height.is_free());
+        assert_eq!(constraints.min, None);
+    }
+
+    #[test]
+    fn axis_constraint_accessors() {
+        assert_eq!(AxisConstraint::Free.minimum(), 0.0);
+        assert_eq!(AxisConstraint::Free.maximum(), None);
+        assert!(AxisConstraint::Free.is_free());
+        assert_eq!(AxisConstraint::Min { min: 200.0 }.minimum(), 200.0);
+        assert_eq!(AxisConstraint::Min { min: 200.0 }.maximum(), None);
+        assert_eq!(AxisConstraint::Frozen { value: 715.0 }.minimum(), 715.0);
+        assert_eq!(
+            AxisConstraint::Frozen { value: 715.0 }.maximum(),
+            Some(715.0)
+        );
     }
 }

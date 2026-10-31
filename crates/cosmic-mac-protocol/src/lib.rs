@@ -51,6 +51,43 @@ use serde::{Deserialize, Serialize};
 /// of a window and fits comfortably in `u64`.
 pub type WindowId = u64;
 
+/// A width/height pair in logical pixels.
+///
+/// Used for per-window size constraints carried in [`ToplevelInfo`].  A maximum of
+/// [`Size::UNBOUNDED`] (or any value at or above `f64::MAX / 2.0`) means "no maximum on this
+/// axis"; JSON can represent it, unlike an infinite float.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Size {
+    /// Width in logical pixels.
+    pub width: f64,
+    /// Height in logical pixels.
+    pub height: f64,
+}
+
+impl Size {
+    /// A zero size.
+    pub const ZERO: Size = Size {
+        width: 0.0,
+        height: 0.0,
+    };
+
+    /// Sentinel maximum meaning "unbounded on both axes".
+    pub const UNBOUNDED: Size = Size {
+        width: f64::MAX,
+        height: f64::MAX,
+    };
+
+    /// Construct a size.
+    pub const fn new(width: f64, height: f64) -> Self {
+        Size { width, height }
+    }
+
+    /// True when both axes are at the [`Size::UNBOUNDED`] sentinel.
+    pub fn is_unbounded(self) -> bool {
+        self.width >= f64::MAX / 2.0 && self.height >= f64::MAX / 2.0
+    }
+}
+
 /// A rectangle in top-left-origin logical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rect {

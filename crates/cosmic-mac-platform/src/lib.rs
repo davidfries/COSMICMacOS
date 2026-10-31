@@ -41,4 +41,7 @@ pub use eventtap::{EventTap, HotkeySpec, KeyEvent};
 pub use geometry::{Point, Rect, Size};
 pub use observers::{PlatformEvent, PlatformObserver};
 pub use overlay::{Color, OverlayWindow};
-pub use window::{AxWindow, ParkStore, WindowInfo};
+pub use window::{
+    AppliedFrame, AxWindow, AxisConstraint, DimensionOutcome, ParkStore, SizeConstraints,
+    WindowInfo,
+};

@@ -35,6 +35,17 @@ use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--probe-window") {
+        let Some(wid) = args
+            .get(index + 1)
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            eprintln!("usage: spike-b --probe-window <wid>");
+            std::process::exit(64);
+        };
+        probe_window(wid);
+        return;
+    }
     let command = args.first().map(String::as_str).unwrap_or("help");
 
     match command {
@@ -43,6 +54,10 @@ fn main() {
         "list" => list_windows(),
         "ax-list" => ax_list(),
         "move" => move_window(&args[1..]),
+        "probe" => {
+            let wid = parse_wid(&args[1..]);
+            probe_window(wid);
+        }
         "raise" => with_wid(&args[1..], window::raise),
         "focus" => with_wid(&args[1..], window::focus_without_raise),
         "park" => park(&args[1..]),
@@ -72,6 +87,8 @@ fn help() {
          needs Accessibility:\n\
            ax-list                  enumerate through AX only\n\
            move <wid> <x> <y> <w> <h>\n\
+           probe <wid>              discover min/max size (momentarily shrinks it)\n\
+           --probe-window <wid>     same, as a flag\n\
            park <wid> [--seconds N] [--display N]\n\
            tap [--seconds N] [--post]\n\
          \n\
@@ -285,7 +302,13 @@ fn move_window(args: &[String]) {
         );
     }
     match window::set_frame(wid, target) {
-        Ok(()) => {
+        Ok(applied) => {
+            if applied.clamped {
+                println!(
+                    "clamped: width={:?} height={:?} position={:?}",
+                    applied.width, applied.height, applied.position
+                );
+            }
             let after = window::window_info(wid).ok().flatten();
             if let Some(info) = after {
                 println!(
@@ -296,11 +319,64 @@ fn move_window(args: &[String]) {
                     info.frame.size.height
                 );
             }
-            println!("ok: moved wid {wid} to {target:?}");
+            println!(
+                "ok: moved wid {wid} to {target:?} (applied {:?})",
+                applied.applied
+            );
         }
         Err(err) => {
             print_error("move", &err);
             std::process::exit(1);
+        }
+    }
+}
+
+/// Discover a window's size constraints.  This *momentarily resizes the window*
+/// (a 1x1 probe for roughly 50-100 ms) and restores its frame afterwards.
+fn probe_window(wid: u32) {
+    if !tcc::accessibility_trusted() {
+        eprintln!("!! probe: needs Accessibility (AXPosition/AXSize are AX attributes)");
+        std::process::exit(3);
+    }
+    let before = window::window_info(wid)
+        .ok()
+        .flatten()
+        .map(|info| info.frame);
+    if let Some(frame) = before {
+        println!(
+            "before: ({:.0},{:.0} {:.0}x{:.0})",
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+        );
+    }
+    match window::probe_size_constraints(wid) {
+        Ok(Some(constraints)) => {
+            println!(
+                "min: {:?} max: {:?} width: {:?} height: {:?}",
+                constraints.min, constraints.max, constraints.width, constraints.height
+            );
+        }
+        Ok(None) => println!("no constraints (probe returned none)"),
+        Err(err) => {
+            print_error("probe", &err);
+            std::process::exit(1);
+        }
+    }
+    if let Some(after) = window::window_info(wid)
+        .ok()
+        .flatten()
+        .map(|info| info.frame)
+    {
+        println!(
+            "after:  ({:.0},{:.0} {:.0}x{:.0})",
+            after.origin.x, after.origin.y, after.size.width, after.size.height
+        );
+        if let Some(before) = before
+            && ((after.origin.x - before.origin.x).abs() > 1.0
+                || (after.origin.y - before.origin.y).abs() > 1.0
+                || (after.size.width - before.size.width).abs() > 1.0
+                || (after.size.height - before.size.height).abs() > 1.0)
+        {
+            println!("warning: frame was not restored exactly");
         }
     }
 }

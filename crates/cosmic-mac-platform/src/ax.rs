@@ -47,6 +47,16 @@ pub(crate) const ATTR_POSITION: &str = "AXPosition";
 pub(crate) const ATTR_SIZE: &str = "AXSize";
 pub(crate) const ATTR_MINIMIZED: &str = "AXMinimized";
 pub(crate) const ATTR_CLOSE_BUTTON: &str = "AXCloseButton";
+/// Minimum size, when an application exposes it (`kAXMinSizeAttribute` on some apps).
+#[allow(dead_code)]
+pub(crate) const ATTR_MIN_SIZE: &str = "AXMinSize";
+/// Alternate spelling used by some applications.
+#[allow(dead_code)]
+pub(crate) const ATTR_MINIMUM_SIZE: &str = "AXMinimumSize";
+/// Maximum size, when an application exposes it (`kAXMaximumSizeAttribute` on some apps).
+pub(crate) const ATTR_MAX_SIZE: &str = "AXMaxSize";
+/// Alternate spelling used by some applications.
+pub(crate) const ATTR_MAXIMUM_SIZE: &str = "AXMaximumSize";
 #[allow(dead_code)]
 pub(crate) const ATTR_FULLSCREEN: &str = "AXFullScreen";
 #[allow(dead_code)]

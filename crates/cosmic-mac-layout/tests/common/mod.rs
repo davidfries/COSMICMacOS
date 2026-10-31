@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cosmic_mac_layout::Layout;
-use cosmic_mac_protocol::{Action, Command, Config, Rect, StackInfo, ToplevelInfo, WindowId};
+use cosmic_mac_protocol::{Action, Command, Config, Rect, Size, StackInfo, ToplevelInfo, WindowId};
 
 pub const WORK: Rect = Rect::new(0.0, 0.0, 1000.0, 500.0);
 pub const TALL_WORK: Rect = Rect::new(0.0, 0.0, 500.0, 1000.0);
@@ -14,6 +14,22 @@ pub const BIG_WORK: Rect = Rect::new(0.0, 0.0, 1200.0, 800.0);
 
 pub fn info(wid: WindowId) -> ToplevelInfo {
     ToplevelInfo::new(wid, "com.example.App", format!("Window {wid}"))
+}
+
+/// A window with optional `(width, height)` minimum and maximum constraints.
+pub fn constrained(
+    wid: WindowId,
+    min: Option<(f64, f64)>,
+    max: Option<(f64, f64)>,
+) -> ToplevelInfo {
+    let mut info = info(wid);
+    if let Some((width, height)) = min {
+        info = info.with_min_size(Size::new(width, height));
+    }
+    if let Some((width, height)) = max {
+        info = info.with_max_size(Size::new(width, height));
+    }
+    info
 }
 
 pub fn dialog(wid: WindowId) -> ToplevelInfo {
@@ -128,6 +144,12 @@ impl Harness {
         let commands = self.layout.window_removed(wid);
         self.platform.apply(&commands);
         self.platform.forget(wid);
+    }
+
+    pub fn update(&mut self, info: ToplevelInfo) -> Vec<Command> {
+        let commands = self.layout.update_window(info);
+        self.platform.apply(&commands);
+        commands
     }
 
     pub fn act(&mut self, action: Action) -> Vec<Command> {

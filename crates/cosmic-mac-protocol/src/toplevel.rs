@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Rect, WindowId};
+use crate::{Rect, Size, WindowId};
 
 fn default_true() -> bool {
     true
@@ -44,6 +44,18 @@ pub struct ToplevelInfo {
     /// Frame observed when the window was registered.  Used for floating placement.
     #[serde(default)]
     pub initial_frame: Option<Rect>,
+    /// Minimum size the application accepts, when known.
+    ///
+    /// Discovered by the platform's AX probe (or reported by the app) and learned by the
+    /// daemon when a `SetFrame` is clamped.  `None` means "no known minimum".
+    #[serde(default)]
+    pub min_size: Option<Size>,
+    /// Maximum size the application accepts, when known.
+    ///
+    /// `None` means "no known maximum"; an axis may still be unbounded when the other is
+    /// constrained (see [`Size::UNBOUNDED`]).
+    #[serde(default)]
+    pub max_size: Option<Size>,
 }
 
 impl Default for ToplevelInfo {
@@ -58,6 +70,8 @@ impl Default for ToplevelInfo {
             resizable: true,
             is_dialog: false,
             initial_frame: None,
+            min_size: None,
+            max_size: None,
         }
     }
 }
@@ -90,6 +104,18 @@ impl ToplevelInfo {
 
     pub fn with_initial_frame(mut self, frame: Rect) -> Self {
         self.initial_frame = Some(frame);
+        self
+    }
+
+    /// Attach the minimum size the application accepts.
+    pub fn with_min_size(mut self, min: Size) -> Self {
+        self.min_size = Some(min);
+        self
+    }
+
+    /// Attach the maximum size the application accepts.
+    pub fn with_max_size(mut self, max: Size) -> Self {
+        self.max_size = Some(max);
         self
     }
 }
@@ -188,7 +214,7 @@ pub struct WindowState {
 #[cfg(test)]
 mod tests {
     use super::{TabInfo, ToplevelCapability, ToplevelInfo, ToplevelManagement, ToplevelState};
-    use crate::Rect;
+    use crate::{Rect, Size};
 
     #[test]
     fn info_defaults_are_sane() {
@@ -198,6 +224,8 @@ mod tests {
         assert!(!info.is_dialog);
         assert!(info.initial_frame.is_none());
         assert!(info.role.is_none());
+        assert!(info.min_size.is_none());
+        assert!(info.max_size.is_none());
     }
 
     #[test]
@@ -206,9 +234,13 @@ mod tests {
             .with_pid(42)
             .with_resizable(false)
             .with_dialog(true)
-            .with_initial_frame(Rect::new(10.0, 20.0, 300.0, 200.0));
+            .with_initial_frame(Rect::new(10.0, 20.0, 300.0, 200.0))
+            .with_min_size(Size::new(642.0, 100.0))
+            .with_max_size(Size::new(4000.0, Size::UNBOUNDED.height));
         let json = serde_json::to_string(&info).unwrap();
         assert_eq!(serde_json::from_str::<ToplevelInfo>(&json).unwrap(), info);
+        assert_eq!(info.min_size, Some(Size::new(642.0, 100.0)));
+        assert!(!info.max_size.unwrap().is_unbounded());
     }
 
     #[test]
@@ -218,6 +250,20 @@ mod tests {
         assert!(info.resizable);
         assert!(!info.is_dialog);
         assert_eq!(info.initial_frame, None);
+        assert_eq!(info.min_size, None);
+        assert_eq!(info.max_size, None);
+    }
+
+    #[test]
+    fn size_constraints_round_trip_through_ipc_shape() {
+        let info = ToplevelInfo::new(9, "a", "b")
+            .with_min_size(Size::new(200.0, 100.0))
+            .with_max_size(Size::UNBOUNDED);
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["min_size"]["width"], 200.0);
+        assert_eq!(value["max_size"]["height"], f64::MAX);
+        let back: ToplevelInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(back, info);
     }
 
     #[test]
