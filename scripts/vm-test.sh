@@ -44,6 +44,8 @@ HELPER=/tmp/cosmicmac-vm-helpers.sh
 ASSERT=/tmp/cosmicmac-vm-assert.py
 BASELINE=/tmp/cosmicmac-vm-baseline.json
 BEFORE=/tmp/cosmicmac-vm-before.json
+FOCUS_BEFORE=/tmp/cosmicmac-vm-focus-before.json
+FOCUS_TREE=/tmp/cosmicmac-vm-focus-tree.json
 AFTER=/tmp/cosmicmac-vm-after.json
 
 # Shell fragment executed remotely. $HOME must be expanded by the remote shell.
@@ -315,6 +317,13 @@ count_test_windows() {
 }
 
 close_test_windows() {
+    # Kill every TextEdit instance first. This also removes stray "Untitled" documents,
+    # which bare `open -a TextEdit` (no document) used to leave behind: an Untitled window
+    # joins the tiling and breaks the scenario's focus assertions. The test documents live
+    # in /tmp and are rewritten on every run, so killing TextEdit loses nothing.
+    pkill -x TextEdit 2>/dev/null || true
+    sleep 1
+
     # Prefer the daemon (it knows every window); fall back to AppleScript when it is down.
     if ctl ping >/dev/null 2>&1; then
         local wids
@@ -328,13 +337,6 @@ close_test_windows() {
     fi
 
     osascript >/dev/null 2>&1 <<'APPLESCRIPT' || true
-tell application "TextEdit"
-    repeat with d in (every document whose name starts with "cosmicmac-vm-test")
-        try
-            close d saving no
-        end try
-    end repeat
-end tell
 tell application "Terminal"
     repeat with w in (every window)
         try
@@ -349,9 +351,9 @@ open_windows() {
     local want="$1"
     close_test_windows || true
 
-    # TextEdit first: open the app, then one new instance per file. New instances are
-    # what makes TextEdit show multiple independent windows over SSH.
-    open -a TextEdit >/dev/null 2>&1 || true
+    # TextEdit instances are launched directly with a document each (`open -n`); a bare
+    # `open -a TextEdit` would create an "Untitled" document window that then joins the
+    # tiling and breaks the scenario's focus assertions.
     local i
     for i in $(seq 1 "$want"); do
         printf 'cosmicMac vm test window %s\n' "$i" > "/tmp/$PREFIX-$i.txt"
@@ -606,24 +608,195 @@ def mode_tiled(windows, want):
             )
 
 
-def mode_focus(windows, side):
+FOCUS_EPSILON = 0.5
+
+
+def center(rect):
+    return (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0)
+
+
+def focus_sort_key(candidate):
+    # Same total order as the layout's `compare_focus_candidates`: primary distance,
+    # perpendicular distance, then topmost, then leftmost, then the lowest wid.
+    wid, primary, perpendicular, y, x = candidate
+    return (primary, perpendicular, y, x, wid)
+
+
+def tree_contains(node, wid):
+    if node["kind"] == "window":
+        return node["wid"] == wid
+    if node["kind"] == "stack":
+        return any(tab["wid"] == wid for tab in node["tabs"])
+    return any(tree_contains(child, wid) for child in node["children"])
+
+
+def tree_path(node, wid, acc):
+    """Path of nodes from `node` down to the leaf holding `wid`, or None."""
+    acc.append(node)
+    if tree_contains_leaf(node, wid):
+        return acc
+    if node["kind"] == "group":
+        for child in node["children"]:
+            found = tree_path(child, wid, acc)
+            if found is not None:
+                return found
+    acc.pop()
+    return None
+
+
+def tree_contains_leaf(node, wid):
+    if node["kind"] == "window":
+        return node["wid"] == wid
+    if node["kind"] == "stack":
+        return any(tab["wid"] == wid for tab in node["tabs"])
+    return False
+
+
+def tree_descend_near(node, forward):
+    while node["kind"] == "group":
+        children = node["children"]
+        node = children[0] if forward else children[-1]
+    return node
+
+
+def tree_descend_edge(node, forward):
+    while node["kind"] == "group":
+        children = node["children"]
+        node = children[-1] if forward else children[0]
+    return node
+
+
+def tree_leaf_wid(node):
+    if node["kind"] == "window":
+        return node["wid"]
+    if node["kind"] == "stack":
+        return node["tabs"][node["active"]]["wid"]
+    return None
+
+
+ORIENTATIONS = {"left": "horizontal", "right": "horizontal",
+                "up": "vertical", "down": "vertical"}
+FORWARD = {"right": True, "down": True, "left": False, "up": False}
+OPPOSITE = {"left": "right", "right": "left", "up": "down", "down": "up"}
+
+
+def tree_focus(tree, from_wid, direction):
+    """Port of `Tree::focus_neighbor` + `target_window` (cosmic-comp semantics).
+
+    Walks the ancestors of `from_wid`'s leaf; at the first group whose orientation matches
+    the direction's axis, the adjacent sibling is chosen and descended into on the near
+    edge.  When no ancestor has a sibling, focus wraps to the opposite tree edge (only when
+    the root splits along the same axis).  Returns None when `from_wid` is not in the tree
+    (e.g. it floats) — the caller then falls back to the spatial oracle.
+    """
+    if tree is None:
+        return None
+    path = tree_path(tree, from_wid, [])
+    if path is None:
+        return None
+    forward = FORWARD[direction]
+    handles = ORIENTATIONS[direction]
+    # Ancestors from the leaf's parent up to the root.
+    for index in range(len(path) - 2, -1, -1):
+        group = path[index]
+        if group["kind"] != "group" or group["orientation"] != handles:
+            continue
+        children = group["children"]
+        position = next(
+            i for i, child in enumerate(children) if child is path[index + 1]
+        )
+        target = position + 1 if forward else position - 1
+        if 0 <= target < len(children):
+            return tree_leaf_wid(tree_descend_near(children[target], forward))
+    # No sibling at any level: wrap to the opposite edge of the root.
+    if tree["kind"] != "group" or tree["orientation"] != handles:
+        return None
+    return tree_leaf_wid(tree_descend_edge(tree, FORWARD[OPPOSITE[direction]]))
+
+
+def geometric_focus(tiles, from_wid, direction):
+    """Independent re-implementation of the layout's directional-focus oracle.
+
+    Operates on the pre-action snapshot so the assertion validates the focus SEMANTICS
+    (direction, wrap-around, tie-break) rather than a specific tiling arrangement.
+    """
+    frames = {window["info"]["wid"]: frame(window) for window in tiles}
+    if from_wid not in frames:
+        return None
+    cx, cy = center(frames[from_wid])
+    candidates = [
+        (wid,) + center(rect)
+        for wid, rect in frames.items()
+        if wid != from_wid
+    ]
+    if not candidates:
+        return None
+
+    # Directional pass: only windows strictly in the requested direction.
+    best = None
+    for wid, x, y in candidates:
+        if direction == "left" and x < cx - FOCUS_EPSILON:
+            key = (cx - x, abs(y - cy))
+        elif direction == "right" and x > cx + FOCUS_EPSILON:
+            key = (x - cx, abs(y - cy))
+        elif direction == "up" and y < cy - FOCUS_EPSILON:
+            key = (cy - y, abs(x - cx))
+        elif direction == "down" and y > cy + FOCUS_EPSILON:
+            key = (y - cy, abs(x - cx))
+        else:
+            continue
+        candidate = (wid, key[0], key[1], y, x)
+        if best is None or focus_sort_key(candidate) < focus_sort_key(best):
+            best = candidate
+    if best is not None:
+        return best[0]
+
+    # Wrap pass: nothing in that direction; the far edge on the opposite side wins.
+    best = None
+    for wid, x, y in candidates:
+        if direction == "right":
+            key = (x - cx, abs(y - cy))  # leftmost
+        elif direction == "left":
+            key = (cx - x, abs(y - cy))  # rightmost
+        elif direction == "down":
+            key = (y - cy, abs(x - cx))  # topmost
+        else:
+            key = (cy - y, abs(x - cx))  # bottommost
+        candidate = (wid, key[0], key[1], y, x)
+        if best is None or focus_sort_key(candidate) < focus_sort_key(best):
+            best = candidate
+    return best[0]
+
+
+def mode_focus(windows, side, pre_path, tree_path):
     tiles = visible_tiled(windows)
     if not tiles:
         fail("no visible tiled test windows")
-    if side == "leftmost":
-        target = min(tiles, key=lambda window: (frame(window)[0], frame(window)[1]))
-    else:
-        target = max(
-            tiles,
-            key=lambda window: (frame(window)[0] + frame(window)[2], frame(window)[1]),
+    pre_tiles = visible_tiled(read(pre_path))
+    focused_before = [window for window in pre_tiles if window.get("focused")]
+    if len(focused_before) != 1:
+        fail(
+            "pre-action snapshot has %d focused test windows, expected 1"
+            % len(focused_before)
         )
+    from_wid = focused_before[0]["info"]["wid"]
+    direction = "left" if side == "leftmost" else "right"
+    # Tiled focus is tree-based (cosmic-comp semantics); floating focus falls back to the
+    # spatial search.  Try the tree first, matching `Layout::act_focus`.
+    tree = read(tree_path)
+    expected = tree_focus(tree, from_wid, direction)
+    if expected is None:
+        expected = geometric_focus(pre_tiles, from_wid, direction)
+    if expected is None:
+        fail("focus oracle found no target for %s from wid %s" % (direction, from_wid))
     focused = [window for window in tiles if window.get("focused")]
     if len(focused) != 1:
         fail("expected exactly one focused test window, found %d" % len(focused))
-    if focused[0]["info"]["wid"] != target["info"]["wid"]:
+    actual = focused[0]["info"]["wid"]
+    if actual != expected:
         fail(
-            "focused wid %s is not the %s window (wid %s)"
-            % (focused[0]["info"]["wid"], side, target["info"]["wid"])
+            "focus %s from wid %s: focused wid %s, expected wid %s (oracle)"
+            % (direction, from_wid, actual, expected)
         )
 
 
@@ -645,7 +818,9 @@ def main():
         return
 
     if mode in ("focus-leftmost", "focus-rightmost"):
-        mode_focus(read(), mode.split("-", 1)[1])
+        if len(sys.argv) < 4:
+            fail("focus assertions need the pre-action snapshot and tree paths")
+        mode_focus(read(), mode.split("-", 1)[1], sys.argv[2], sys.argv[3])
         return
 
     if mode == "stacked":
@@ -864,6 +1039,11 @@ snapshot_geometry() {
     run_remote "snapshot geometry to $BEFORE" "$REMOTE_CTL list-windows --json > $BEFORE"
 }
 
+snapshot_focus() {
+    run_remote "snapshot pre-action focus to $FOCUS_BEFORE" \
+        "$REMOTE_CTL list-windows --json > $FOCUS_BEFORE && $REMOTE_CTL tree --json > $FOCUS_TREE"
+}
+
 build_and_deploy
 deploy_helpers
 
@@ -903,11 +1083,13 @@ run_remote "capture baseline frames" "bash $HELPER baseline"
 assert_windows "windows tile the work area" "tiled $COUNT"
 screenshot "vm-test-01-tiled"
 
+snapshot_focus
 action focus left
-assert_windows "focus left picks the leftmost window" "focus-leftmost"
+assert_windows "focus left picks the window the oracle expects" "focus-leftmost $FOCUS_BEFORE $FOCUS_TREE"
 
+snapshot_focus
 action focus right
-assert_windows "focus right picks the rightmost window" "focus-rightmost"
+assert_windows "focus right picks the window the oracle expects" "focus-rightmost $FOCUS_BEFORE $FOCUS_TREE"
 
 action toggle-stacking
 assert_windows "two windows form a stack with one active member" "stacked"
@@ -988,7 +1170,17 @@ assert_windows "unmaximize restores the tiling" "tiled $COUNT"
 
 snapshot_geometry
 action resize left
-assert_windows "resize changes the focused window's frame" "geometry-changed $BEFORE"
+# Resize works along the focused window's parent group axis (cosmic-comp semantics), so
+# `resize left` is a no-op when that group is vertical; fall back to the vertical axis.
+if remote_ok "probe: resize left changed geometry" \
+    "$REMOTE_CTL list-windows --json | python3 $ASSERT geometry-changed $BEFORE"; then
+    step "resize left changed the focused window's frame"
+else
+    snapshot_geometry
+    action resize up
+    assert_windows "resize (vertical) changes the focused window's frame" \
+        "geometry-changed $BEFORE"
+fi
 assert_windows "the workspace still tiles after resize" "tiled $COUNT"
 
 snapshot_geometry

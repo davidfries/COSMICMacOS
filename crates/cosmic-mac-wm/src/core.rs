@@ -381,7 +381,21 @@ impl Core {
             }
             Request::Restore => {
                 let restored = self.applier.restore_all();
-                log::info!("restored {restored} windows on request");
+                // Stop managing the windows that were just restored: an emergency restore
+                // hands control back to the user, and the next platform event would
+                // otherwise re-tile everything onto the old layout.  The layout's removal
+                // commands are deliberately DISCARDED - the frames were just restored and
+                // must not be touched again.  New windows are still managed afterwards.
+                let managed: Vec<WindowId> = self
+                    .layout
+                    .windows()
+                    .iter()
+                    .map(|state| state.info.wid)
+                    .collect();
+                for wid in managed {
+                    let _ = self.layout.window_removed(wid);
+                }
+                log::info!("restored {restored} windows on request; no longer managing them");
                 Response::Ok
             }
         }
