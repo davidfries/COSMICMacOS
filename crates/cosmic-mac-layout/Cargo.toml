@@ -1,0 +1,9 @@
+[package]
+name = "cosmic-mac-layout"
+description = "Pure-Rust tiling tree, stacks, floating layer and workspace model for cosmicMac"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+cosmic-mac-protocol = { path = "../cosmic-mac-protocol" }

@@ -1,0 +1,13 @@
+[package]
+name = "cosmic-mac-protocol"
+description = "Platform-neutral IPC and layout types shared by the cosmicMac window manager and CLI"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+ron = { workspace = true }
+serde_json = { workspace = true }
