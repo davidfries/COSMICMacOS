@@ -1,0 +1,65 @@
+[package]
+name = "cosmic-mac-platform"
+description = "macOS platform primitives for cosmicMac: Accessibility (AX), SkyLight, CGEventTap, overlays"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+libc = "0.2"
+
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSWindow",
+    "NSScreen",
+    "NSRunningApplication",
+    "NSWorkspace",
+    "NSGraphics",
+    "NSResponder",
+    "NSView",
+    "NSColor",
+    "NSEvent",
+    "objc2-core-foundation",
+    "libc",
+] }
+
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFString",
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFData",
+    "CFMachPort",
+    "CFRunLoop",
+    "CFDate",
+    "CFUUID",
+    "CFURL",
+    "CFCGTypes",
+] }
+
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGBase",
+    "CGError",
+    "CGAffineTransform",
+    "CGEvent",
+    "CGEventTypes",
+    "CGWindow",
+    "CGDirectDisplay",
+    "CGDisplayConfiguration",
+    "CGContext",
+    "CGColor",
+    "CGColorSpace",
+    "CGImage",
+    "CGRemoteOperation",
+    "CGEventSource",
+] }
+
+[dev-dependencies]
+env_logger.workspace = true
