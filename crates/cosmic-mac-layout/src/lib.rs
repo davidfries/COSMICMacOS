@@ -468,12 +468,16 @@ impl Layout {
             .and_then(|wid| frames.get(&wid).copied())
             .map(Rect::center)
             .unwrap_or_else(|| self.work_area.center());
-        let candidates: Vec<(WindowId, f64, f64)> = frames
+        // Each candidate carries (wid, primary distance, perpendicular distance, y, x).  The
+        // position fields only exist to break ties deterministically: on an exact tie the
+        // topmost window wins, then the leftmost one, then the lowest window id.  Without
+        // that, a tie would be resolved by map iteration order and flip between runs.
+        let candidates: Vec<(WindowId, f64, f64, f64, f64)> = frames
             .iter()
             .filter(|(wid, _)| Some(**wid) != from)
             .map(|(wid, rect)| {
                 let (x, y) = rect.center();
-                (*wid, x, y)
+                (*wid, 0.0, 0.0, y, x)
             })
             .collect();
         if candidates.is_empty() {
@@ -482,37 +486,39 @@ impl Layout {
 
         let directional = candidates
             .iter()
-            .filter_map(|(wid, x, y)| {
+            .filter_map(|&(wid, _, _, y, x)| {
                 let (primary, perpendicular) = match direction {
-                    Direction::Left if *x < cx - FOCUS_EPSILON => (cx - *x, (*y - cy).abs()),
-                    Direction::Right if *x > cx + FOCUS_EPSILON => (*x - cx, (*y - cy).abs()),
-                    Direction::Up if *y < cy - FOCUS_EPSILON => (cy - *y, (*x - cx).abs()),
-                    Direction::Down if *y > cy + FOCUS_EPSILON => (*y - cy, (*x - cx).abs()),
+                    Direction::Left if x < cx - FOCUS_EPSILON => (cx - x, (y - cy).abs()),
+                    Direction::Right if x > cx + FOCUS_EPSILON => (x - cx, (y - cy).abs()),
+                    Direction::Up if y < cy - FOCUS_EPSILON => (cy - y, (x - cx).abs()),
+                    Direction::Down if y > cy + FOCUS_EPSILON => (y - cy, (x - cx).abs()),
                     _ => return None,
                 };
-                Some((*wid, primary, perpendicular))
+                Some((wid, primary, perpendicular, y, x))
             })
-            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)));
-        if let Some((wid, _, _)) = directional {
+            .min_by(compare_focus_candidates);
+        if let Some(&(wid, ..)) = directional.as_ref() {
             return Some(wid);
         }
 
         // Wrap around: pick the window at the far edge on the opposite side.
-        let wrapped = match direction {
-            Direction::Right => candidates
-                .iter()
-                .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2))),
-            Direction::Left => candidates
-                .iter()
-                .max_by(|a, b| a.1.total_cmp(&b.1).then(b.2.total_cmp(&a.2))),
-            Direction::Down => candidates
-                .iter()
-                .min_by(|a, b| a.2.total_cmp(&b.2).then(a.1.total_cmp(&b.1))),
-            Direction::Up => candidates
-                .iter()
-                .max_by(|a, b| a.2.total_cmp(&b.2).then(b.1.total_cmp(&a.1))),
-        };
-        wrapped.map(|(wid, _, _)| *wid)
+        let wrapped = candidates
+            .iter()
+            .map(|&(wid, _, _, y, x)| {
+                let (primary, perpendicular) = match direction {
+                    // Nothing to the right: wrap to the leftmost window.
+                    Direction::Right => (x - cx, (y - cy).abs()),
+                    // Nothing to the left: wrap to the rightmost window.
+                    Direction::Left => (cx - x, (y - cy).abs()),
+                    // Nothing below: wrap to the topmost window.
+                    Direction::Down => (y - cy, (x - cx).abs()),
+                    // Nothing above: wrap to the bottommost window.
+                    Direction::Up => (cy - y, (x - cx).abs()),
+                };
+                (wid, primary, perpendicular, y, x)
+            })
+            .min_by(compare_focus_candidates);
+        wrapped.map(|(wid, ..)| wid)
     }
 
     // -------------------------------------------------------------------------------------
@@ -1294,6 +1300,20 @@ fn locate(workspace: &Workspace, wid: WindowId) -> Option<Location> {
         return Some(Location::Stack(stack_id, member));
     }
     workspace.tree.window_node(wid).map(Location::Plain)
+}
+
+/// Total order for directional-focus candidates: nearest first, then the one perpendicular
+/// to the focus direction, then topmost, then leftmost, then the lowest window id.  Used by
+/// both the directional pass and the wrap-around pass so ties never depend on iteration order.
+fn compare_focus_candidates(
+    a: &(WindowId, f64, f64, f64, f64),
+    b: &(WindowId, f64, f64, f64, f64),
+) -> std::cmp::Ordering {
+    a.1.total_cmp(&b.1)
+        .then(a.2.total_cmp(&b.2))
+        .then(a.3.total_cmp(&b.3))
+        .then(a.4.total_cmp(&b.4))
+        .then(a.0.cmp(&b.0))
 }
 
 fn adjacent_sibling(tree: &Tree, node: NodeId, direction: Direction) -> Option<NodeId> {

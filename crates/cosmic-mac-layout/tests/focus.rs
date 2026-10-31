@@ -14,6 +14,32 @@ fn three_horizontal() -> Harness {
     harness
 }
 
+/// One full-height window on the left half and two windows splitting the right half — the
+/// arrangement from the VM integration test.  The two right-hand windows are exactly
+/// equidistant from the left window's centre, so directional focus must break the tie by
+/// position (topmost wins), never by window-id iteration order.
+fn left_and_two_on_the_right() -> Harness {
+    let mut harness = Harness::with(Config::default(), Rect::new(0.0, 0.0, 1728.0, 975.0));
+    harness.add();
+    harness.add();
+    harness.add();
+    harness
+}
+
+#[test]
+fn focus_right_from_left_half_picks_the_top_right_window() {
+    let mut harness = left_and_two_on_the_right();
+    harness.act(Action::FocusWindow { wid: 1 });
+    harness.act(Action::Focus {
+        direction: Direction::Right,
+    });
+    // Windows 2 and 3 tie on distance; the top one wins no matter which wid it got.
+    let second = harness.frame(2);
+    let third = harness.frame(3);
+    let expected = if second.y <= third.y { 2 } else { 3 };
+    assert_eq!(harness.layout.focused(), Some(expected));
+}
+
 fn three_nested() -> Harness {
     let mut harness = Harness::with(Config::default(), Rect::new(0.0, 0.0, 1000.0, 1000.0));
     harness.add();
