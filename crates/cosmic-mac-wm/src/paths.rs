@@ -34,6 +34,14 @@ pub fn journal_path() -> PathBuf {
     cosmic_dir().join("frame-journal.ron")
 }
 
+/// `~/Library/Application Support/cosmic/wm-session.ron`.
+///
+/// Remembers the work area and tiling order of the last session so a restart
+/// can tell whether the previous tiling tree is still valid.
+pub fn session_path() -> PathBuf {
+    cosmic_dir().join("wm-session.ron")
+}
+
 /// `~/Library/Application Support/cosmic/com.system76.CosmicSettings.Shortcuts/custom.ron`.
 pub fn keybindings_path() -> PathBuf {
     cosmic_dir()
@@ -58,6 +66,7 @@ mod tests {
         assert!(dir.ends_with("Library/Application Support/cosmic"));
         assert!(socket_path().ends_with("cosmic-mac-wm.sock"));
         assert!(journal_path().ends_with("frame-journal.ron"));
+        assert!(session_path().ends_with("wm-session.ron"));
         assert!(
             keybindings_path()
                 .to_string_lossy()

@@ -80,6 +80,7 @@ fn main() {
     let runtime_shutdown = shutdown.clone();
     let socket_path = paths::socket_path();
     let journal_path = paths::journal_path();
+    let session_path = paths::session_path();
     let backend_for_run: cosmic_mac_wm::backend::SharedBackend = backend.clone();
     let runtime_thread = std::thread::Builder::new()
         .name("wm-runtime".into())
@@ -95,15 +96,15 @@ fn main() {
                     return;
                 }
             };
-            if let Err(error) = runtime.block_on(daemon::run(
-                backend_for_run,
+            let launch = daemon::Launch {
+                backend: backend_for_run,
                 config,
                 work_area,
                 journal_path,
+                session_path,
                 socket_path,
-                rx,
-                tx,
-            )) {
+            };
+            if let Err(error) = runtime.block_on(daemon::run(launch, rx, tx)) {
                 log::error!("daemon stopped: {error}");
             }
             runtime_shutdown.store(true, Ordering::SeqCst);

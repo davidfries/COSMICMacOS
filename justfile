@@ -79,6 +79,12 @@ wm-test:
 wm-lint:
     cargo clippy -p cosmic-mac-wm --all-targets -- -D warnings
 
+# Full host check for the daemon: tests, clippy and formatting.
+wm-check:
+    cargo test -p cosmic-mac-wm
+    cargo clippy -p cosmic-mac-wm --all-targets -- -D warnings
+    cargo fmt -p cosmic-mac-wm -- --check
+
 wm-fmt:
     cargo fmt -p cosmic-mac-wm
 

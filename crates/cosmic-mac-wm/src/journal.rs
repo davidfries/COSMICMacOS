@@ -156,7 +156,15 @@ impl Journal {
                 continue;
             }
             match backend.set_frame(wid, frame) {
-                Ok(()) => restored += 1,
+                Ok(applied) => {
+                    if applied.clamped {
+                        log::debug!(
+                            "journal: window {wid} restored to {:?} instead of {frame:?}",
+                            applied.applied
+                        );
+                    }
+                    restored += 1;
+                }
                 Err(error) => errors.push((wid, error)),
             }
         }
@@ -243,8 +251,18 @@ mod tests {
     fn corrupt_file_is_renamed_by_restore_stale() {
         struct Noop;
         impl PlatformBackend for Noop {
-            fn set_frame(&self, _: WindowId, _: Rect) -> Result<(), String> {
-                Ok(())
+            fn set_frame(
+                &self,
+                _: WindowId,
+                rect: Rect,
+            ) -> Result<crate::backend::AppliedFrame, String> {
+                Ok(crate::backend::AppliedFrame::new(rect, rect))
+            }
+            fn size_constraints(
+                &self,
+                _: WindowId,
+            ) -> Result<Option<crate::backend::SizeConstraints>, String> {
+                Ok(None)
             }
             fn raise(&self, _: WindowId) -> Result<(), String> {
                 Ok(())

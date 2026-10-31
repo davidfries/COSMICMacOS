@@ -5,7 +5,10 @@
 //!
 //! * [`keybindings`] — COSMIC `keybindings.ron` parsing and the embedded defaults.
 //! * [`journal`] — crash-safe original-frame journal.
+//! * [`session`] — work area and tiling order of the previous run, used to
+//!   decide whether a restart may reuse the old tree order.
 //! * [`rules`] — float-by-default classification and the managed-window filter.
+//! * [`constraints`] — per-window size constraints learned from the platform.
 //! * [`commands`] — `Command` → platform calls, debounce and tab-bar updates.
 //! * [`core`] — the single-threaded layout owner fed by platform events and IPC.
 //! * [`daemon`] — the tokio event loop joining platform, keyboard and IPC.
@@ -13,6 +16,7 @@
 
 pub mod backend;
 pub mod commands;
+pub mod constraints;
 pub mod core;
 pub mod daemon;
 pub mod ipc;
@@ -21,4 +25,5 @@ pub mod keybindings;
 pub mod macos;
 pub mod paths;
 pub mod rules;
+pub mod session;
 pub mod tabbar;

@@ -11,7 +11,6 @@ use tokio::sync::{mpsc, oneshot};
 use crate::backend::SharedBackend;
 use crate::core::Core;
 use crate::ipc;
-
 /// A message for the layout owner.
 pub enum Message {
     /// A window/application/display event from the platform observers.
@@ -26,17 +25,37 @@ pub enum Message {
     Shutdown,
 }
 
+/// Everything the daemon needs to start.
+pub struct Launch {
+    /// Platform backend.
+    pub backend: SharedBackend,
+    /// Window-manager configuration.
+    pub config: Config,
+    /// Work area at startup.
+    pub work_area: Rect,
+    /// Crash journal path.
+    pub journal_path: PathBuf,
+    /// Layout session snapshot path.
+    pub session_path: PathBuf,
+    /// IPC socket path.
+    pub socket_path: PathBuf,
+}
+
 /// Run the daemon until a signal arrives or the message channel closes.
 pub async fn run(
-    backend: SharedBackend,
-    config: Config,
-    work_area: Rect,
-    journal_path: PathBuf,
-    socket_path: PathBuf,
+    launch: Launch,
     mut rx: mpsc::UnboundedReceiver<Message>,
     tx: mpsc::UnboundedSender<Message>,
 ) -> Result<(), String> {
-    let mut core = Core::new(config, work_area, backend, journal_path);
+    let Launch {
+        backend,
+        config,
+        work_area,
+        journal_path,
+        session_path,
+        socket_path,
+    } = launch;
+    let mut core = Core::new(config, work_area, backend, journal_path, session_path);
 
     let listener = ipc::bind(&socket_path)?;
     let ipc_tx = tx.clone();
@@ -53,8 +72,12 @@ pub async fn run(
 
     let windows = core.applier().backend().windows();
     let count = windows.len();
-    let added = core.startup(windows);
-    log::info!("startup enumeration: {added} managed windows ({count} on screen)");
+    let report = core.startup(windows);
+    log::info!(
+        "startup enumeration: {} managed windows ({count} on screen), tree order {:?}",
+        report.added,
+        report.order
+    );
 
     while let Some(message) = rx.recv().await {
         match message {

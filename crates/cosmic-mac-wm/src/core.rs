@@ -6,19 +6,40 @@
 //! actions and IPC requests; nothing else touches the layout.  Queries are
 //! answered from the same state, so the IPC view is always a consistent
 //! snapshot.
+//!
+//! # App-clamped frames
+//!
+//! Native apps silently refuse or clamp Accessibility resizes.  When the
+//! platform reports an [`AppliedFrame`](crate::backend::AppliedFrame) that
+//! differs from the request, [`Core`] probes the window's minimum size, feeds
+//! the learned constraint back into the layout with
+//! [`Layout::update_window`] and re-applies the recomputed frames so the
+//! siblings can absorb the difference.  A window that still refuses its tile
+//! (a frozen dimension) is reported once and then left alone: the daemon never
+//! loops on it.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cosmic_mac_layout::Layout;
 use cosmic_mac_platform::PlatformEvent;
-use cosmic_mac_protocol::{Action, Command, Config, Request, Response, ToplevelInfo, WindowId};
+use cosmic_mac_protocol::{
+    Action, Command, Config, Rect, Request, Response, ToplevelInfo, WindowId,
+};
 
 use crate::backend::PlatformBackend;
-use crate::commands::CommandApplier;
+use crate::commands::{ClampNotice, CommandApplier};
+use crate::constraints::{self, ConstraintStats, LearnedConstraints};
 use crate::journal::Journal;
 use crate::rules;
+use crate::session::{SessionState, SessionStore};
+
+/// A detected clamp may re-tile the layout once.  Anything the re-tile
+/// reports is recorded but never retried, so a window with a frozen dimension
+/// cannot make the daemon bounce frames forever.
+const MAX_CONSTRAINT_PASSES: u8 = 1;
 
 /// The daemon's state machine.
 pub struct Core {
@@ -29,15 +50,33 @@ pub struct Core {
     /// events that macOS emits while a programmatic focus change settles.
     focus_debounce: Duration,
     self_pid: i32,
+    session: SessionStore,
+    /// Size constraints learned per window this session.  Probing moves the
+    /// window, so a window is probed at most once per session.
+    constraints: HashMap<WindowId, LearnedConstraints>,
+    constraint_stats: ConstraintStats,
+}
+
+/// What [`Core::startup`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupReport {
+    /// Windows handed to the layout.
+    pub added: usize,
+    /// True when the previous session's tiling order was discarded because the
+    /// work area changed (or because there was no previous session).
+    pub tree_rebuilt: bool,
+    /// Window order used for insertion, front-to-back.
+    pub order: Vec<WindowId>,
 }
 
 impl Core {
     /// Create a core with an initial work area.
     pub fn new(
         config: Config,
-        work_area: cosmic_mac_protocol::Rect,
+        work_area: Rect,
         backend: Arc<dyn PlatformBackend>,
         journal_path: PathBuf,
+        session_path: PathBuf,
     ) -> Self {
         let layout = Layout::with_work_area(config, work_area);
         let applier = CommandApplier::new(backend, Journal::new(journal_path), work_area);
@@ -47,6 +86,9 @@ impl Core {
             recent_focus: None,
             focus_debounce: Duration::from_millis(250),
             self_pid: std::process::id() as i32,
+            session: SessionStore::new(session_path),
+            constraints: HashMap::new(),
+            constraint_stats: ConstraintStats::default(),
         }
     }
 
@@ -60,21 +102,70 @@ impl Core {
         &self.applier
     }
 
+    /// Constraints learned for a window, if any.
+    pub fn constraints(&self, wid: WindowId) -> Option<LearnedConstraints> {
+        self.constraints.get(&wid).copied()
+    }
+
+    /// Clamp/probe/retile counters (diagnostics and tests).
+    pub fn constraint_stats(&self) -> ConstraintStats {
+        self.constraint_stats
+    }
+
     /// Startup enumeration.  `windows` must be front-to-back (the order of
-    /// `CGWindowListCopyWindowInfo`).  Windows are added back-to-front so the
-    /// frontmost one is focused last.
-    pub fn startup(&mut self, windows: Vec<ToplevelInfo>) -> usize {
-        let front = windows
-            .iter()
-            .find(|info| rules::is_manageable(info))
-            .map(|info| info.wid);
+    /// `CGWindowListCopyWindowInfo`).
+    ///
+    /// The tiling tree is always rebuilt from scratch; only the *order* can be
+    /// reused.  If the work area changed since the last session, the recorded
+    /// order is discarded (its tiles were sized for a different screen) and the
+    /// fresh enumeration order is used.
+    ///
+    /// Windows are inserted back-to-front next to the **largest** current tile
+    /// rather than next to the previously added window.  Inserting every window
+    /// next to its predecessor builds a chain of halved tiles (`1/2`, `1/4`,
+    /// `1/8`, ...), which is why a restart with eight windows used to park
+    /// Finder and Notes in tiny corner tiles.
+    pub fn startup(&mut self, windows: Vec<ToplevelInfo>) -> StartupReport {
+        let work_area = self.layout.work_area();
+        let previous = self.session.load();
+        let previous_area = previous.as_ref().and_then(|state| state.work_area);
+        let changed = previous_area.is_some_and(|area| !area.approx_eq(work_area, 0.5));
+        let tree_rebuilt = changed || previous.is_none();
+        if changed {
+            log::warn!(
+                "work area changed since the last session ({previous_area:?} -> {work_area:?}); \
+                 discarding the previous tiling tree and rebuilding it from a fresh \
+                 front-to-back enumeration"
+            );
+        } else if previous.is_some() {
+            log::info!("work area unchanged ({work_area:?}); reusing the previous tiling order");
+        } else {
+            log::info!("no previous layout session; building the tiling tree from scratch");
+        }
+
+        let mut windows: Vec<ToplevelInfo> = windows
+            .into_iter()
+            .filter(rules::is_manageable)
+            .filter(|info| self.layout.window_info(info.wid).is_none())
+            .collect();
+        if let Some(previous) = &previous
+            && !changed
+        {
+            let recorded = &previous.tiled_order;
+            windows.sort_by_key(|info| {
+                recorded
+                    .iter()
+                    .position(|wid| *wid == info.wid)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+
+        let front = windows.first().map(|info| info.wid);
+        let order: Vec<WindowId> = windows.iter().map(|info| info.wid).collect();
         let mut added = 0;
         for info in windows.into_iter().rev() {
-            if !rules::is_manageable(&info) {
-                continue;
-            }
-            if self.layout.window_info(info.wid).is_some() {
-                continue;
+            if let Some(reference) = self.largest_tile() {
+                self.focus_window(reference);
             }
             self.add_window(info);
             added += 1;
@@ -84,7 +175,12 @@ impl Core {
         {
             self.focus_window(front);
         }
-        added
+        self.persist_session();
+        StartupReport {
+            added,
+            tree_rebuilt,
+            order,
+        }
     }
 
     /// Feed one platform event.
@@ -146,6 +242,7 @@ impl Core {
             Vec::new()
         };
         self.applier.forget_window(wid);
+        self.constraints.remove(&wid);
         self.apply(commands);
     }
 
@@ -179,7 +276,9 @@ impl Core {
                 return;
             }
             log::debug!("window {wid} moved by user; snapping back to {rect:?}");
-            self.applier.reapply_frame(wid, rect);
+            if let Some(clamp) = self.applier.reapply_frame(wid, rect) {
+                self.handle_clamp(clamp, 0);
+            }
         }
     }
 
@@ -191,6 +290,11 @@ impl Core {
         let mut info = self.applier.backend().window_info(wid).unwrap_or(existing);
         if let Some(title) = title {
             info.title = title;
+        }
+        // The fresh platform record has no learned constraints; keep them so a
+        // title change does not make the layout forget a window's minimum size.
+        if let Some(learned) = self.constraints.get(&wid).copied() {
+            info = constraints::attach(info, learned);
         }
         let commands = self.layout.update_window(rules::normalize_for_layout(info));
         self.apply(commands);
@@ -279,8 +383,9 @@ impl Core {
         }
     }
 
-    /// Display work area changed.
-    pub fn set_work_area(&mut self, work_area: cosmic_mac_protocol::Rect) {
+    /// Display work area changed.  Every window is re-tiled onto the new area
+    /// by the layout, and the new area is recorded for the next restart.
+    pub fn set_work_area(&mut self, work_area: Rect) {
         if work_area == self.applier.work_area() {
             return;
         }
@@ -288,11 +393,14 @@ impl Core {
         self.applier.set_work_area(work_area);
         let commands = self.layout.set_work_area(work_area);
         self.apply(commands);
+        self.persist_session();
     }
 
     /// Restore every touched window and drop the journal.
     pub fn shutdown(&mut self) {
+        self.persist_session();
         let restored = self.applier.restore_all();
+        self.constraints.clear();
         log::info!("shutdown: restored {restored} windows");
     }
 
@@ -307,6 +415,41 @@ impl Core {
         self.apply(commands);
     }
 
+    /// Largest visible tiled frame on the active workspace, used to keep the
+    /// startup tree balanced.
+    fn largest_tile(&self) -> Option<WindowId> {
+        let active = self.layout.active_workspace();
+        self.layout
+            .windows()
+            .into_iter()
+            .filter(|state| state.visible && !state.floating && state.workspace == active)
+            .max_by(|a, b| a.frame.area().total_cmp(&b.frame.area()))
+            .map(|state| state.info.wid)
+    }
+
+    /// Tiled windows in tree order, for the next restart.
+    fn tiled_order(&self) -> Vec<WindowId> {
+        let mut order = self
+            .layout
+            .tree_snapshot()
+            .map(|tree| tree.window_ids())
+            .unwrap_or_default();
+        for state in self.layout.windows() {
+            if !state.floating && !order.contains(&state.info.wid) {
+                order.push(state.info.wid);
+            }
+        }
+        order
+    }
+
+    fn persist_session(&self) {
+        let state = SessionState {
+            work_area: Some(self.layout.work_area()),
+            tiled_order: self.tiled_order(),
+        };
+        self.session.save(&state);
+    }
+
     fn apply(&mut self, commands: Vec<Command>) {
         if !commands.is_empty() {
             log::debug!("commands: {commands:?}");
@@ -317,13 +460,159 @@ impl Core {
         }) {
             self.recent_focus = Some((wid, Instant::now()));
         }
-        self.applier.apply(&commands);
+        let clamps = self.applier.apply(&commands);
+        for clamp in clamps {
+            self.handle_clamp(clamp, 0);
+        }
         // StackChanged is only emitted when the stack identity changes; a work
-        // area change can move the stack without a new command, so re-sync the
-        // tab bar after every batch.  The applier de-duplicates.
+        // area change or a re-tile can move the stack without a new command, so
+        // re-sync the tab bar after every batch.  The applier de-duplicates.
         if let Err(error) = self.applier.sync_stack_bar(self.layout.active_stack()) {
             log::debug!("tab bar update failed: {error}");
         }
+    }
+
+    /// React to a frame the platform refused: learn the window's constraint,
+    /// re-tile the layout with it and re-apply the recomputed frames.
+    fn handle_clamp(&mut self, clamp: ClampNotice, depth: u8) {
+        if depth >= MAX_CONSTRAINT_PASSES {
+            // The re-tile could not fix it either (a frozen dimension).  Log
+            // once per window and dimension, then leave the window alone.
+            self.record_stuck(clamp);
+            return;
+        }
+        self.learn_constraints(clamp);
+        let commands = self.retile_with_constraints(clamp.wid);
+        let followups = self.applier.apply(&commands);
+        self.record_stuck(clamp);
+        for followup in followups {
+            self.handle_clamp(followup, depth + 1);
+        }
+    }
+
+    /// Probe a window's size constraints once per session and cache the result.
+    ///
+    /// A missing or failing probe is not fatal: the daemon simply retiles with
+    /// no constraint and warns once if the frame stays wrong.  A per-axis
+    /// "frozen" report from the frame application itself is merged in for free,
+    /// so a frozen dimension is pinned on the very first pass.
+    fn learn_constraints(&mut self, clamp: ClampNotice) {
+        let wid = clamp.wid;
+        if !self
+            .constraints
+            .get(&wid)
+            .is_some_and(|constraints| constraints.probed)
+        {
+            self.constraint_stats.probes += 1;
+            let learned = match self.applier.backend().size_constraints(wid) {
+                Ok(constraints) => constraints,
+                Err(error) => {
+                    log::debug!("window {wid}: size constraint probe failed: {error}");
+                    None
+                }
+            };
+            // The probe moved the window and put it back; treat the frame it
+            // ended at as programmed so the resulting notifications stay
+            // echoes.
+            if let Some(frame) = self.applier.backend().frame(wid) {
+                self.applier.mark_programmed(wid, frame);
+            }
+            let constraints = self.constraints.entry(wid).or_default();
+            constraints.probed = true;
+            if let Some(learned) = learned {
+                log::info!("window {wid}: learned size constraints {learned:?}");
+                if learned.min.is_some() {
+                    constraints.min = learned.min;
+                }
+                if learned.max.is_some() {
+                    constraints.max = learned.max;
+                }
+                if let Some(value) = learned.width_frozen {
+                    constraints.freeze_width(value);
+                }
+                if let Some(value) = learned.height_frozen {
+                    constraints.freeze_height(value);
+                }
+            } else {
+                log::debug!("window {wid}: no size constraints reported by the probe");
+            }
+        }
+        let constraints = self.constraints.entry(wid).or_default();
+        if clamp.width_frozen {
+            constraints.freeze_width(clamp.applied.width);
+        }
+        if clamp.height_frozen {
+            constraints.freeze_height(clamp.applied.height);
+        }
+    }
+
+    /// Hand the learned constraints to the layout and return the commands that
+    /// re-tile the siblings.
+    fn retile_with_constraints(&mut self, wid: WindowId) -> Vec<Command> {
+        let Some(info) = self.layout.window_info(wid).cloned() else {
+            return Vec::new();
+        };
+        let learned = self.constraints.get(&wid).copied().unwrap_or_default();
+        let info = constraints::attach(info, learned);
+        self.constraint_stats.retiles += 1;
+        let mut commands = self.layout.update_window(rules::normalize_for_layout(info));
+        // Re-apply the window's own tile even when the layout only rebalanced
+        // siblings: the probe moved the window a moment ago and the layout's
+        // frame must win.
+        if let Some(rect) = self.layout.frame_of(wid)
+            && !commands
+                .iter()
+                .any(|command| matches!(command, Command::SetFrame { wid: w, .. } if *w == wid))
+        {
+            commands.push(Command::SetFrame { wid, rect });
+        }
+        if !commands.is_empty() {
+            log::debug!("re-tiling after a clamp on window {wid}: {commands:?}");
+        }
+        commands
+    }
+
+    /// Compare the window's frame with its tile after a re-tile and report a
+    /// dimension the app refuses to move, once.
+    fn record_stuck(&mut self, clamp: ClampNotice) {
+        let wid = clamp.wid;
+        let Some(want) = self.layout.frame_of(wid) else {
+            return;
+        };
+        let got = self.applier.backend().frame(wid).unwrap_or(clamp.applied);
+        if got.approx_eq(want, 1.0) {
+            return;
+        }
+        let mut details = Vec::new();
+        let constraints = self.constraints.entry(wid).or_default();
+        if (got.width - want.width).abs() > 1.0 && !constraints.warned_width {
+            constraints.warned_width = true;
+            // Remember the frozen width so the next `update_window` asks for
+            // exactly the value the app insists on.
+            constraints.freeze_width(got.width);
+            details.push(format!(
+                "width {:.0}px requested, stuck at {:.0}px",
+                want.width, got.width
+            ));
+        }
+        if (got.height - want.height).abs() > 1.0 && !constraints.warned_height {
+            constraints.warned_height = true;
+            constraints.freeze_height(got.height);
+            details.push(format!(
+                "height {:.0}px requested, stuck at {:.0}px",
+                want.height, got.height
+            ));
+        }
+        if details.is_empty() {
+            return;
+        }
+        self.constraint_stats.warnings += 1;
+        log::warn!(
+            "window {wid}: the app does not accept its tile {want:?} ({}); \
+             no sibling can absorb this right now, so it is left in place and \
+             reported only once",
+            details.join(", ")
+        );
     }
 
     fn is_recent_focus_event(&self) -> bool {
@@ -353,13 +642,17 @@ mod tests {
     use std::sync::Mutex;
 
     use cosmic_mac_platform::{PlatformEvent, Rect as PlatformRect};
-    use cosmic_mac_protocol::{Config, Rect, Request, Response, StackInfo, ToplevelInfo};
+    use cosmic_mac_protocol::{Config, Rect, Request, Response, Size, StackInfo, ToplevelInfo};
 
-    use crate::backend::PlatformResult;
+    use crate::backend::{AppliedFrame, PlatformResult, SizeConstraints};
+    use crate::session::{SessionState, SessionStore};
+
+    const WORK_AREA: Rect = Rect::new(0.0, 0.0, 1000.0, 800.0);
 
     #[derive(Debug, Clone, PartialEq)]
     enum Call {
         SetFrame(WindowId, Rect),
+        Probe(WindowId),
         Focus(WindowId),
         Park(WindowId, Rect),
         Unpark(WindowId),
@@ -372,6 +665,13 @@ mod tests {
         parked: HashMap<WindowId, Rect>,
         calls: Vec<Call>,
         work_area: Rect,
+        min_sizes: HashMap<WindowId, Size>,
+        frozen_width: HashMap<WindowId, f64>,
+        frozen_height: HashMap<WindowId, f64>,
+        probe_fails: bool,
+        /// Report clamps without the per-axis "frozen" classification, like a
+        /// platform that only knows `clamped: bool`.
+        hide_frozen: bool,
     }
 
     struct TestBackend {
@@ -387,6 +687,11 @@ mod tests {
                     parked: HashMap::new(),
                     calls: Vec::new(),
                     work_area,
+                    min_sizes: HashMap::new(),
+                    frozen_width: HashMap::new(),
+                    frozen_height: HashMap::new(),
+                    probe_fails: false,
+                    hide_frozen: false,
                 }),
             }
         }
@@ -398,14 +703,91 @@ mod tests {
         fn frame(&self, wid: WindowId) -> Option<Rect> {
             self.state.lock().unwrap().frames.get(&wid).copied()
         }
+
+        fn set_min_size(&self, wid: WindowId, size: Size) {
+            self.state.lock().unwrap().min_sizes.insert(wid, size);
+        }
+
+        fn freeze_width(&self, wid: WindowId, width: f64) {
+            self.state.lock().unwrap().frozen_width.insert(wid, width);
+        }
+
+        fn fail_probes(&self) {
+            self.state.lock().unwrap().probe_fails = true;
+        }
+
+        fn hide_frozen(&self) {
+            self.state.lock().unwrap().hide_frozen = true;
+        }
+
+        fn probes(&self) -> usize {
+            self.calls()
+                .into_iter()
+                .filter(|call| matches!(call, Call::Probe(_)))
+                .count()
+        }
+
+        fn frames(&self) -> HashMap<WindowId, Rect> {
+            self.state.lock().unwrap().frames.clone()
+        }
     }
 
     impl PlatformBackend for TestBackend {
-        fn set_frame(&self, wid: WindowId, rect: Rect) -> PlatformResult<()> {
+        fn set_frame(&self, wid: WindowId, rect: Rect) -> PlatformResult<AppliedFrame> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::SetFrame(wid, rect));
-            state.frames.insert(wid, rect);
-            Ok(())
+            let mut applied = rect;
+            if let Some(frozen) = state.frozen_width.get(&wid) {
+                applied.width = *frozen;
+            }
+            if let Some(frozen) = state.frozen_height.get(&wid) {
+                applied.height = *frozen;
+            }
+            if let Some(min) = state.min_sizes.get(&wid) {
+                applied.width = applied.width.max(min.width);
+                applied.height = applied.height.max(min.height);
+            }
+            let width_frozen = !state.hide_frozen
+                && state
+                    .frozen_width
+                    .get(&wid)
+                    .is_some_and(|frozen| (rect.width - *frozen).abs() > 1.0);
+            let height_frozen = !state.hide_frozen
+                && state
+                    .frozen_height
+                    .get(&wid)
+                    .is_some_and(|frozen| (rect.height - *frozen).abs() > 1.0);
+            state.frames.insert(wid, applied);
+            Ok(AppliedFrame::with_axes(
+                rect,
+                applied,
+                width_frozen,
+                height_frozen,
+            ))
+        }
+        fn size_constraints(&self, wid: WindowId) -> PlatformResult<Option<SizeConstraints>> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(Call::Probe(wid));
+            if state.probe_fails {
+                return Err("probe unsupported".into());
+            }
+            let frozen_width = state.frozen_width.get(&wid).copied();
+            let frozen_height = state.frozen_height.get(&wid).copied();
+            let min = state.min_sizes.get(&wid).copied();
+            let mut width = min.map(|size| size.width).unwrap_or(100.0);
+            let mut height = min.map(|size| size.height).unwrap_or(100.0);
+            if let Some(frozen) = frozen_width {
+                width = frozen;
+            }
+            if let Some(frozen) = frozen_height {
+                height = frozen;
+            }
+            Ok(Some(SizeConstraints {
+                min: Some(Size::new(width, height)),
+                max: None,
+                width_frozen: frozen_width.filter(|_| !state.hide_frozen),
+                height_frozen: frozen_height.filter(|_| !state.hide_frozen),
+            }))
         }
         fn raise(&self, _: WindowId) -> PlatformResult<()> {
             Ok(())
@@ -478,16 +860,41 @@ mod tests {
         }
     }
 
-    fn core(frames: &[(WindowId, Rect)]) -> (Core, Arc<TestBackend>, tempfile::TempDir) {
+    fn core_with(
+        frames: &[(WindowId, Rect)],
+        work_area: Rect,
+        session: Option<SessionState>,
+    ) -> (Core, Arc<TestBackend>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let backend = Arc::new(TestBackend::new(frames, Rect::new(0.0, 0.0, 1000.0, 800.0)));
+        let session_path = dir.path().join("wm-session.ron");
+        if let Some(state) = session {
+            SessionStore::new(&session_path).save(&state);
+        }
+        let backend = Arc::new(TestBackend::new(frames, work_area));
         let core = Core::new(
             Config::default(),
-            Rect::new(0.0, 0.0, 1000.0, 800.0),
+            work_area,
             backend.clone(),
             dir.path().join("frame-journal.ron"),
+            session_path,
         );
         (core, backend, dir)
+    }
+
+    fn core(frames: &[(WindowId, Rect)]) -> (Core, Arc<TestBackend>, tempfile::TempDir) {
+        core_with(frames, WORK_AREA, None)
+    }
+
+    fn window(wid: WindowId) -> ToplevelInfo {
+        ToplevelInfo::new(wid, "com.example.app", "title")
+            .with_initial_frame(Rect::new(0.0, 0.0, 500.0, 400.0))
+    }
+
+    fn set_frames_after(calls: &[Call], marker: usize, wid: WindowId) -> usize {
+        calls[marker..]
+            .iter()
+            .filter(|call| matches!(call, Call::SetFrame(w, _) if *w == wid))
+            .count()
     }
 
     #[test]
@@ -496,7 +903,8 @@ mod tests {
             (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
             (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
         ]);
-        assert_eq!(core.startup(backend.windows()), 2);
+        let report = core.startup(backend.windows());
+        assert_eq!(report.added, 2);
         assert_eq!(core.layout().focused(), Some(1));
         let calls = backend.calls();
         assert!(calls.contains(&Call::Focus(1)), "{calls:?}");
@@ -599,5 +1007,269 @@ mod tests {
             core.layout().window_info(1).map(|info| info.title.as_str()),
             Some("Renamed")
         );
+    }
+
+    #[test]
+    fn clamped_frame_triggers_probe_retile_and_flush_tiles() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        assert_eq!(core.constraint_stats().probes, 0);
+
+        // Notes-style horizontal minimum: the app refuses to go below 600px.
+        backend.set_min_size(1, Size::new(600.0, 100.0));
+        let marker = backend.calls().len();
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+
+        let stats = core.constraint_stats();
+        assert_eq!(stats.probes, 1, "the clamp must trigger exactly one probe");
+        assert_eq!(
+            stats.retiles, 1,
+            "the probe must trigger exactly one retile"
+        );
+        assert_eq!(
+            stats.warnings, 0,
+            "the layout absorbed the minimum, so nothing is stuck"
+        );
+        assert_eq!(
+            core.constraints(1).and_then(|constraints| constraints.min),
+            Some(Size::new(600.0, 100.0)),
+            "the learned minimum is cached"
+        );
+        // The re-apply step issues the layout tile again after the probe.
+        assert!(
+            set_frames_after(&backend.calls(), marker, 1) >= 2,
+            "expected the clamped window to be re-applied: {:?}",
+            backend.calls()
+        );
+
+        // The re-tile is flush: the clamped window takes its minimum and the
+        // sibling shrinks to absorb it.
+        let frames = backend.frames();
+        assert_eq!(frames.get(&1).map(|frame| frame.width), Some(600.0));
+        assert_eq!(frames.get(&2).map(|frame| frame.width), Some(300.0));
+        assert!(
+            (frames.get(&1).unwrap().area() + frames.get(&2).unwrap().area() - 900.0 * 800.0).abs()
+                < 1.0
+        );
+
+        // A later layout change must not probe again.
+        core.set_work_area(Rect::new(0.0, 0.0, 1000.0, 800.0));
+        assert_eq!(core.constraint_stats().probes, 1);
+        assert_eq!(backend.probes(), 1);
+        assert_eq!(core.constraint_stats().warnings, 0);
+    }
+
+    #[test]
+    fn a_frozen_dimension_is_pinned_and_absorbed_by_the_siblings() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+
+        // System Settings freezes its width at 715px: it ignores both larger
+        // and smaller requests, and the platform classifies the axis as Frozen.
+        backend.freeze_width(1, 715.0);
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+
+        assert_eq!(core.constraint_stats().probes, 1);
+        let constraints = core.constraints(1).expect("constraints");
+        assert_eq!(constraints.min.map(|size| size.width), Some(715.0));
+        assert_eq!(constraints.max.map(|size| size.width), Some(715.0));
+        // The layout asked for exactly the frozen width on the re-tile and the
+        // sibling absorbed the difference: no warning, no wallpaper gap.
+        assert_eq!(core.constraint_stats().warnings, 0);
+        let frames = backend.frames();
+        assert_eq!(frames.get(&1).map(|frame| frame.width), Some(715.0));
+        assert_eq!(frames.get(&2).map(|frame| frame.width), Some(185.0));
+    }
+
+    #[test]
+    fn a_silent_frozen_dimension_warns_once_and_never_loops() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+
+        // Worst case: the app is silently stuck at 715px, the platform only
+        // reports `clamped` (no per-axis classification) and the probe fails.
+        backend.freeze_width(1, 715.0);
+        backend.hide_frozen();
+        backend.fail_probes();
+        let marker = backend.calls().len();
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+
+        let stats = core.constraint_stats();
+        assert_eq!(stats.probes, 1);
+        assert_eq!(stats.retiles, 1);
+        assert_eq!(stats.warnings, 1, "the stuck dimension is reported once");
+        assert!(
+            backend.calls().len() - marker < 12,
+            "the first clamp pass must be bounded: {} calls",
+            backend.calls().len() - marker
+        );
+
+        // More layout passes must not re-probe and must not warn again.  The
+        // pinned width learned from the stuck frame lets a later re-tile fix it.
+        let after_first = backend.calls().len();
+        core.set_work_area(Rect::new(0.0, 0.0, 1200.0, 900.0));
+        core.set_work_area(Rect::new(0.0, 0.0, 1000.0, 700.0));
+        assert_eq!(core.constraint_stats().probes, 1);
+        assert_eq!(core.constraint_stats().warnings, 1);
+        assert_eq!(backend.probes(), 1);
+        assert!(
+            backend.calls().len() - after_first < 20,
+            "no retry storm: {} extra calls",
+            backend.calls().len() - after_first
+        );
+    }
+
+    #[test]
+    fn probe_failures_are_tolerated_and_do_not_loop() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        // A clamped-but-shrinkable app whose probe is unavailable: the daemon
+        // cannot learn a minimum, so the frame stays wrong and is reported once.
+        backend.set_min_size(1, Size::new(700.0, 100.0));
+        backend.fail_probes();
+        let marker = backend.calls().len();
+
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+
+        let stats = core.constraint_stats();
+        assert_eq!(stats.probes, 1);
+        assert_eq!(stats.retiles, 1);
+        assert_eq!(stats.warnings, 1);
+        // Bounded: one initial application plus one re-apply for the window.
+        assert!(set_frames_after(&backend.calls(), marker, 1) <= 3);
+        let constraints = core.constraints(1).expect("constraints");
+        assert!(constraints.probed);
+        // The stuck width is pinned so a later re-tile can absorb it, even
+        // though the probe itself learned nothing.
+        assert_eq!(constraints.min.map(|size| size.width), Some(700.0));
+    }
+
+    #[test]
+    fn work_area_change_reframes_every_window() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (3, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        let marker = backend.calls().len();
+
+        let area = Rect::new(0.0, 0.0, 1440.0, 900.0);
+        core.set_work_area(area);
+
+        let calls = backend.calls();
+        let mut covered = 0.0;
+        for wid in [1, 2, 3] {
+            assert_eq!(
+                set_frames_after(&calls, marker, wid),
+                1,
+                "window {wid} must be re-framed exactly once"
+            );
+            let frame = backend.frame(wid).expect("frame");
+            assert!(
+                frame.x >= area.x - 0.5 && frame.y >= area.y - 0.5,
+                "{frame:?}"
+            );
+            assert!(
+                frame.right() <= area.right() + 0.5 && frame.bottom() <= area.bottom() + 0.5,
+                "{frame:?} outside {area:?}"
+            );
+            covered += frame.area();
+        }
+        // Flush tiles: the frames cover the whole new work area.
+        assert!(
+            (covered - area.area()).abs() < 1.0,
+            "{covered} != {}",
+            area.area()
+        );
+        assert_eq!(core.applier().work_area(), area);
+    }
+
+    #[test]
+    fn restart_with_a_changed_work_area_rebuilds_a_fresh_tree() {
+        let new_area = Rect::new(0.0, 0.0, 1600.0, 1000.0);
+        let session = SessionState {
+            work_area: Some(WORK_AREA),
+            tiled_order: vec![6, 5, 4, 3, 2, 1],
+        };
+        let frames: Vec<(WindowId, Rect)> = (1..=6)
+            .map(|wid| (wid, Rect::new(0.0, 0.0, 400.0, 300.0)))
+            .collect();
+        let (mut core, backend, _dir) = core_with(&frames, new_area, Some(session));
+
+        let report = core.startup((1..=6).map(window).collect());
+
+        assert!(
+            report.tree_rebuilt,
+            "a changed work area must discard the tree"
+        );
+        assert_eq!(report.order, vec![1, 2, 3, 4, 5, 6]);
+        let frames = backend.frames();
+        let mut smallest = f64::INFINITY;
+        for wid in 1..=6 {
+            let frame = frames.get(&wid).copied().expect("frame");
+            assert!(
+                frame.x >= new_area.x - 0.5
+                    && frame.y >= new_area.y - 0.5
+                    && frame.right() <= new_area.right() + 0.5
+                    && frame.bottom() <= new_area.bottom() + 0.5,
+                "window {wid} frame {frame:?} outside {new_area:?}"
+            );
+            smallest = smallest.min(frame.area());
+        }
+        // A balanced tree keeps the smallest tile within a factor of two of the
+        // others; the old insertion order produced 1/64 tiles for the first
+        // window.
+        assert!(
+            smallest >= new_area.area() / 8.0 - 1.0,
+            "startup tree is not balanced: smallest tile {smallest} of {}",
+            new_area.area()
+        );
+        // The session file now records the new work area.
+        let recorded = SessionStore::new(_dir.path().join("wm-session.ron"))
+            .load()
+            .expect("session");
+        assert_eq!(recorded.work_area, Some(new_area));
+    }
+
+    #[test]
+    fn restart_with_an_unchanged_work_area_reuses_the_recorded_order() {
+        let session = SessionState {
+            work_area: Some(WORK_AREA),
+            tiled_order: vec![2, 3, 1],
+        };
+        let frames: Vec<(WindowId, Rect)> = (1..=3)
+            .map(|wid| (wid, Rect::new(0.0, 0.0, 400.0, 300.0)))
+            .collect();
+        let (mut core, _backend, _dir) = core_with(&frames, WORK_AREA, Some(session));
+
+        let report = core.startup((1..=3).map(window).collect());
+
+        assert!(!report.tree_rebuilt);
+        assert_eq!(report.order, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn shutdown_persists_the_session() {
+        let (mut core, backend, dir) = core(&[(1, Rect::new(0.0, 0.0, 400.0, 300.0))]);
+        core.startup(backend.windows());
+        core.shutdown();
+        let recorded = SessionStore::new(dir.path().join("wm-session.ron"))
+            .load()
+            .expect("session");
+        assert_eq!(recorded.work_area, Some(WORK_AREA));
+        assert_eq!(recorded.tiled_order, vec![1]);
     }
 }

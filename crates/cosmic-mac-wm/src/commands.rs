@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use cosmic_mac_protocol::{Command, Rect, StackInfo, WindowId};
 
-use crate::backend::{PlatformBackend, PlatformResult};
+use crate::backend::{AppliedFrame, PlatformBackend, PlatformResult};
 use crate::journal::Journal;
 
 /// How long after a programmatic move we ignore platform move notifications.
@@ -22,6 +22,24 @@ pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(150);
 struct Programmed {
     rect: Rect,
     at: Instant,
+}
+
+/// A window that refused (part of) the frame the layout assigned it.
+///
+/// The daemon reacts by probing the window's minimum size and re-tiling with
+/// the learned constraint; see [`crate::core::Core`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClampNotice {
+    /// Window the platform clamped.
+    pub wid: WindowId,
+    /// Frame the layout asked for.
+    pub requested: Rect,
+    /// Frame the window actually reached.
+    pub applied: Rect,
+    /// The app ignored the width change entirely (System Settings style).
+    pub width_frozen: bool,
+    /// The app ignored the height change entirely.
+    pub height_frozen: bool,
 }
 
 /// Applies layout commands to a backend.
@@ -35,6 +53,8 @@ pub struct CommandApplier {
     last_stack: Option<StackInfo>,
     stack_initialised: bool,
     debounce: Duration,
+    /// Clamps discovered while applying the current batch.
+    clamps: Vec<ClampNotice>,
 }
 
 impl CommandApplier {
@@ -50,6 +70,7 @@ impl CommandApplier {
             last_stack: None,
             stack_initialised: false,
             debounce: DEFAULT_DEBOUNCE,
+            clamps: Vec::new(),
         }
     }
 
@@ -84,23 +105,48 @@ impl CommandApplier {
     }
 
     /// Apply a batch of commands in order, logging per-command failures.
-    pub fn apply(&mut self, commands: &[Command]) {
+    ///
+    /// Returns the windows whose frames the platform refused to honour.  The
+    /// caller (the layout owner) turns those into constraint probes and a
+    /// re-tile; the applier deliberately does not own the layout.
+    pub fn apply(&mut self, commands: &[Command]) -> Vec<ClampNotice> {
+        self.clamps.clear();
         for command in commands {
             if let Err(error) = self.apply_one(command) {
                 log::warn!("{command:?} failed: {error}");
             }
         }
         self.prune_programmed();
+        std::mem::take(&mut self.clamps)
     }
 
     /// Apply one command.
     pub fn apply_one(&mut self, command: &Command) -> PlatformResult<()> {
         match command {
             Command::SetFrame { wid, rect } => {
+                // The journal must be on disk before the first frame is
+                // touched, no matter what the platform answers.
                 self.record_original(*wid);
-                self.backend.set_frame(*wid, *rect)?;
+                let outcome = self.backend.set_frame(*wid, *rect)?;
                 self.visible.insert(*wid);
-                self.mark_programmed(*wid, *rect);
+                // Record what the window actually reached.  Recording the
+                // requested frame would make the echo suppression compare
+                // against a frame the window is never at.
+                self.mark_programmed(*wid, outcome.applied);
+                if outcome.clamped && outcome.size_differs(AppliedFrame::TOLERANCE) {
+                    log::debug!(
+                        "window {wid}: platform clamped {:?} to {:?}",
+                        rect,
+                        outcome.applied
+                    );
+                    self.clamps.push(ClampNotice {
+                        wid: *wid,
+                        requested: *rect,
+                        applied: outcome.applied,
+                        width_frozen: outcome.width_frozen,
+                        height_frozen: outcome.height_frozen,
+                    });
+                }
                 Ok(())
             }
             Command::Raise { wid } => self.backend.raise(*wid),
@@ -140,10 +186,27 @@ impl CommandApplier {
     }
 
     /// Re-apply a layout frame after the user moved a tiled window.
-    pub fn reapply_frame(&mut self, wid: WindowId, rect: Rect) {
+    ///
+    /// Returns the clamp when the app refused this frame too, so the layout
+    /// owner can learn from it.
+    pub fn reapply_frame(&mut self, wid: WindowId, rect: Rect) -> Option<ClampNotice> {
         match self.backend.set_frame(wid, rect) {
-            Ok(()) => self.mark_programmed(wid, rect),
-            Err(error) => log::warn!("snapping window {wid} back failed: {error}"),
+            Ok(outcome) => {
+                self.mark_programmed(wid, outcome.applied);
+                (outcome.clamped && outcome.size_differs(AppliedFrame::TOLERANCE)).then_some(
+                    ClampNotice {
+                        wid,
+                        requested: rect,
+                        applied: outcome.applied,
+                        width_frozen: outcome.width_frozen,
+                        height_frozen: outcome.height_frozen,
+                    },
+                )
+            }
+            Err(error) => {
+                log::warn!("snapping window {wid} back failed: {error}");
+                None
+            }
         }
     }
 
@@ -261,9 +324,14 @@ mod tests {
 
     use cosmic_mac_protocol::{StackInfo, TabInfo, ToplevelInfo};
 
+    use cosmic_mac_protocol::Size;
+
+    use crate::backend::SizeConstraints;
+
     #[derive(Debug, Clone, PartialEq)]
     enum Call {
         SetFrame(WindowId, Rect),
+        Probe(WindowId),
         Raise(WindowId),
         Focus(WindowId),
         Close(WindowId),
@@ -280,6 +348,8 @@ mod tests {
         calls: Vec<Call>,
         work_area: Rect,
         display: Rect,
+        /// Simulated minimum size per window.
+        min_sizes: HashMap<WindowId, Size>,
     }
 
     struct MockBackend {
@@ -295,6 +365,7 @@ mod tests {
                     calls: Vec::new(),
                     work_area,
                     display: Rect::new(0.0, 0.0, 1920.0, 1080.0),
+                    min_sizes: HashMap::new(),
                 }),
             }
         }
@@ -306,14 +377,36 @@ mod tests {
         fn frames(&self) -> HashMap<WindowId, Rect> {
             self.state.lock().unwrap().frames.clone()
         }
+
+        fn set_min_size(&self, wid: WindowId, size: Size) {
+            self.state.lock().unwrap().min_sizes.insert(wid, size);
+        }
     }
 
     impl PlatformBackend for MockBackend {
-        fn set_frame(&self, wid: WindowId, rect: Rect) -> PlatformResult<()> {
+        fn set_frame(&self, wid: WindowId, rect: Rect) -> PlatformResult<AppliedFrame> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::SetFrame(wid, rect));
-            state.frames.insert(wid, rect);
-            Ok(())
+            let mut applied = rect;
+            if let Some(min) = state.min_sizes.get(&wid) {
+                applied.width = applied.width.max(min.width);
+                applied.height = applied.height.max(min.height);
+            }
+            state.frames.insert(wid, applied);
+            Ok(AppliedFrame::new(rect, applied))
+        }
+
+        fn size_constraints(&self, wid: WindowId) -> PlatformResult<Option<SizeConstraints>> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(Call::Probe(wid));
+            Ok(state
+                .min_sizes
+                .get(&wid)
+                .copied()
+                .map(|min| SizeConstraints {
+                    min: Some(min),
+                    ..SizeConstraints::default()
+                }))
         }
         fn raise(&self, wid: WindowId) -> PlatformResult<()> {
             self.state.lock().unwrap().calls.push(Call::Raise(wid));
@@ -577,5 +670,74 @@ mod tests {
         assert!(applier.journal().contains(1));
         applier.forget_window(1);
         assert!(!applier.journal().contains(1));
+    }
+
+    #[test]
+    fn clamped_frame_is_reported_and_recorded_as_programmed() {
+        let (mut applier, backend, _dir) = applier(&[(1, Rect::new(0.0, 0.0, 400.0, 300.0))]);
+        backend.set_min_size(1, Size::new(642.0, 300.0));
+        let requested = Rect::new(0.0, 0.0, 500.0, 800.0);
+
+        let clamps = applier.apply(&[Command::SetFrame {
+            wid: 1,
+            rect: requested,
+        }]);
+
+        let applied = Rect::new(0.0, 0.0, 642.0, 800.0);
+        assert_eq!(
+            clamps,
+            vec![ClampNotice {
+                wid: 1,
+                requested,
+                applied,
+                width_frozen: false,
+                height_frozen: false,
+            }]
+        );
+        assert_eq!(backend.frames().get(&1), Some(&applied));
+    }
+
+    #[test]
+    fn debounce_uses_the_applied_frame_not_the_request() {
+        let (mut applier, backend, _dir) = applier(&[(1, Rect::new(0.0, 0.0, 400.0, 300.0))]);
+        backend.set_min_size(1, Size::new(800.0, 600.0));
+        applier.apply(&[Command::SetFrame {
+            wid: 1,
+            rect: Rect::new(0.0, 0.0, 500.0, 400.0),
+        }]);
+        // Simulate the debounce window having expired: an echo of the frame the
+        // window actually reached must still be recognised as ours, otherwise
+        // the daemon snaps the window back on every layout pass.
+        applier.set_debounce(Duration::ZERO);
+        let applied = Rect::new(0.0, 0.0, 800.0, 600.0);
+        assert!(
+            applier.is_echo(1, applied),
+            "the applied frame must be the programmed frame"
+        );
+        // The requested frame is not what the window is at; it is not an echo.
+        assert!(!applier.is_echo(1, Rect::new(0.0, 0.0, 500.0, 400.0)));
+    }
+
+    #[test]
+    fn journal_is_written_before_a_clamped_first_frame() {
+        let original = Rect::new(10.0, 20.0, 300.0, 200.0);
+        let (mut applier, backend, _dir) = applier(&[(1, original)]);
+        backend.set_min_size(1, Size::new(600.0, 200.0));
+        let journal_path = applier.journal().path().to_path_buf();
+        applier.apply(&[Command::SetFrame {
+            wid: 1,
+            rect: Rect::new(0.0, 0.0, 500.0, 200.0),
+        }]);
+        assert_eq!(Journal::load(&journal_path).unwrap().get(1), Some(original));
+    }
+
+    #[test]
+    fn reapplying_a_frame_reports_a_clamp() {
+        let (mut applier, backend, _dir) = applier(&[(1, Rect::new(0.0, 0.0, 400.0, 300.0))]);
+        backend.set_min_size(1, Size::new(700.0, 300.0));
+        let tile = Rect::new(0.0, 0.0, 500.0, 800.0);
+        let clamp = applier.reapply_frame(1, tile).expect("clamp reported");
+        assert_eq!(clamp.applied.width, 700.0);
+        assert_eq!(clamp.requested, tile);
     }
 }

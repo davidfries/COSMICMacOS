@@ -7,7 +7,7 @@ use cosmic_mac_platform::window::{self, ParkStore, WindowInfo};
 use cosmic_mac_platform::{Rect as PlatformRect, display};
 use cosmic_mac_protocol::{Rect, StackInfo, ToplevelInfo, WindowId};
 
-use crate::backend::{PlatformBackend, PlatformResult};
+use crate::backend::{AppliedFrame, PlatformBackend, PlatformResult, SizeConstraints};
 use crate::tabbar::TabBarHandle;
 
 /// The production backend.
@@ -63,8 +63,32 @@ impl Default for MacPlatform {
 }
 
 impl PlatformBackend for MacPlatform {
-    fn set_frame(&self, wid: WindowId, rect: Rect) -> PlatformResult<()> {
-        window::set_frame(wid as u32, to_platform(rect)).map_err(|error| error.to_string())
+    fn set_frame(&self, wid: WindowId, rect: Rect) -> PlatformResult<AppliedFrame> {
+        let outcome =
+            window::set_frame(wid as u32, to_platform(rect)).map_err(|error| error.to_string())?;
+        // `window::set_frame` already performs the size → position → size
+        // workaround, one corrective retry and a read-back.  Its per-axis
+        // classification tells us whether the app clamped (it has a minimum or
+        // maximum) or froze the dimension outright.
+        Ok(AppliedFrame::with_axes(
+            rect,
+            from_platform(outcome.applied),
+            outcome.width == window::DimensionOutcome::Frozen,
+            outcome.height == window::DimensionOutcome::Frozen,
+        ))
+    }
+
+    fn size_constraints(&self, wid: WindowId) -> PlatformResult<Option<SizeConstraints>> {
+        // The platform probe shrinks the window, reads back what it allowed and
+        // restores the frame; results are cached per window in the platform.
+        let constraints =
+            window::probe_size_constraints(wid as u32).map_err(|error| error.to_string())?;
+        Ok(constraints.map(|constraints| SizeConstraints {
+            min: constraints.min.map(from_platform_size),
+            max: constraints.max.map(from_platform_size),
+            width_frozen: constraints.width.maximum(),
+            height_frozen: constraints.height.maximum(),
+        }))
     }
 
     fn raise(&self, wid: WindowId) -> PlatformResult<()> {
@@ -107,6 +131,9 @@ impl PlatformBackend for MacPlatform {
 
     fn forget(&self, wid: WindowId) {
         self.park.forget(wid as u32);
+        // Drop the platform's cached probe result too: window ids are reused
+        // and a stale minimum would constrain the next window with this id.
+        window::forget_size_constraints(wid as u32);
     }
 
     fn restore_all(&self) -> Vec<(WindowId, String)> {
@@ -213,6 +240,10 @@ pub fn to_toplevel(info: &WindowInfo) -> ToplevelInfo {
         // are represented as dialogs so the pure layout engine floats them.
         is_dialog: info.is_dialog || info.is_floating || floating_subrole || picture_in_picture,
         initial_frame: Some(from_platform(info.frame)),
+        // Constraints are learned lazily from a probe after a clamped resize;
+        // probing every window during enumeration would move them all.
+        min_size: None,
+        max_size: None,
     }
 }
 
@@ -223,6 +254,10 @@ fn from_platform(rect: PlatformRect) -> Rect {
         rect.size.width,
         rect.size.height,
     )
+}
+
+fn from_platform_size(size: cosmic_mac_platform::Size) -> cosmic_mac_protocol::Size {
+    cosmic_mac_protocol::Size::new(size.width, size.height)
 }
 
 fn to_platform(rect: Rect) -> PlatformRect {
