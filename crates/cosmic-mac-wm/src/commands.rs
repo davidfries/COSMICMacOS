@@ -26,8 +26,10 @@ struct Programmed {
 
 /// A window that refused (part of) the frame the layout assigned it.
 ///
-/// The daemon reacts by probing the window's minimum size and re-tiling with
-/// the learned constraint; see [`crate::core::Core`].
+/// The daemon reacts by recording the direction of the difference and probing
+/// the window; see [`crate::core::Core`].  A single clamp cannot say whether the
+/// app has a minimum, a maximum or a genuinely frozen dimension, so only
+/// `requested` versus `applied` is carried here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClampNotice {
     /// Window the platform clamped.
@@ -36,10 +38,6 @@ pub struct ClampNotice {
     pub requested: Rect,
     /// Frame the window actually reached.
     pub applied: Rect,
-    /// The app ignored the width change entirely (System Settings style).
-    pub width_frozen: bool,
-    /// The app ignored the height change entirely.
-    pub height_frozen: bool,
 }
 
 /// Applies layout commands to a backend.
@@ -143,8 +141,6 @@ impl CommandApplier {
                         wid: *wid,
                         requested: *rect,
                         applied: outcome.applied,
-                        width_frozen: outcome.width_frozen,
-                        height_frozen: outcome.height_frozen,
                     });
                 }
                 Ok(())
@@ -198,8 +194,6 @@ impl CommandApplier {
                         wid,
                         requested: rect,
                         applied: outcome.applied,
-                        width_frozen: outcome.width_frozen,
-                        height_frozen: outcome.height_frozen,
                     },
                 )
             }
@@ -312,7 +306,7 @@ impl CommandApplier {
     }
 
     #[cfg(test)]
-    fn set_debounce(&mut self, debounce: Duration) {
+    pub(crate) fn set_debounce(&mut self, debounce: Duration) {
         self.debounce = debounce;
     }
 }
@@ -690,8 +684,6 @@ mod tests {
                 wid: 1,
                 requested,
                 applied,
-                width_frozen: false,
-                height_frozen: false,
             }]
         );
         assert_eq!(backend.frames().get(&1), Some(&applied));

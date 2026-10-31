@@ -67,28 +67,28 @@ impl PlatformBackend for MacPlatform {
         let outcome =
             window::set_frame(wid as u32, to_platform(rect)).map_err(|error| error.to_string())?;
         // `window::set_frame` already performs the size → position → size
-        // workaround, one corrective retry and a read-back.  Its per-axis
-        // classification tells us whether the app clamped (it has a minimum or
-        // maximum) or froze the dimension outright.
-        Ok(AppliedFrame::with_axes(
-            rect,
-            from_platform(outcome.applied),
-            outcome.width == window::DimensionOutcome::Frozen,
-            outcome.height == window::DimensionOutcome::Frozen,
-        ))
+        // workaround, one corrective retry and a read-back.  A single operation
+        // only says whether this request was honoured; the direction of a
+        // difference is recorded by the core and confirmed with a probe.
+        Ok(AppliedFrame::new(rect, from_platform(outcome.applied)))
     }
 
     fn size_constraints(&self, wid: WindowId) -> PlatformResult<Option<SizeConstraints>> {
-        // The platform probe shrinks the window, reads back what it allowed and
-        // restores the frame; results are cached per window in the platform.
+        // The platform probe shrinks and grows the window, reads back what it
+        // allowed and restores the frame; results are cached per window.
+        // `min`/`max` already use the final semantics: a Min axis leaves the
+        // max unbounded (f64::MAX) unless a grow clamp was found, and only a
+        // genuinely Frozen axis makes min == max.
         let constraints =
             window::probe_size_constraints(wid as u32).map_err(|error| error.to_string())?;
         Ok(constraints.map(|constraints| SizeConstraints {
             min: constraints.min.map(from_platform_size),
             max: constraints.max.map(from_platform_size),
-            width_frozen: constraints.width.maximum(),
-            height_frozen: constraints.height.maximum(),
         }))
+    }
+
+    fn forget_size_constraints(&self, wid: WindowId) {
+        window::forget_size_constraints(wid as u32);
     }
 
     fn raise(&self, wid: WindowId) -> PlatformResult<()> {

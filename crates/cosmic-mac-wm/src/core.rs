@@ -265,6 +265,10 @@ impl Core {
             // user move; never fight it.
             return;
         }
+        // The user may have resized this window by dragging an edge.  Drop the
+        // platform probe cache and the learned bounds so the next clamp probes
+        // the application again instead of trusting a stale minimum/maximum.
+        self.invalidate_constraints(wid);
         if state.floating {
             // Floating windows may be moved freely.  The layout keeps its old
             // placement frame; it is only used for diagnostics and snapshots.
@@ -490,59 +494,60 @@ impl Core {
         }
     }
 
-    /// Probe a window's size constraints once per session and cache the result.
+    /// Record one clamped frame and learn from it.
     ///
-    /// A missing or failing probe is not fatal: the daemon simply retiles with
-    /// no constraint and warns once if the frame stays wrong.  A per-axis
-    /// "frozen" report from the frame application itself is merged in for free,
-    /// so a frozen dimension is pinned on the very first pass.
+    /// A single `set_frame` result only tells us the *direction* of the
+    /// refusal: a window that comes back wider than requested refused to
+    /// shrink (minimum candidate), a window that comes back narrower refused
+    /// to grow (maximum candidate).  It cannot tell a minimum from a genuinely
+    /// frozen dimension, so the authoritative answer comes from the platform's
+    /// shrink **and** grow probe.  Candidates are promoted only after that
+    /// probe succeeds; a failed probe keeps them as evidence but never pins a
+    /// bound.
     fn learn_constraints(&mut self, clamp: ClampNotice) {
         let wid = clamp.wid;
-        if !self
+        self.constraints
+            .entry(wid)
+            .or_default()
+            .note_frame(clamp.requested, clamp.applied);
+
+        if self
             .constraints
             .get(&wid)
             .is_some_and(|constraints| constraints.probed)
         {
-            self.constraint_stats.probes += 1;
-            let learned = match self.applier.backend().size_constraints(wid) {
-                Ok(constraints) => constraints,
-                Err(error) => {
-                    log::debug!("window {wid}: size constraint probe failed: {error}");
-                    None
-                }
-            };
-            // The probe moved the window and put it back; treat the frame it
-            // ended at as programmed so the resulting notifications stay
-            // echoes.
-            if let Some(frame) = self.applier.backend().frame(wid) {
-                self.applier.mark_programmed(wid, frame);
+            // Already probed this session: the new observation can tighten the
+            // confirmed bounds (for example a Terminal grid snap).
+            self.constraints
+                .entry(wid)
+                .or_default()
+                .promote_candidates();
+            return;
+        }
+
+        self.constraint_stats.probes += 1;
+        let learned = match self.applier.backend().size_constraints(wid) {
+            Ok(constraints) => constraints,
+            Err(error) => {
+                log::debug!("window {wid}: size constraint probe failed: {error}");
+                None
             }
-            let constraints = self.constraints.entry(wid).or_default();
-            constraints.probed = true;
-            if let Some(learned) = learned {
-                log::info!("window {wid}: learned size constraints {learned:?}");
-                if learned.min.is_some() {
-                    constraints.min = learned.min;
-                }
-                if learned.max.is_some() {
-                    constraints.max = learned.max;
-                }
-                if let Some(value) = learned.width_frozen {
-                    constraints.freeze_width(value);
-                }
-                if let Some(value) = learned.height_frozen {
-                    constraints.freeze_height(value);
-                }
-            } else {
-                log::debug!("window {wid}: no size constraints reported by the probe");
-            }
+        };
+        // The probe moved the window and put it back; treat the frame it ended
+        // at as programmed so the resulting notifications stay echoes.
+        if let Some(frame) = self.applier.backend().frame(wid) {
+            self.applier.mark_programmed(wid, frame);
         }
         let constraints = self.constraints.entry(wid).or_default();
-        if clamp.width_frozen {
-            constraints.freeze_width(clamp.applied.width);
-        }
-        if clamp.height_frozen {
-            constraints.freeze_height(clamp.applied.height);
+        match learned {
+            Some(learned) => {
+                log::info!("window {wid}: learned size constraints {learned:?}");
+                constraints.confirm_probe(learned.min, learned.max);
+            }
+            None => {
+                log::debug!("window {wid}: no size constraints reported by the probe");
+                constraints.fail_probe();
+            }
         }
     }
 
@@ -574,6 +579,12 @@ impl Core {
 
     /// Compare the window's frame with its tile after a re-tile and report a
     /// dimension the app refuses to move, once.
+    ///
+    /// The comparison also feeds the directional candidate set, but it must
+    /// **never** pin a bound by itself: `got > want` only proves the app would
+    /// not shrink to `want`, not that the dimension is frozen.  If a probe has
+    /// already confirmed the window, the candidate is merged into the
+    /// authoritative bounds.
     fn record_stuck(&mut self, clamp: ClampNotice) {
         let wid = clamp.wid;
         let Some(want) = self.layout.frame_of(wid) else {
@@ -584,24 +595,24 @@ impl Core {
             return;
         }
         let mut details = Vec::new();
-        let constraints = self.constraints.entry(wid).or_default();
-        if (got.width - want.width).abs() > 1.0 && !constraints.warned_width {
-            constraints.warned_width = true;
-            // Remember the frozen width so the next `update_window` asks for
-            // exactly the value the app insists on.
-            constraints.freeze_width(got.width);
-            details.push(format!(
-                "width {:.0}px requested, stuck at {:.0}px",
-                want.width, got.width
-            ));
-        }
-        if (got.height - want.height).abs() > 1.0 && !constraints.warned_height {
-            constraints.warned_height = true;
-            constraints.freeze_height(got.height);
-            details.push(format!(
-                "height {:.0}px requested, stuck at {:.0}px",
-                want.height, got.height
-            ));
+        {
+            let constraints = self.constraints.entry(wid).or_default();
+            constraints.note_frame(want, got);
+            constraints.promote_candidates();
+            if (got.width - want.width).abs() > 1.0 && !constraints.warned_width {
+                constraints.warned_width = true;
+                details.push(format!(
+                    "width {:.0}px requested, stuck at {:.0}px",
+                    want.width, got.width
+                ));
+            }
+            if (got.height - want.height).abs() > 1.0 && !constraints.warned_height {
+                constraints.warned_height = true;
+                details.push(format!(
+                    "height {:.0}px requested, stuck at {:.0}px",
+                    want.height, got.height
+                ));
+            }
         }
         if details.is_empty() {
             return;
@@ -613,6 +624,17 @@ impl Core {
              reported only once",
             details.join(", ")
         );
+    }
+
+    /// Drop learned constraints after a user-driven geometry change.
+    ///
+    /// The app's current size may now be its new natural/minimum size, and the
+    /// platform probe cache is stale too, so the next clamp must re-probe.
+    fn invalidate_constraints(&mut self, wid: WindowId) {
+        self.applier.backend().forget_size_constraints(wid);
+        if self.constraints.remove(&wid).is_some() {
+            log::debug!("window {wid}: user resize invalidated learned size constraints");
+        }
     }
 
     fn is_recent_focus_event(&self) -> bool {
@@ -653,6 +675,7 @@ mod tests {
     enum Call {
         SetFrame(WindowId, Rect),
         Probe(WindowId),
+        ForgetProbe(WindowId),
         Focus(WindowId),
         Park(WindowId, Rect),
         Unpark(WindowId),
@@ -669,9 +692,6 @@ mod tests {
         frozen_width: HashMap<WindowId, f64>,
         frozen_height: HashMap<WindowId, f64>,
         probe_fails: bool,
-        /// Report clamps without the per-axis "frozen" classification, like a
-        /// platform that only knows `clamped: bool`.
-        hide_frozen: bool,
     }
 
     struct TestBackend {
@@ -691,7 +711,6 @@ mod tests {
                     frozen_width: HashMap::new(),
                     frozen_height: HashMap::new(),
                     probe_fails: false,
-                    hide_frozen: false,
                 }),
             }
         }
@@ -708,16 +727,12 @@ mod tests {
             self.state.lock().unwrap().min_sizes.insert(wid, size);
         }
 
-        fn freeze_width(&self, wid: WindowId, width: f64) {
+        fn simulate_frozen_width(&self, wid: WindowId, width: f64) {
             self.state.lock().unwrap().frozen_width.insert(wid, width);
         }
 
         fn fail_probes(&self) {
             self.state.lock().unwrap().probe_fails = true;
-        }
-
-        fn hide_frozen(&self) {
-            self.state.lock().unwrap().hide_frozen = true;
         }
 
         fn probes(&self) -> usize {
@@ -747,48 +762,48 @@ mod tests {
                 applied.width = applied.width.max(min.width);
                 applied.height = applied.height.max(min.height);
             }
-            let width_frozen = !state.hide_frozen
-                && state
-                    .frozen_width
-                    .get(&wid)
-                    .is_some_and(|frozen| (rect.width - *frozen).abs() > 1.0);
-            let height_frozen = !state.hide_frozen
-                && state
-                    .frozen_height
-                    .get(&wid)
-                    .is_some_and(|frozen| (rect.height - *frozen).abs() > 1.0);
             state.frames.insert(wid, applied);
-            Ok(AppliedFrame::with_axes(
-                rect,
-                applied,
-                width_frozen,
-                height_frozen,
-            ))
+            Ok(AppliedFrame::new(rect, applied))
         }
+
         fn size_constraints(&self, wid: WindowId) -> PlatformResult<Option<SizeConstraints>> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::Probe(wid));
             if state.probe_fails {
                 return Err("probe unsupported".into());
             }
-            let frozen_width = state.frozen_width.get(&wid).copied();
-            let frozen_height = state.frozen_height.get(&wid).copied();
             let min = state.min_sizes.get(&wid).copied();
-            let mut width = min.map(|size| size.width).unwrap_or(100.0);
-            let mut height = min.map(|size| size.height).unwrap_or(100.0);
-            if let Some(frozen) = frozen_width {
-                width = frozen;
+            let mut min_width = min.map(|size| size.width);
+            let mut min_height = min.map(|size| size.height);
+            let mut max_width = None;
+            let mut max_height = None;
+            if let Some(frozen) = state.frozen_width.get(&wid) {
+                min_width = Some(*frozen);
+                max_width = Some(*frozen);
             }
-            if let Some(frozen) = frozen_height {
-                height = frozen;
+            if let Some(frozen) = state.frozen_height.get(&wid) {
+                min_height = Some(*frozen);
+                max_height = Some(*frozen);
             }
-            Ok(Some(SizeConstraints {
-                min: Some(Size::new(width, height)),
-                max: None,
-                width_frozen: frozen_width.filter(|_| !state.hide_frozen),
-                height_frozen: frozen_height.filter(|_| !state.hide_frozen),
-            }))
+            let min = (min_width.is_some() || min_height.is_some())
+                .then(|| Size::new(min_width.unwrap_or(0.0), min_height.unwrap_or(0.0)));
+            let max = (max_width.is_some() || max_height.is_some()).then(|| {
+                Size::new(
+                    max_width.unwrap_or(f64::MAX),
+                    max_height.unwrap_or(f64::MAX),
+                )
+            });
+            Ok(Some(SizeConstraints { min, max }))
         }
+
+        fn forget_size_constraints(&self, wid: WindowId) {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(Call::ForgetProbe(wid));
+        }
+
         fn raise(&self, _: WindowId) -> PlatformResult<()> {
             Ok(())
         }
@@ -1072,7 +1087,7 @@ mod tests {
 
         // System Settings freezes its width at 715px: it ignores both larger
         // and smaller requests, and the platform classifies the axis as Frozen.
-        backend.freeze_width(1, 715.0);
+        backend.simulate_frozen_width(1, 715.0);
         core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
 
         assert_eq!(core.constraint_stats().probes, 1);
@@ -1088,17 +1103,17 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_frozen_dimension_warns_once_and_never_loops() {
+    fn a_single_clamp_with_a_failed_probe_never_pins_a_bound() {
         let (mut core, backend, _dir) = core(&[
             (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
             (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
         ]);
         core.startup(backend.windows());
 
-        // Worst case: the app is silently stuck at 715px, the platform only
-        // reports `clamped` (no per-axis classification) and the probe fails.
-        backend.freeze_width(1, 715.0);
-        backend.hide_frozen();
+        // Worst case: the app is stuck at 715px and the probe is unavailable.
+        // The clamp direction only proves it would not shrink, so it must be
+        // kept as a candidate, never as an authoritative minimum/maximum.
+        backend.simulate_frozen_width(1, 715.0);
         backend.fail_probes();
         let marker = backend.calls().len();
         core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
@@ -1113,8 +1128,21 @@ mod tests {
             backend.calls().len() - marker
         );
 
-        // More layout passes must not re-probe and must not warn again.  The
-        // pinned width learned from the stuck frame lets a later re-tile fix it.
+        let constraints = core.constraints(1).expect("constraints");
+        assert!(constraints.probed);
+        assert!(!constraints.confirmed);
+        assert_eq!(
+            constraints.min, None,
+            "an unconfirmed clamp must not pin a min"
+        );
+        assert_eq!(
+            constraints.max, None,
+            "a Min candidate must not invent a max"
+        );
+        assert_eq!(constraints.candidate_min.width, Some(715.0));
+        assert!(constraints.candidate_max.width.is_none());
+
+        // More layout passes must not re-probe and must not warn again.
         let after_first = backend.calls().len();
         core.set_work_area(Rect::new(0.0, 0.0, 1200.0, 900.0));
         core.set_work_area(Rect::new(0.0, 0.0, 1000.0, 700.0));
@@ -1136,7 +1164,8 @@ mod tests {
         ]);
         core.startup(backend.windows());
         // A clamped-but-shrinkable app whose probe is unavailable: the daemon
-        // cannot learn a minimum, so the frame stays wrong and is reported once.
+        // records the directional candidate, warns once, and never pins it as
+        // authoritative without the probe's confirmation.
         backend.set_min_size(1, Size::new(700.0, 100.0));
         backend.fail_probes();
         let marker = backend.calls().len();
@@ -1151,9 +1180,55 @@ mod tests {
         assert!(set_frames_after(&backend.calls(), marker, 1) <= 3);
         let constraints = core.constraints(1).expect("constraints");
         assert!(constraints.probed);
-        // The stuck width is pinned so a later re-tile can absorb it, even
-        // though the probe itself learned nothing.
-        assert_eq!(constraints.min.map(|size| size.width), Some(700.0));
+        assert!(!constraints.confirmed);
+        assert_eq!(constraints.min, None);
+        assert_eq!(constraints.max, None);
+        assert_eq!(constraints.candidate_min.width, Some(700.0));
+    }
+
+    #[test]
+    fn user_resize_invalidates_learned_constraints_and_reprobes() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        core.set_debounce(Duration::ZERO);
+        backend.set_min_size(1, Size::new(600.0, 100.0));
+
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+        assert_eq!(core.constraint_stats().probes, 1);
+        assert_eq!(
+            core.constraints(1).and_then(|constraints| constraints.min),
+            Some(Size::new(600.0, 100.0))
+        );
+
+        // A user drag on a tiled window is not an echo: learned bounds and the
+        // platform probe cache must be dropped.
+        core.applier.set_debounce(Duration::ZERO);
+        let before = backend.calls().len();
+        core.platform_event(PlatformEvent::WindowMoved {
+            wid: 1,
+            frame: PlatformRect::new(10.0, 10.0, 700.0, 500.0),
+        });
+        assert!(
+            core.constraints(1).is_none(),
+            "user resize must forget learned constraints"
+        );
+        let calls = backend.calls();
+        assert!(
+            calls[before..].contains(&Call::ForgetProbe(1)),
+            "platform probe cache must be invalidated: {calls:?}"
+        );
+
+        // The next clamp re-probes and learns the new minimum.
+        backend.set_min_size(1, Size::new(700.0, 100.0));
+        core.set_work_area(Rect::new(0.0, 0.0, 1000.0, 800.0));
+        assert!(core.constraint_stats().probes >= 2);
+        assert_eq!(
+            core.constraints(1).and_then(|constraints| constraints.min),
+            Some(Size::new(700.0, 100.0))
+        );
     }
 
     #[test]

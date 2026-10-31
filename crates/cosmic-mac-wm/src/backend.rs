@@ -27,27 +27,29 @@ pub type PlatformResult<T> = Result<T, String>;
 
 /// Per-window size constraints reported by the platform probe.
 ///
-/// The platform's `probe_size_constraints` discovers minima by momentarily
-/// shrinking the window, reads declared maxima from `AXMaxSize`, and classifies
-/// each axis as free, minimum-bounded or frozen.  A frozen axis is one the
-/// application refuses to change at all (System Settings freezes its width).
+/// The platform's `probe_size_constraints` performs a shrink **and** a grow check,
+/// reads declared maxima from `AXMaxSize`, and classifies each axis as free,
+/// minimum-bounded or genuinely frozen.  `min` and `max` already encode that
+/// classification: a `Min` axis leaves `max` unbounded (`f64::MAX` on that axis)
+/// unless the grow probe also found a real maximum, while a genuinely frozen
+/// axis contributes the same value to both `min` and `max`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SizeConstraints {
-    /// Smallest size the window accepts, if any axis has a minimum.
+    /// Smallest size the window accepts, per axis (`0.0` means "no minimum").
     pub min: Option<Size>,
-    /// Declared maximum size, if the application publishes one.
+    /// Largest size the window accepts, per axis (`f64::MAX` means "no maximum").
+    /// `None` only when no axis has a maximum.
     pub max: Option<Size>,
-    /// Value a frozen width is stuck at.
-    pub width_frozen: Option<f64>,
-    /// Value a frozen height is stuck at.
-    pub height_frozen: Option<f64>,
 }
 
 /// The outcome of moving and resizing a window.
 ///
 /// `applied` is what the window actually reached (read back from the
 /// Accessibility API), and `clamped` is true when that differs from
-/// `requested` by more than [`AppliedFrame::TOLERANCE`].
+/// `requested` by more than [`AppliedFrame::TOLERANCE`].  A single operation
+/// cannot tell a minimum, a maximum or a genuinely frozen dimension apart;
+/// only the direction of the difference is meaningful here.  Use
+/// [`PlatformBackend::size_constraints`] for the authoritative classification.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AppliedFrame {
     /// The frame the daemon asked for.
@@ -56,10 +58,6 @@ pub struct AppliedFrame {
     pub applied: Rect,
     /// True when the app refused part of the request.
     pub clamped: bool,
-    /// True when the app ignored the width change entirely.
-    pub width_frozen: bool,
-    /// True when the app ignored the height change entirely.
-    pub height_frozen: bool,
 }
 
 impl AppliedFrame {
@@ -72,22 +70,6 @@ impl AppliedFrame {
             requested,
             applied,
             clamped: !applied.approx_eq(requested, Self::TOLERANCE),
-            width_frozen: false,
-            height_frozen: false,
-        }
-    }
-
-    /// Build a frame with per-axis outcomes (used by the real backend).
-    pub fn with_axes(
-        requested: Rect,
-        applied: Rect,
-        width_frozen: bool,
-        height_frozen: bool,
-    ) -> Self {
-        AppliedFrame {
-            width_frozen,
-            height_frozen,
-            ..AppliedFrame::new(requested, applied)
         }
     }
 
@@ -131,6 +113,12 @@ pub trait PlatformBackend: Send + Sync {
     /// calls it when a frame application was clamped and remembers the answer
     /// for the rest of the session.
     fn size_constraints(&self, wid: WindowId) -> PlatformResult<Option<SizeConstraints>>;
+    /// Drop the platform's cached probe result for `wid`.
+    ///
+    /// Called when the user resizes a tiled window: the application's current
+    /// constraints may have changed, so the next clamp must re-probe instead of
+    /// reusing a stale minimum/maximum.
+    fn forget_size_constraints(&self, _wid: WindowId) {}
     /// Raise a window without changing focus.
     fn raise(&self, wid: WindowId) -> PlatformResult<()>;
     /// Focus a window without raising it.
