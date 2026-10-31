@@ -265,13 +265,23 @@ impl Core {
             // user move; never fight it.
             return;
         }
+        if state.floating {
+            // Floating windows may be moved and resized freely.  Adopt the
+            // user's frame so a later diff (for example unparking after a
+            // workspace round trip) does not snap it back to the old placement.
+            self.layout.floating_moved(wid, frame);
+        }
         // The user may have resized this window by dragging an edge.  Drop the
         // platform probe cache and the learned bounds so the next clamp probes
         // the application again instead of trusting a stale minimum/maximum.
-        self.invalidate_constraints(wid);
+        // A pure move (title-bar drag) keeps the size, and with it a good probe.
+        let tolerance = crate::backend::AppliedFrame::TOLERANCE;
+        if (frame.width - state.frame.width).abs() > tolerance
+            || (frame.height - state.frame.height).abs() > tolerance
+        {
+            self.invalidate_constraints(wid);
+        }
         if state.floating {
-            // Floating windows may be moved freely.  The layout keeps its old
-            // placement frame; it is only used for diagnostics and snapshots.
             return;
         }
         // A tiled window moved by the user snaps back to its layout slot.
@@ -400,6 +410,11 @@ impl Core {
                     .collect();
                 for wid in managed {
                     let _ = self.layout.window_removed(wid);
+                }
+                // The discarded commands included the tab bar's removal; hide the
+                // overlay explicitly so it does not float over a restored window.
+                if let Err(error) = self.applier.sync_stack_bar(None) {
+                    log::debug!("hiding the tab bar after restore failed: {error}");
                 }
                 log::info!("restored {restored} windows on request; no longer managing them");
                 Response::Ok
@@ -657,15 +672,28 @@ impl Core {
         );
     }
 
-    /// Drop learned constraints after a user-driven geometry change.
+    /// Drop learned constraints after a user-driven size change.
     ///
     /// The app's current size may now be its new natural/minimum size, and the
-    /// platform probe cache is stale too, so the next clamp must re-probe.
+    /// platform probe cache is stale too, so the next clamp must re-probe.  The
+    /// bounds previously attached to the layout are cleared as well: otherwise
+    /// they would keep shaping the tiles, the window would never be asked for a
+    /// size outside them, and no clamp (hence no re-probe) would ever happen.
     fn invalidate_constraints(&mut self, wid: WindowId) {
         self.applier.backend().forget_size_constraints(wid);
-        if self.constraints.remove(&wid).is_some() {
+        let removed = self.constraints.remove(&wid).is_some();
+        if removed {
             log::debug!("window {wid}: user resize invalidated learned size constraints");
         }
+        let Some(info) = self.layout.window_info(wid).cloned() else {
+            return;
+        };
+        if !removed && info.min_size.is_none() && info.max_size.is_none() {
+            return;
+        }
+        let info = constraints::attach(info, LearnedConstraints::default());
+        let commands = self.layout.update_window(rules::normalize_for_layout(info));
+        self.apply(commands);
     }
 
     fn is_recent_focus_event(&self) -> bool {
@@ -1338,32 +1366,214 @@ mod tests {
             Some(Size::new(600.0, 100.0))
         );
 
-        // A user drag on a tiled window is not an echo: learned bounds and the
-        // platform probe cache must be dropped.
+        // A user edge-resize on a tiled window is not an echo: the learned
+        // bounds and the platform probe cache must be dropped.  The app's
+        // minimum changed with it.
+        backend.set_min_size(1, Size::new(700.0, 100.0));
         core.applier.set_debounce(Duration::ZERO);
         let before = backend.calls().len();
         core.platform_event(PlatformEvent::WindowMoved {
             wid: 1,
             frame: PlatformRect::new(10.0, 10.0, 700.0, 500.0),
         });
-        assert!(
-            core.constraints(1).is_none(),
-            "user resize must forget learned constraints"
-        );
         let calls = backend.calls();
         assert!(
             calls[before..].contains(&Call::ForgetProbe(1)),
             "platform probe cache must be invalidated: {calls:?}"
         );
-
-        // The next clamp re-probes and learns the new minimum.
-        backend.set_min_size(1, Size::new(700.0, 100.0));
-        core.set_work_area(Rect::new(0.0, 0.0, 1000.0, 800.0));
-        assert!(core.constraint_stats().probes >= 2);
+        // Clearing the layout's bounds re-tiles the window below the app's
+        // minimum; that clamp re-probes at once and learns the new minimum.
+        assert_eq!(core.constraint_stats().probes, 2);
         assert_eq!(
             core.constraints(1).and_then(|constraints| constraints.min),
             Some(Size::new(700.0, 100.0))
         );
+        assert_eq!(
+            core.layout().window_info(1).and_then(|info| info.min_size),
+            Some(Size::new(700.0, 100.0)),
+            "the re-learned minimum reaches the layout"
+        );
+        assert_eq!(backend.frame(1).map(|frame| frame.width), Some(700.0));
+        assert_eq!(backend.frame(2).map(|frame| frame.width), Some(200.0));
+
+        // Learned again: a later layout change does not probe.
+        core.set_work_area(Rect::new(0.0, 0.0, 1000.0, 800.0));
+        assert_eq!(core.constraint_stats().probes, 2);
+        assert_eq!(
+            core.constraints(1).and_then(|constraints| constraints.min),
+            Some(Size::new(700.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn user_resize_clears_the_bounds_held_by_the_layout() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        backend.set_min_size(1, Size::new(600.0, 100.0));
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+        assert_eq!(
+            core.layout().window_info(1).and_then(|info| info.min_size),
+            Some(Size::new(600.0, 100.0)),
+            "the probe pinned a minimum in the layout"
+        );
+        assert_eq!(
+            core.layout().frame_of(1).map(|rect| rect.width),
+            Some(600.0)
+        );
+
+        // The user resizes the window and the app no longer insists on 600px.
+        backend.set_min_size(1, Size::new(0.0, 0.0));
+        core.applier.set_debounce(Duration::ZERO);
+        core.platform_event(PlatformEvent::WindowResized {
+            wid: 1,
+            frame: PlatformRect::new(0.0, 0.0, 700.0, 800.0),
+        });
+
+        assert!(core.constraints(1).is_none());
+        let info = core.layout().window_info(1).expect("window info");
+        assert_eq!(info.min_size, None, "stale minimum still shapes the tiles");
+        assert_eq!(info.max_size, None);
+        // The tiles are recomputed without the stale bound.
+        assert_eq!(
+            core.layout().frame_of(1).map(|rect| rect.width),
+            Some(450.0)
+        );
+        assert_eq!(backend.frame(1).map(|frame| frame.width), Some(450.0));
+        assert_eq!(backend.frame(2).map(|frame| frame.width), Some(450.0));
+        assert_eq!(core.constraint_stats().probes, 1);
+    }
+
+    #[test]
+    fn position_only_move_keeps_learned_constraints() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        backend.set_min_size(1, Size::new(600.0, 100.0));
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+        let learned = core.constraints(1).expect("constraints");
+        assert_eq!(learned.min, Some(Size::new(600.0, 100.0)));
+        let tile = core.layout().frame_of(1).expect("tile");
+
+        // A title-bar drag: same size, different position.
+        core.applier.set_debounce(Duration::ZERO);
+        let marker = backend.calls().len();
+        core.platform_event(PlatformEvent::WindowMoved {
+            wid: 1,
+            frame: PlatformRect::new(tile.x + 40.0, tile.y + 30.0, tile.width, tile.height),
+        });
+
+        assert_eq!(
+            core.constraints(1),
+            Some(learned),
+            "a good probe was dropped"
+        );
+        let calls = backend.calls();
+        assert!(
+            !calls[marker..].contains(&Call::ForgetProbe(1)),
+            "a move must not invalidate the probe cache: {calls:?}"
+        );
+        assert_eq!(
+            core.layout().window_info(1).and_then(|info| info.min_size),
+            Some(Size::new(600.0, 100.0))
+        );
+        // The tiled window still snaps back to its slot.
+        assert_eq!(backend.frame(1), Some(tile));
+        assert_eq!(core.constraint_stats().probes, 1);
+    }
+
+    #[test]
+    fn user_move_of_a_floating_window_is_adopted_by_the_layout() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        core.action(Action::ToggleWindowFloating);
+        let focused = core.layout().focused().expect("focused window");
+        let old = core.layout().frame_of(focused).expect("floating frame");
+        assert!(
+            core.layout()
+                .windows()
+                .iter()
+                .any(|state| state.info.wid == focused && state.floating)
+        );
+
+        // The user drags the floating window somewhere else (not an echo).
+        core.set_debounce(Duration::ZERO);
+        core.applier.set_debounce(Duration::ZERO);
+        let moved = Rect::new(old.x + 50.0, old.y + 60.0, old.width, old.height);
+        backend.state.lock().unwrap().frames.insert(focused, moved);
+        let marker = backend.calls().len();
+        core.platform_event(PlatformEvent::WindowMoved {
+            wid: focused as u32,
+            frame: PlatformRect::new(moved.x, moved.y, moved.width, moved.height),
+        });
+
+        assert_eq!(core.layout().frame_of(focused), Some(moved));
+        let state = core
+            .layout()
+            .windows()
+            .into_iter()
+            .find(|state| state.info.wid == focused)
+            .unwrap();
+        assert_eq!(state.frame, moved);
+        assert_eq!(
+            set_frames_after(&backend.calls(), marker, focused),
+            0,
+            "the window must not be snapped back: {:?}",
+            backend.calls()
+        );
+
+        // A workspace round trip unparks it and must not re-apply the old frame.
+        core.action(Action::Workspace { index: 2 });
+        core.action(Action::Workspace { index: 1 });
+        let calls = backend.calls();
+        assert!(
+            calls[marker..].contains(&Call::Unpark(focused)),
+            "{calls:?}"
+        );
+        assert!(
+            !calls[marker..].contains(&Call::SetFrame(focused, old)),
+            "the stale placement was re-emitted: {calls:?}"
+        );
+        assert_eq!(backend.frame(focused), Some(moved));
+        assert_eq!(core.layout().frame_of(focused), Some(moved));
+    }
+
+    #[test]
+    fn restore_hides_the_stack_tab_bar() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        core.action(Action::ToggleStacking);
+        assert!(
+            core.layout().active_stack().is_some(),
+            "windows are stacked"
+        );
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::StackBar(Some(_)))),
+            "{:?}",
+            backend.calls()
+        );
+
+        let marker = backend.calls().len();
+        assert_eq!(core.request(Request::Restore), Response::Ok);
+        let calls = backend.calls();
+        assert!(
+            calls[marker..].contains(&Call::StackBar(None)),
+            "the tab bar must be hidden after restore: {calls:?}"
+        );
+        assert!(core.layout().windows().is_empty());
     }
 
     #[test]

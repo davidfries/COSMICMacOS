@@ -140,6 +140,8 @@ fn next_workspace_wraps_around() {
     let mut harness = Harness::new();
     harness.add();
     harness.act(Action::Workspace { index: 2 });
+    // Leaving an empty workspace trims it, so workspace 2 needs a window to persist.
+    harness.add();
     harness.act(Action::Workspace { index: 1 });
     harness.act(Action::NextWorkspace);
     assert_eq!(harness.layout.active_workspace(), 2);
@@ -152,6 +154,7 @@ fn previous_workspace_wraps_around() {
     let mut harness = Harness::new();
     harness.add();
     harness.act(Action::Workspace { index: 2 });
+    harness.add();
     harness.act(Action::Workspace { index: 1 });
     harness.act(Action::PreviousWorkspace);
     assert_eq!(harness.layout.active_workspace(), 2);
@@ -180,6 +183,7 @@ fn last_workspace_returns_to_the_previous_one() {
     let mut harness = Harness::new();
     harness.add();
     harness.act(Action::Workspace { index: 2 });
+    harness.add();
     harness.act(Action::Workspace { index: 1 });
     harness.act(Action::LastWorkspace);
     assert_eq!(harness.layout.active_workspace(), 2);
@@ -199,11 +203,13 @@ fn move_to_next_workspace_moves_without_following() {
     harness.add();
     harness.add();
     harness.act(Action::Workspace { index: 2 });
+    harness.add();
     harness.act(Action::Workspace { index: 1 });
     harness.act(Action::MoveToNextWorkspace);
     assert_eq!(harness.layout.active_workspace(), 1);
     assert_eq!(harness.layout.focused(), Some(1));
-    assert_eq!(harness.layout.workspaces()[1].window_count, 1);
+    assert_eq!(harness.layout.workspaces()[0].window_count, 1);
+    assert_eq!(harness.layout.workspaces()[1].window_count, 2);
 }
 
 #[test]
@@ -212,10 +218,12 @@ fn move_to_previous_workspace_moves_without_following() {
     harness.add();
     harness.add();
     harness.act(Action::Workspace { index: 2 });
+    harness.add();
     harness.act(Action::Workspace { index: 1 });
     harness.act(Action::MoveToPreviousWorkspace);
     assert_eq!(harness.layout.active_workspace(), 1);
-    assert_eq!(harness.layout.workspaces()[1].window_count, 1);
+    assert_eq!(harness.layout.workspaces()[0].window_count, 1);
+    assert_eq!(harness.layout.workspaces()[1].window_count, 2);
 }
 
 #[test]
@@ -223,11 +231,13 @@ fn move_to_last_workspace_moves_to_the_previous_one() {
     let mut harness = Harness::new();
     harness.add();
     harness.act(Action::Workspace { index: 2 });
+    harness.add();
     harness.act(Action::Workspace { index: 1 });
     harness.add();
     harness.act(Action::MoveToLastWorkspace);
     assert_eq!(harness.layout.active_workspace(), 1);
-    assert_eq!(harness.layout.workspaces()[1].window_count, 1);
+    assert_eq!(harness.layout.workspaces()[0].window_count, 1);
+    assert_eq!(harness.layout.workspaces()[1].window_count, 2);
 }
 
 #[test]
@@ -237,6 +247,12 @@ fn auto_removes_trailing_workspace_when_it_becomes_empty() {
     harness.act(Action::Workspace { index: 2 });
     harness.add();
     harness.remove(2);
+    // The emptied workspace is still active, so it stays until the user leaves it.
+    assert_eq!(harness.layout.workspaces().len(), 2);
+    assert_eq!(harness.layout.active_workspace(), 2);
+    assert_eq!(harness.layout.focused(), None);
+    harness.assert_synced();
+    harness.act(Action::Workspace { index: 1 });
     let workspaces = harness.layout.workspaces();
     assert_eq!(workspaces.len(), 1);
     assert_eq!(harness.layout.active_workspace(), 1);
@@ -251,6 +267,9 @@ fn auto_removes_multiple_trailing_workspaces() {
     harness.act(Action::Workspace { index: 3 });
     harness.add();
     harness.remove(2);
+    assert_eq!(harness.layout.workspaces().len(), 3);
+    assert_eq!(harness.layout.active_workspace(), 3);
+    harness.act(Action::Workspace { index: 1 });
     assert_eq!(harness.layout.workspaces().len(), 1);
     assert_eq!(harness.layout.active_workspace(), 1);
 }
@@ -264,6 +283,9 @@ fn does_not_remove_empty_workspace_with_windows_after_it() {
     harness.act(Action::Workspace { index: 3 });
     harness.add();
     harness.remove(3);
+    assert_eq!(harness.layout.workspaces().len(), 3);
+    assert_eq!(harness.layout.active_workspace(), 3);
+    harness.act(Action::Workspace { index: 2 });
     let workspaces = harness.layout.workspaces();
     assert_eq!(workspaces.len(), 2);
     assert_eq!(harness.layout.active_workspace(), 2);
@@ -345,4 +367,49 @@ fn move_to_next_workspace_with_one_workspace_is_a_noop() {
     let commands = harness.act(Action::MoveToNextWorkspace);
     assert!(commands.is_empty());
     assert_eq!(harness.layout.focused(), Some(1));
+}
+
+#[test]
+fn closing_a_window_elsewhere_keeps_the_empty_active_workspace() {
+    // The user switched to an empty workspace to launch an app there; a window closing on
+    // workspace 1 before the new window appears must not yank them back.
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    harness.act(Action::Workspace { index: 2 });
+    harness.remove(1);
+    let workspaces = harness.layout.workspaces();
+    assert_eq!(workspaces.len(), 2);
+    assert_eq!(harness.layout.active_workspace(), 2);
+    assert!(workspaces[1].active);
+    assert_eq!(workspaces[0].window_count, 1);
+    assert_eq!(workspaces[1].window_count, 0);
+    assert_eq!(harness.layout.focused(), None);
+    harness.assert_synced();
+
+    // The app's window then lands on workspace 2.
+    harness.add();
+    assert_eq!(harness.layout.active_workspace(), 2);
+    assert_eq!(harness.layout.workspaces()[1].window_count, 1);
+    harness.assert_synced();
+}
+
+#[test]
+fn leaving_the_empty_active_workspace_trims_it() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    harness.act(Action::Workspace { index: 2 });
+    harness.remove(1);
+    assert_eq!(harness.layout.workspaces().len(), 2);
+
+    let commands = harness.act(Action::Workspace { index: 1 });
+    assert_eq!(workspace_activations(&commands), vec![1]);
+    assert_eq!(harness.layout.workspaces().len(), 1);
+    assert_eq!(harness.layout.active_workspace(), 1);
+    assert_eq!(harness.layout.focused(), Some(2));
+    // The trimmed workspace is gone, so there is nothing to go back to.
+    assert!(harness.act(Action::LastWorkspace).is_empty());
+    assert_eq!(harness.layout.active_workspace(), 1);
+    harness.assert_synced();
 }

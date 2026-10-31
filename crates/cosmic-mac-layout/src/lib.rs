@@ -318,7 +318,7 @@ impl Layout {
     }
 
     /// A window disappeared.  The tree is collapsed, focus moves to the next window and empty
-    /// trailing workspaces are removed.
+    /// trailing workspaces after the active one are removed.
     pub fn window_removed(&mut self, wid: WindowId) -> Vec<Command> {
         let Some(index) = self.window_workspace(wid) else {
             self.infos.remove(&wid);
@@ -356,6 +356,52 @@ impl Layout {
             *existing = info;
         }
         self.sync()
+    }
+
+    /// The user moved or resized a floating window to `frame`.
+    ///
+    /// The layout adopts `frame` as the window's floating placement, so a later diff (for
+    /// example after a workspace round trip unparks the window) does not snap it back to the
+    /// old placement.  The frame is also recorded as already emitted, so the next diff does
+    /// not send a `SetFrame` for a frame the window is already at.
+    ///
+    /// A maximized floating window keeps its maximized frame; `frame` becomes the frame it
+    /// returns to when un-maximized.  Its emitted frame is left alone, because recording
+    /// `frame` there would make the next unrelated diff snap it back to the work area.
+    ///
+    /// Returns whether the layout's state changed; `false` when `wid` is not floating.
+    pub fn floating_moved(&mut self, wid: WindowId, frame: Rect) -> bool {
+        let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.floating(wid).is_some())
+        else {
+            return false;
+        };
+        let workspace = &mut self.workspaces[index];
+        let mut changed = false;
+        if let Some(floating) = workspace.floating_mut(wid)
+            && floating.frame != frame
+        {
+            floating.frame = frame;
+            changed = true;
+        }
+        let mut maximized = false;
+        if let Some(max) = &mut workspace.maximized
+            && max.wid == wid
+        {
+            maximized = true;
+            if let Some(restore) = &mut max.restore
+                && *restore != frame
+            {
+                *restore = frame;
+                changed = true;
+            }
+        }
+        if !maximized && self.emitted.visible.contains(&wid) {
+            self.emitted.frames.insert(wid, frame);
+        }
+        changed
     }
 
     pub fn set_work_area(&mut self, work_area: Rect) -> Vec<Command> {
@@ -969,6 +1015,9 @@ impl Layout {
         self.last_workspace = Some(self.active);
         self.active = index;
         self.workspaces[index].normalize_focus();
+        // Leaving an empty trailing workspace removes it (the active one is never trimmed,
+        // so this is where an emptied workspace finally goes away, like cosmic-comp).
+        self.trim_workspaces();
     }
 
     fn ensure_workspaces(&mut self, index: usize) {
@@ -978,10 +1027,14 @@ impl Layout {
         }
     }
 
-    /// Remove empty trailing workspaces (COSMIC's dynamic workspace behaviour).  If the active
-    /// workspace was the trailing empty one, the previous workspace becomes active.
+    /// Remove empty trailing workspaces (COSMIC's dynamic workspace behaviour).
+    ///
+    /// The active workspace is never removed: the user may have switched to an empty
+    /// workspace to launch an app there, and a window closing elsewhere must not yank them
+    /// back.  An empty active workspace is trimmed once the user leaves it
+    /// (`switch_to`).
     fn trim_workspaces(&mut self) {
-        while self.workspaces.len() > 1
+        while self.workspaces.len() - 1 > self.active
             && self
                 .workspaces
                 .last()

@@ -324,3 +324,85 @@ fn toggle_tiling_enables_tiling_even_when_autotile_is_false() {
     harness.assert_frame(2, 500.0, 0.0, 500.0, 500.0);
     harness.assert_synced();
 }
+
+#[test]
+fn floating_moved_adopts_the_user_frame() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add_with(dialog(2));
+    harness.assert_frame(2, 300.0, 150.0, 400.0, 200.0);
+
+    let moved = Rect::new(40.0, 30.0, 420.0, 260.0);
+    assert!(harness.layout.floating_moved(2, moved));
+    // The user put the window there; the fake platform follows.
+    harness.platform.frames.insert(2, moved);
+    harness.assert_frame(2, 40.0, 30.0, 420.0, 260.0);
+    let state = harness
+        .layout
+        .windows()
+        .into_iter()
+        .find(|window| window.info.wid == 2)
+        .unwrap();
+    assert_eq!(state.frame, moved);
+
+    // The next diff must not echo the frame back (or snap it to the old placement).
+    let commands = harness.update(dialog(2));
+    assert!(!set_frames(&commands).contains_key(&2), "{commands:?}");
+    harness.assert_synced();
+
+    // A workspace round trip re-shows the window at the moved frame, not the old one.
+    harness.act(Action::Workspace { index: 2 });
+    let commands = harness.act(Action::Workspace { index: 1 });
+    assert!(shows(&commands).contains(&2), "{commands:?}");
+    assert_eq!(set_frames(&commands).get(&2), Some(&moved), "{commands:?}");
+    harness.assert_synced();
+}
+
+#[test]
+fn floating_moved_ignores_tiled_and_unknown_windows() {
+    let mut harness = Harness::new();
+    harness.add();
+    let tiled = harness.frame(1);
+    assert!(
+        !harness
+            .layout
+            .floating_moved(1, Rect::new(5.0, 5.0, 100.0, 100.0))
+    );
+    assert!(
+        !harness
+            .layout
+            .floating_moved(99, Rect::new(5.0, 5.0, 100.0, 100.0))
+    );
+    assert_eq!(harness.frame(1), tiled);
+    let commands = harness.update(info(1));
+    assert!(commands.is_empty(), "{commands:?}");
+}
+
+#[test]
+fn floating_moved_with_the_same_frame_reports_no_change() {
+    let mut harness = Harness::new();
+    harness.add_with(dialog(1));
+    let frame = harness.frame(1);
+    assert!(!harness.layout.floating_moved(1, frame));
+}
+
+#[test]
+fn floating_moved_while_maximized_updates_the_restore_frame() {
+    let mut harness = Harness::new();
+    harness.add_with(dialog(1));
+    harness.act(Action::Maximize);
+    harness.assert_frame(1, 0.0, 0.0, 1000.0, 500.0);
+
+    let moved = Rect::new(40.0, 30.0, 1000.0, 500.0);
+    assert!(harness.layout.floating_moved(1, moved));
+    // Still maximized: the layout keeps its frame and the next diff leaves the window alone.
+    harness.assert_frame(1, 0.0, 0.0, 1000.0, 500.0);
+    let commands = harness.update(dialog(1));
+    assert!(set_frames(&commands).is_empty(), "{commands:?}");
+
+    // Un-maximizing returns to where the user dragged it.
+    let commands = harness.act(Action::Maximize);
+    assert_eq!(set_frames(&commands).get(&1), Some(&moved), "{commands:?}");
+    harness.assert_frame(1, 40.0, 30.0, 1000.0, 500.0);
+    harness.assert_synced();
+}

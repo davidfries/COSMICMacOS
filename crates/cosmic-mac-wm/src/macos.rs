@@ -14,10 +14,10 @@ use crate::tabbar::TabBarHandle;
 pub struct MacPlatform {
     park: ParkStore,
     work_area: Mutex<Rect>,
-    /// Full frame of the main display, cached on the main thread.  Used as the
-    /// parking corner so `display_frame` does not have to call `NSScreen` from
-    /// the layout thread.
-    main_frame: Rect,
+    /// Full frame of the main display, cached on the main thread and refreshed
+    /// on every display change.  Used as the parking corner so `display_frame`
+    /// does not have to call `NSScreen` from the layout thread.
+    main_frame: Mutex<Rect>,
     tab_bar: Option<TabBarHandle>,
 }
 
@@ -27,7 +27,7 @@ impl MacPlatform {
     /// Must be called on the main thread so `NSScreen.visibleFrame` is
     /// available.
     pub fn new() -> Self {
-        let (work_area, main_frame) = main_display_frames();
+        let (work_area, main_frame) = main_display_frames_now();
         let tab_bar = match TabBarHandle::spawn() {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -38,14 +38,17 @@ impl MacPlatform {
         MacPlatform {
             park: ParkStore::new(),
             work_area: Mutex::new(work_area),
-            main_frame,
+            main_frame: Mutex::new(main_frame),
             tab_bar,
         }
     }
 
-    /// Update the cached work area after a display change.
-    pub fn update_work_area(&self, work_area: Rect) {
+    /// Update the cached work area and main display frame after a display
+    /// change, so parking uses the new screen corner (a stale frame parks
+    /// inside a grown screen or off a shrunk one).
+    pub fn update_displays(&self, work_area: Rect, main_frame: Rect) {
         *self.work_area.lock().expect("work area poisoned") = work_area;
+        *self.main_frame.lock().expect("main frame poisoned") = main_frame;
     }
 
     fn info(&self, wid: WindowId) -> Option<ToplevelInfo> {
@@ -179,26 +182,35 @@ impl PlatformBackend for MacPlatform {
     }
 
     fn display_frame(&self, wid: WindowId) -> Rect {
+        let main_frame = *self.main_frame.lock().expect("main frame poisoned");
         if let Some(frame) = self.frame(wid) {
             let (x, y) = frame.center();
-            if self.main_frame.contains_point(x, y) {
-                return self.main_frame;
+            if main_frame.contains_point(x, y) {
+                return main_frame;
             }
-            if let Ok(Some(display)) = display::display_at(cosmic_mac_platform::Point::new(x, y)) {
+            let point = cosmic_mac_platform::Point::new(x, y);
+            // Prefer the main-thread snapshot: enumerating displays here (the WM
+            // thread) would lose the work areas and log a warning each time.
+            let display = match display::cached_displays() {
+                Some(displays) => displays.into_iter().find(|display| display.contains(point)),
+                None => display::display_at(point).ok().flatten(),
+            };
+            if let Some(display) = display {
                 return from_platform(display.frame);
             }
         }
-        self.main_frame
+        main_frame
     }
 }
 
 /// Current main-display work area.  Call on the main thread.
 pub fn main_work_area_now() -> Rect {
-    main_display_frames().0
+    main_display_frames_now().0
 }
 
-/// `(visible_frame, frame)` of the main display.  Call on the main thread.
-fn main_display_frames() -> (Rect, Rect) {
+/// Current `(visible_frame, frame)` of the main display: the work area and the
+/// full frame used as the parking corner.  Call on the main thread.
+pub fn main_display_frames_now() -> (Rect, Rect) {
     if let Ok(display) = display::main_display() {
         return (
             from_platform(display.visible_frame),

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use cosmic_mac_wm::backend::PlatformBackend;
 use cosmic_mac_wm::daemon::Message;
-use cosmic_mac_wm::keybindings::KeyMap;
+use cosmic_mac_wm::keybindings::{self, KeyMap};
 use cosmic_mac_wm::macos::{self, MacPlatform};
 use cosmic_mac_wm::{daemon, ipc, journal, paths};
 
@@ -85,6 +85,11 @@ fn main() {
     let runtime_thread = std::thread::Builder::new()
         .name("wm-runtime".into())
         .spawn(move || {
+            // Held for the whole thread body: a normal return *and* a panic
+            // unwinding out of the runtime both stop the main thread's run loop.
+            // Without it a panic left a zombie whose event tap kept swallowing
+            // every bound chord system-wide.
+            let _shutdown = ShutdownOnDrop(runtime_shutdown);
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -92,7 +97,6 @@ fn main() {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     log::error!("cannot create tokio runtime: {error}");
-                    runtime_shutdown.store(true, Ordering::SeqCst);
                     return;
                 }
             };
@@ -107,7 +111,6 @@ fn main() {
             if let Err(error) = runtime.block_on(daemon::run(launch, rx, tx)) {
                 log::error!("daemon stopped: {error}");
             }
-            runtime_shutdown.store(true, Ordering::SeqCst);
         })
         .expect("cannot spawn the daemon thread");
 
@@ -115,6 +118,16 @@ fn main() {
     observer.run(shutdown);
     let _ = runtime_thread.join();
     log::info!("cosmic-mac-wm exited");
+}
+
+/// Sets the shutdown flag when dropped, so the main thread stops pumping its
+/// run loop (and releases the event tap) however the runtime thread ends.
+struct ShutdownOnDrop(Arc<AtomicBool>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Observers plus the event tap, owned by the main thread's run loop.
@@ -173,8 +186,17 @@ fn start_observers(
             if is_passthrough(&tap_passthrough) {
                 return false;
             }
-            if key.is_key_down {
-                let _ = tap_tx.send(Message::Key(action));
+            // Autorepeat only re-sends directional focus/move/resize; holding a
+            // one-shot chord (Super+Q) must not close window after window.
+            // Repeats that are not dispatched are still swallowed below, so
+            // the app never sees them either.
+            if keybindings::dispatches(&action, key.is_key_down, key.is_repeat) {
+                if tap_tx.send(Message::Key(action)).is_err() {
+                    // The daemon is gone: never swallow keys on its behalf.
+                    return false;
+                }
+            } else if tap_tx.is_closed() {
+                return false;
             }
             // Swallow both down and up so the app never sees a stuck key.
             true
@@ -184,8 +206,8 @@ fn start_observers(
 
     let display_tx = tx.clone();
     display::set_display_change_handler(Arc::new(move || {
-        let work_area = macos::main_work_area_now();
-        backend.update_work_area(work_area);
+        let (work_area, main_frame) = macos::main_display_frames_now();
+        backend.update_displays(work_area, main_frame);
         let _ = display_tx.send(Message::WorkArea(work_area));
     }))
     .map_err(|error| format!("display change handler: {error}"))?;
@@ -263,5 +285,30 @@ fn load_config() -> Config {
             log::warn!("cannot read {}: {error}; using defaults", path.display());
             Config::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_guard_sets_the_flag_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(ShutdownOnDrop(flag.clone()));
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shutdown_guard_sets_the_flag_when_the_thread_panics() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let guard_flag = flag.clone();
+        let result = std::thread::spawn(move || {
+            let _shutdown = ShutdownOnDrop(guard_flag);
+            panic!("runtime crashed");
+        })
+        .join();
+        assert!(result.is_err(), "the thread must have panicked");
+        assert!(flag.load(Ordering::SeqCst));
     }
 }

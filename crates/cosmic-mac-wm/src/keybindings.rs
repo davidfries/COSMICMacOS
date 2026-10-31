@@ -311,6 +311,27 @@ impl KeyMap {
     }
 }
 
+/// Whether holding a bound chord should repeat `action` on key autorepeat.
+///
+/// Only directional focus, move and resize are useful to hold.  Every other
+/// action is one-shot: holding Super+Q must close one window, not window after
+/// window.  The event tap still swallows the repeats of one-shot chords so the
+/// focused app never sees them.
+pub fn repeats_when_held(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Focus { .. } | Action::Move { .. } | Action::Resize { .. }
+    )
+}
+
+/// Whether a bound key event should dispatch `action` to the daemon.
+///
+/// Key-ups never dispatch; an autorepeat key-down dispatches only for actions
+/// that [`repeat when held`](repeats_when_held).
+pub fn dispatches(action: &Action, is_key_down: bool, is_repeat: bool) -> bool {
+    is_key_down && (!is_repeat || repeats_when_held(action))
+}
+
 /// Split the body of a RON map into top-level `key: value` entries.
 ///
 /// Commas inside bindings, action arguments, strings and comments are ignored.
@@ -677,6 +698,38 @@ mod tests {
     fn lookup(keymap: &KeyMap, key: &str, modifiers: &[Modifier]) -> Option<Action> {
         let binding = Binding::new(modifiers.to_vec(), key);
         keymap.table().get(&binding).cloned()
+    }
+
+    #[test]
+    fn autorepeat_only_repeats_directional_actions() {
+        let left = Direction::Left;
+        for action in [
+            Action::Focus { direction: left },
+            Action::Move { direction: left },
+            Action::Resize { direction: left },
+        ] {
+            assert!(repeats_when_held(&action), "{action:?}");
+            assert!(dispatches(&action, true, false), "{action:?}");
+            assert!(dispatches(&action, true, true), "{action:?}");
+            assert!(!dispatches(&action, false, false), "{action:?}");
+        }
+        for action in [
+            Action::Close,
+            Action::ToggleTiling,
+            Action::ToggleStacking,
+            Action::Maximize,
+            Action::FocusNext,
+            Action::Workspace { index: 2 },
+            Action::MoveToWorkspace { index: 2 },
+        ] {
+            assert!(!repeats_when_held(&action), "{action:?}");
+            assert!(dispatches(&action, true, false), "{action:?}");
+            assert!(
+                !dispatches(&action, true, true),
+                "holding the chord must not repeat {action:?}"
+            );
+            assert!(!dispatches(&action, false, false), "{action:?}");
+        }
     }
 
     #[test]
