@@ -1,0 +1,55 @@
+[package]
+name = "cosmic-mac-wm"
+description = "cosmicMac window-manager daemon: event loop, keybindings, workspaces, stacks and IPC"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "cosmic-mac-wm"
+path = "src/main.rs"
+
+[dependencies]
+cosmic-mac-protocol = { path = "../cosmic-mac-protocol" }
+cosmic-mac-layout = { path = "../cosmic-mac-layout" }
+cosmic-mac-platform = { path = "../cosmic-mac-platform" }
+
+serde.workspace = true
+serde_json.workspace = true
+ron.workspace = true
+tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true
+libc = "0.2"
+
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSWorkspace",
+    "NSRunningApplication",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFString",
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFCGTypes",
+    "CFAttributedString",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGBase",
+    "CGContext",
+    "CGColor",
+    "CGError",
+] }
+objc2-core-text = { version = "0.3", default-features = false, features = [
+    "std",
+    "CTFont",
+    "CTLine",
+    "CTStringAttributes",
+    "objc2-core-graphics",
+] }
+
+[dev-dependencies]
+tempfile = "3"
