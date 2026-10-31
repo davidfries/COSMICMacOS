@@ -116,6 +116,7 @@ pub fn render_windows(windows: &[WindowState], limit: Option<usize>) -> String {
         ("VIS", false),
         ("FLOAT", false),
         ("FRAME", false),
+        ("ACTUAL", false),
     ];
     let rows: Vec<Vec<String>> = windows
         .iter()
@@ -138,10 +139,21 @@ pub fn render_windows(windows: &[WindowState], limit: Option<usize>) -> String {
                 yes_no(window.visible).to_string(),
                 yes_no(window.floating).to_string(),
                 format_rect(window.frame),
+                format_actual(window),
             ]
         })
         .collect();
     render_table(&columns, &rows)
+}
+
+/// The ACTUAL column: `=` when the real frame matches the layout frame, the real
+/// frame when it differs, `?` when it is unknown.
+fn format_actual(window: &WindowState) -> String {
+    match window.actual_frame {
+        Some(actual) if actual.approx_eq(window.frame, 1.0) => "=".to_string(),
+        Some(actual) => format_rect(actual),
+        None => "?".to_string(),
+    }
 }
 
 /// Render `Response::Workspaces`.
@@ -305,6 +317,7 @@ mod tests {
             in_stack: false,
             stack_active: false,
             frame: Rect::new(0.0, 0.0, 800.0, 600.0),
+            actual_frame: Some(Rect::new(0.0, 0.0, 800.0, 600.0)),
         }
     }
 
@@ -346,7 +359,7 @@ mod tests {
         let table = render_windows(&[focused, stacked, stack_active], None);
         let header = table.lines().next().unwrap();
         for column in [
-            "WID", "PID", "APP", "TITLE", "WS", "STACK", "VIS", "FLOAT", "FRAME",
+            "WID", "PID", "APP", "TITLE", "WS", "STACK", "VIS", "FLOAT", "FRAME", "ACTUAL",
         ] {
             assert!(header.contains(column), "missing {column} in {header}");
         }
@@ -358,6 +371,37 @@ mod tests {
         assert!(table.contains("tab"));
         assert!(table.contains("0,0 800x600"));
         assert_eq!(table.lines().count(), 4);
+    }
+
+    fn actual_cell(state: WindowState) -> String {
+        let table = render_windows(&[state], None);
+        let header = table.lines().next().unwrap();
+        let start = header.find("ACTUAL").unwrap();
+        table.lines().nth(1).unwrap()[start..]
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn actual_column_shows_equals_when_the_frame_matches() {
+        let mut state = window(1, "a");
+        // Within the 1 px tolerance.
+        state.actual_frame = Some(Rect::new(0.5, -0.5, 800.9, 599.2));
+        assert_eq!(actual_cell(state), "=");
+    }
+
+    #[test]
+    fn actual_column_shows_the_real_frame_when_it_differs() {
+        let mut state = window(1, "a");
+        state.actual_frame = Some(Rect::new(0.0, 0.0, 726.0, 600.0));
+        assert_eq!(actual_cell(state), "0,0 726x600");
+    }
+
+    #[test]
+    fn actual_column_shows_a_question_mark_when_unknown() {
+        let mut state = window(1, "a");
+        state.actual_frame = None;
+        assert_eq!(actual_cell(state), "?");
     }
 
     #[test]

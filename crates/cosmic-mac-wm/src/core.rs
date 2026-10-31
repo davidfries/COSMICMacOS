@@ -367,7 +367,13 @@ impl Core {
     /// are answered from the layout snapshot.
     pub fn request(&mut self, request: Request) -> Response {
         match request {
-            Request::ListWindows => Response::Windows(self.layout.windows()),
+            Request::ListWindows => {
+                let mut windows = self.layout.windows();
+                for state in &mut windows {
+                    state.actual_frame = self.applier.backend().frame(state.info.wid);
+                }
+                Response::Windows(windows)
+            }
             Request::ListWorkspaces => Response::Workspaces(self.layout.workspaces()),
             Request::Tree => Response::Tree(self.layout.tree_snapshot()),
             Request::Config => Response::Config(self.layout.config().clone()),
@@ -540,27 +546,38 @@ impl Core {
         }
 
         self.constraint_stats.probes += 1;
-        let learned = match self.applier.backend().size_constraints(wid) {
-            Ok(constraints) => constraints,
-            Err(error) => {
-                log::debug!("window {wid}: size constraint probe failed: {error}");
-                None
-            }
-        };
+        let probe = self.applier.backend().size_constraints(wid);
         // The probe moved the window and put it back; treat the frame it ended
         // at as programmed so the resulting notifications stay echoes.
         if let Some(frame) = self.applier.backend().frame(wid) {
             self.applier.mark_programmed(wid, frame);
         }
         let constraints = self.constraints.entry(wid).or_default();
-        match learned {
-            Some(learned) => {
+        match probe {
+            Ok(Some(learned)) => {
                 log::info!("window {wid}: learned size constraints {learned:?}");
                 constraints.confirm_probe(learned.min, learned.max);
             }
-            None => {
+            Ok(None) => {
                 log::debug!("window {wid}: no size constraints reported by the probe");
                 constraints.fail_probe();
+            }
+            Err(error) => {
+                // Transient (for example CGError 1000 right after a resize):
+                // retry on a later clamp, but only a bounded number of times.
+                let gave_up = constraints.defer_probe();
+                log::debug!(
+                    "window {wid}: size constraint probe failed \
+                     (attempt {}/{}): {error}",
+                    constraints.probe_attempts,
+                    LearnedConstraints::MAX_PROBE_ATTEMPTS
+                );
+                if gave_up {
+                    log::warn!(
+                        "window {wid}: giving up on size constraint probing after {} failures",
+                        constraints.probe_attempts
+                    );
+                }
             }
         }
     }
@@ -747,6 +764,10 @@ mod tests {
 
         fn fail_probes(&self) {
             self.state.lock().unwrap().probe_fails = true;
+        }
+
+        fn allow_probes(&self) {
+            self.state.lock().unwrap().probe_fails = false;
         }
 
         fn probes(&self) -> usize {
@@ -1117,6 +1138,41 @@ mod tests {
     }
 
     #[test]
+    fn list_windows_reports_the_actual_frame_next_to_the_layout_frame() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        // The app refuses to leave 715px and the probe is unavailable, so the
+        // layout keeps its 700px tile while the real frame stays 715px wide.
+        backend.simulate_frozen_width(1, 715.0);
+        backend.fail_probes();
+        core.set_work_area(Rect::new(0.0, 0.0, 1400.0, 800.0));
+
+        let Response::Windows(windows) = core.request(Request::ListWindows) else {
+            panic!("expected a window list");
+        };
+        assert_eq!(windows.len(), 2);
+        for state in &windows {
+            assert_eq!(
+                state.actual_frame,
+                backend.frame(state.info.wid),
+                "window {} must report the backend frame",
+                state.info.wid
+            );
+        }
+        let refusing = windows.iter().find(|state| state.info.wid == 1).unwrap();
+        let actual = refusing.actual_frame.expect("actual frame");
+        assert!((actual.width - 715.0).abs() < 1.0);
+        assert!(
+            !actual.approx_eq(refusing.frame, 1.0),
+            "the frozen window should differ from its layout frame: {actual:?} vs {:?}",
+            refusing.frame
+        );
+    }
+
+    #[test]
     fn a_single_clamp_with_a_failed_probe_never_pins_a_bound() {
         let (mut core, backend, _dir) = core(&[
             (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
@@ -1143,7 +1199,8 @@ mod tests {
         );
 
         let constraints = core.constraints(1).expect("constraints");
-        assert!(constraints.probed);
+        assert!(!constraints.probed, "a transient failure stays retryable");
+        assert_eq!(constraints.probe_attempts, 1);
         assert!(!constraints.confirmed);
         assert_eq!(
             constraints.min, None,
@@ -1156,18 +1213,33 @@ mod tests {
         assert_eq!(constraints.candidate_min.width, Some(715.0));
         assert!(constraints.candidate_max.width.is_none());
 
-        // More layout passes must not re-probe and must not warn again.
+        // Further layout passes retry the probe up to the cap, then stop; the
+        // stuck warning is not repeated.
         let after_first = backend.calls().len();
+        let max_attempts = usize::from(LearnedConstraints::MAX_PROBE_ATTEMPTS);
         core.set_work_area(Rect::new(0.0, 0.0, 1200.0, 900.0));
         core.set_work_area(Rect::new(0.0, 0.0, 1000.0, 700.0));
-        assert_eq!(core.constraint_stats().probes, 1);
+        core.set_work_area(Rect::new(0.0, 0.0, 1100.0, 800.0));
+        core.set_work_area(Rect::new(0.0, 0.0, 1300.0, 900.0));
+        assert_eq!(core.constraint_stats().probes, max_attempts);
         assert_eq!(core.constraint_stats().warnings, 1);
-        assert_eq!(backend.probes(), 1);
+        assert_eq!(backend.probes(), max_attempts);
         assert!(
-            backend.calls().len() - after_first < 20,
+            backend.calls().len() - after_first < 40,
             "no retry storm: {} extra calls",
             backend.calls().len() - after_first
         );
+
+        let constraints = core.constraints(1).expect("constraints");
+        assert!(constraints.probed, "the probe gave up at the cap");
+        assert_eq!(
+            constraints.probe_attempts,
+            LearnedConstraints::MAX_PROBE_ATTEMPTS
+        );
+        assert!(!constraints.confirmed);
+        assert_eq!(constraints.min, None);
+        assert_eq!(constraints.max, None);
+        assert_eq!(constraints.candidate_min.width, Some(715.0));
     }
 
     #[test]
@@ -1193,11 +1265,60 @@ mod tests {
         // Bounded: one initial application plus one re-apply for the window.
         assert!(set_frames_after(&backend.calls(), marker, 1) <= 3);
         let constraints = core.constraints(1).expect("constraints");
+        assert!(!constraints.probed, "a transient failure stays retryable");
+        assert_eq!(constraints.probe_attempts, 1);
+
+        // Later layout passes retry until the cap, then stop probing.
+        let max_attempts = usize::from(LearnedConstraints::MAX_PROBE_ATTEMPTS);
+        let after_first = backend.calls().len();
+        for width in [1000.0, 1100.0, 1200.0, 1300.0, 1400.0] {
+            core.set_work_area(Rect::new(0.0, 0.0, width, 800.0));
+        }
+        assert_eq!(core.constraint_stats().probes, max_attempts);
+        assert_eq!(backend.probes(), max_attempts);
+        assert_eq!(core.constraint_stats().warnings, 1);
+        assert!(
+            backend.calls().len() - after_first < 60,
+            "no retry storm: {} extra calls",
+            backend.calls().len() - after_first
+        );
+        let constraints = core.constraints(1).expect("constraints");
         assert!(constraints.probed);
         assert!(!constraints.confirmed);
         assert_eq!(constraints.min, None);
         assert_eq!(constraints.max, None);
         assert_eq!(constraints.candidate_min.width, Some(700.0));
+    }
+
+    #[test]
+    fn transient_probe_failure_is_retried_and_then_learns() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        backend.set_min_size(1, Size::new(600.0, 100.0));
+        backend.fail_probes();
+
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+        assert_eq!(backend.probes(), 1);
+        let constraints = core.constraints(1).expect("constraints");
+        assert_eq!(constraints.probe_attempts, 1);
+        assert!(!constraints.probed);
+        assert!(!constraints.confirmed);
+
+        backend.allow_probes();
+        core.set_work_area(Rect::new(0.0, 0.0, 1000.0, 800.0));
+        assert_eq!(backend.probes(), 2);
+        assert_eq!(core.constraint_stats().probes, 2);
+        let constraints = core.constraints(1).expect("constraints");
+        assert!(constraints.probed);
+        assert!(constraints.confirmed);
+        assert_eq!(constraints.min, Some(Size::new(600.0, 100.0)));
+
+        // Learned: no further probes.
+        core.set_work_area(Rect::new(0.0, 0.0, 1100.0, 800.0));
+        assert_eq!(backend.probes(), 2);
     }
 
     #[test]

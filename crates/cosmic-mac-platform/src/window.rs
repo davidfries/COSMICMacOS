@@ -342,7 +342,10 @@ fn grow_target(original: Size, cap: Option<Size>) -> Option<Size> {
 /// bottom or right edge would be clamped by the display rather than by the
 /// application, which the caller would otherwise record as a real maximum.
 fn grow_cap() -> Option<(Size, Point)> {
-    let display = crate::display::main_display().ok()?;
+    // The WM thread must not enumerate displays itself (NSScreen is main-thread
+    // only); use the snapshot the main thread keeps current.
+    let display =
+        crate::display::cached_main_display().or_else(|| crate::display::main_display().ok())?;
     let cap = Size::new(
         display.frame.size.width * GROW_DISPLAY_FRACTION,
         display.frame.size.height * GROW_DISPLAY_FRACTION,

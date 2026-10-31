@@ -73,8 +73,11 @@ pub struct LearnedConstraints {
     pub candidate_min: AxisBounds,
     /// Directional upper-bound candidates from clamped frames.
     pub candidate_max: AxisBounds,
-    /// Whether the probe already ran (successfully or not) for this epoch.
+    /// Whether the probe is finished for this epoch: it answered, reported
+    /// nothing, or failed transiently [`Self::MAX_PROBE_ATTEMPTS`] times.
     pub probed: bool,
+    /// Transient probe failures so far; reset when the entry is invalidated.
+    pub probe_attempts: u8,
     /// Whether the probe produced an authoritative answer.
     pub confirmed: bool,
     /// Whether the "cannot reach its tile" warning was logged for the width.
@@ -84,6 +87,9 @@ pub struct LearnedConstraints {
 }
 
 impl LearnedConstraints {
+    /// Transient probe failures tolerated before the daemon gives up on a window.
+    pub const MAX_PROBE_ATTEMPTS: u8 = 3;
+
     /// Record the direction of a clamped frame.
     ///
     /// * `applied > requested` → the app refused to shrink: a **minimum** candidate.
@@ -134,6 +140,22 @@ impl LearnedConstraints {
     pub fn fail_probe(&mut self) {
         self.probed = true;
         self.confirmed = false;
+    }
+
+    /// Record a transient probe failure (an Accessibility error, as opposed to
+    /// a definitive "nothing reported").
+    ///
+    /// The window stays unprobed so the next clamp tries again, until
+    /// [`Self::MAX_PROBE_ATTEMPTS`] failures have accumulated; then the probe is
+    /// marked finished (still unconfirmed).  Returns `true` when this call gave up.
+    pub fn defer_probe(&mut self) -> bool {
+        self.probe_attempts = self.probe_attempts.saturating_add(1);
+        if self.probe_attempts >= Self::MAX_PROBE_ATTEMPTS {
+            self.probed = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Promote directional candidates once the probe has confirmed them.
@@ -312,6 +334,49 @@ mod tests {
         );
         constraints.fail_probe();
         assert!(constraints.probed);
+        assert!(!constraints.confirmed);
+        assert!(constraints.min.is_none());
+        assert!(constraints.max.is_none());
+        assert_eq!(constraints.candidate_min.width, Some(642.0));
+    }
+
+    #[test]
+    fn defer_probe_counts_attempts_and_keeps_the_probe_open_below_the_cap() {
+        let mut constraints = LearnedConstraints::default();
+        for attempt in 1..LearnedConstraints::MAX_PROBE_ATTEMPTS {
+            assert!(!constraints.defer_probe());
+            assert_eq!(constraints.probe_attempts, attempt);
+            assert!(!constraints.probed, "attempt {attempt} must stay retryable");
+            assert!(!constraints.confirmed);
+        }
+    }
+
+    #[test]
+    fn defer_probe_gives_up_at_the_cap_without_confirming() {
+        let mut constraints = LearnedConstraints::default();
+        let mut gave_up = false;
+        for _ in 0..LearnedConstraints::MAX_PROBE_ATTEMPTS {
+            gave_up = constraints.defer_probe();
+        }
+        assert!(gave_up, "the capping call reports that it gave up");
+        assert_eq!(
+            constraints.probe_attempts,
+            LearnedConstraints::MAX_PROBE_ATTEMPTS
+        );
+        assert!(constraints.probed);
+        assert!(!constraints.confirmed);
+    }
+
+    #[test]
+    fn defer_probe_never_promotes_candidates() {
+        let mut constraints = clamp(
+            Rect::new(0.0, 0.0, 500.0, 400.0),
+            Rect::new(0.0, 0.0, 642.0, 400.0),
+        );
+        for _ in 0..=LearnedConstraints::MAX_PROBE_ATTEMPTS {
+            constraints.defer_probe();
+            constraints.promote_candidates();
+        }
         assert!(!constraints.confirmed);
         assert!(constraints.min.is_none());
         assert!(constraints.max.is_none());

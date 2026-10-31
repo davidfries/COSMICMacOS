@@ -79,8 +79,10 @@ Options:
   --json        Print the exact Response::Windows payload as JSON
   --limit N     Show at most N rows (0 prints just the header)
 
-Columns: WID, PID, APP, TITLE, WS (workspace), STACK, VIS, FLOAT, FRAME.
-FRAME is `x,y WxH` in global top-left-origin logical pixels.
+Columns: WID, PID, APP, TITLE, WS (workspace), STACK, VIS, FLOAT, FRAME, ACTUAL.
+FRAME is the layout frame as `x,y WxH` in global top-left-origin logical pixels.
+ACTUAL is the frame the window really has (read from Accessibility): `=` when it
+matches FRAME within 1 px, the real frame when it differs, `?` when unknown.
 ";
 
 pub const LIST_WORKSPACES_HELP: &str = "\

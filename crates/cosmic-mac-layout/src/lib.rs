@@ -234,6 +234,8 @@ impl Layout {
                     in_stack,
                     stack_active,
                     frame: frames.all.get(&wid).copied().unwrap_or(Rect::ZERO),
+                    // The layout has no platform access; the daemon fills this in.
+                    actual_frame: None,
                 });
             }
         }

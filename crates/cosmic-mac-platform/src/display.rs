@@ -57,7 +57,34 @@ pub fn main_display_id() -> CGDirectDisplayID {
     CGMainDisplayID()
 }
 
+/// Last enumeration produced on the main thread, where `NSScreen` work areas are
+/// available.
+static SNAPSHOT: OnceLock<Mutex<Vec<DisplayInfo>>> = OnceLock::new();
+
+/// Displays as of the last [`list_displays`] call made **on the main thread**,
+/// or `None` if that never happened.
+///
+/// Off-main-thread callers (the WM thread's probes and `display_frame`) use this
+/// instead of [`list_displays`], which would log a warning and fall back to full
+/// display frames.  The daemon populates it at startup on the main thread and
+/// refreshes it from the display-change handler, which re-enumerates the main
+/// display on the main thread (`macos::main_work_area_now`).
+pub fn cached_displays() -> Option<Vec<DisplayInfo>> {
+    let displays = SNAPSHOT.get()?.lock().ok()?;
+    (!displays.is_empty()).then(|| displays.clone())
+}
+
+/// The main display from the snapshot; see [`cached_displays`].
+pub fn cached_main_display() -> Option<DisplayInfo> {
+    cached_displays()?
+        .into_iter()
+        .find(|display| display.is_main)
+}
+
 /// Enumerate active displays.
+///
+/// Calls made on the main thread also refresh the snapshot behind
+/// [`cached_displays`].
 pub fn list_displays() -> Result<Vec<DisplayInfo>> {
     let mut ids = [0u32; 32];
     let mut count: u32 = 0;
@@ -73,6 +100,7 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
     let anchor = CGDisplayBounds(main_id).size.height;
 
     // NSScreen is only valid on the main thread; collect the work areas there.
+    let on_main_thread = MainThreadMarker::new().is_some();
     let screens: Vec<(Rect, Rect, f64, Option<String>)> = if let Some(mtm) = MainThreadMarker::new()
     {
         NSScreen::screens(mtm)
@@ -123,6 +151,12 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
             .cmp(&a.is_main)
             .then_with(|| a.frame.origin.x.total_cmp(&b.frame.origin.x))
     });
+    if on_main_thread {
+        let slot = SNAPSHOT.get_or_init(|| Mutex::new(Vec::new()));
+        if let Ok(mut snapshot) = slot.lock() {
+            *snapshot = displays.clone();
+        }
+    }
     Ok(displays)
 }
 
@@ -203,5 +237,22 @@ pub fn clear_display_change_handler() {
     // registered; CoreGraphics returns an error which we ignore here.
     unsafe {
         let _ = CGDisplayRemoveReconfigurationCallback(Some(display_changed), std::ptr::null_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test threads are never the process main thread, so enumerating from here
+    /// must not populate the snapshot (it would hold full frames, not work areas).
+    #[test]
+    fn enumerating_off_the_main_thread_does_not_populate_the_snapshot() {
+        assert!(MainThreadMarker::new().is_none());
+        assert!(cached_displays().is_none());
+        assert!(cached_main_display().is_none());
+        let _ = list_displays();
+        assert!(cached_displays().is_none());
+        assert!(cached_main_display().is_none());
     }
 }

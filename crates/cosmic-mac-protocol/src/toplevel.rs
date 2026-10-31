@@ -209,6 +209,10 @@ pub struct WindowState {
     pub stack_active: bool,
     /// The frame the window has or would have in the layout.
     pub frame: Rect,
+    /// The frame the window really has on screen, read from Accessibility when the snapshot
+    /// was taken.  `None` when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_frame: Option<Rect>,
 }
 
 #[cfg(test)]
