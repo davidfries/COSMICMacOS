@@ -336,14 +336,21 @@ fn grow_target(original: Size, cap: Option<Size>) -> Option<Size> {
     }
 }
 
-/// Half of the main display's frame, used as the grow-probe cap.
-fn grow_cap() -> Option<Size> {
+/// Half of the main display's frame plus a safe origin for the grow probe.
+///
+/// The original window position is deliberately not reused: a window near the
+/// bottom or right edge would be clamped by the display rather than by the
+/// application, which the caller would otherwise record as a real maximum.
+fn grow_cap() -> Option<(Size, Point)> {
     let display = crate::display::main_display().ok()?;
     let cap = Size::new(
         display.frame.size.width * GROW_DISPLAY_FRACTION,
         display.frame.size.height * GROW_DISPLAY_FRACTION,
     );
-    (cap.width > 0.0 && cap.height > 0.0).then_some(cap)
+    if cap.width <= 0.0 || cap.height <= 0.0 {
+        return None;
+    }
+    Some((cap, display.visible_frame.origin))
 }
 
 fn approx_equal(a: f64, b: f64) -> bool {
@@ -881,11 +888,12 @@ impl AxWindow {
     ///
     /// **This momentarily resizes the window** — it shrinks the window to 1×1, reads
     /// back what the application allowed, then grows it by [`GROW_STEP`] on each
-    /// axis (capped at [`GROW_DISPLAY_FRACTION`] of the main display, position
-    /// unchanged), reads that back too, and restores the original frame after each
-    /// step.  The platform layer never calls this automatically; the daemon decides
-    /// when a probe is worth the visible flicker (for example after a `SetFrame` was
-    /// clamped).
+    /// axis (capped at [`GROW_DISPLAY_FRACTION`] of the main display), reads that
+    /// back too, and restores the original frame after each step.  The grow step
+    /// runs at the main display's visible origin so a window near a screen edge
+    /// does not look like it has a maximum.  The platform layer never calls this
+    /// automatically; the daemon decides when a probe is worth the visible flicker
+    /// (for example after a `SetFrame` was clamped).
     ///
     /// The two steps are what tell a **minimum equal to the current size** apart
     /// from a **frozen** dimension.  Applications respond per axis:
@@ -915,22 +923,32 @@ impl AxWindow {
         let original = self.current_frame()?;
         let declared_max = self.declared_max_size();
         let shrink = shrink_target(original.size);
-        let grow = grow_target(original.size, grow_cap());
+        let grow_probe = grow_cap();
+        let grow = grow_target(original.size, grow_probe.map(|(cap, _)| cap));
         if shrink == original.size && grow.is_none() {
             // Nothing to learn without growing the window.
             return Ok(SizeConstraints::unconstrained(declared_max));
         }
 
-        let shrink_applied = self.probe_once(original, shrink)?;
+        let shrink_applied = self.probe_once(original, shrink, original.origin)?;
         let grow_applied = match grow {
-            Some(grow) => match self.probe_once(original, grow) {
-                Ok(applied) => Some(applied),
-                Err(error) => {
-                    // A failed grow step must not lose the shrink result.
-                    log::debug!("probe({}): grow step failed: {error}", self.wid);
-                    None
+            Some(grow) => {
+                // Grow at the display's visible origin, not at the window's
+                // current position: growing downward/rightward from a window
+                // near an edge would otherwise be clamped by the screen and
+                // misreported as an application maximum.
+                let origin = grow_probe
+                    .map(|(_, origin)| origin)
+                    .unwrap_or(original.origin);
+                match self.probe_once(original, grow, origin) {
+                    Ok(applied) => Some(applied),
+                    Err(error) => {
+                        // A failed grow step must not lose the shrink result.
+                        log::debug!("probe({}): grow step failed: {error}", self.wid);
+                        None
+                    }
                 }
-            },
+            }
             None => None,
         };
         Ok(SizeConstraints::from_probes(
@@ -943,15 +961,10 @@ impl AxWindow {
         ))
     }
 
-    /// Apply one probe size at the window's current position, read back the size
-    /// the application produced, and always restore the original frame.
-    fn probe_once(&self, original: Rect, probe: Size) -> Result<Size> {
-        let applied = self.set_frame(Rect::new(
-            original.origin.x,
-            original.origin.y,
-            probe.width,
-            probe.height,
-        ))?;
+    /// Apply one probe size, read back the size the application produced, and
+    /// always restore the original frame.
+    fn probe_once(&self, original: Rect, probe: Size, origin: Point) -> Result<Size> {
+        let applied = self.set_frame(Rect::new(origin.x, origin.y, probe.width, probe.height))?;
         // Always try to restore, even if the probe itself looked odd.
         match self.set_frame(original) {
             Ok(restored) => {
