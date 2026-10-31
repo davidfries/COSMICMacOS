@@ -1,0 +1,15 @@
+[package]
+name = "cosmic-mac-ctl"
+description = "Command-line client for the cosmicMac window manager daemon"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "cosmic-mac-ctl"
+path = "src/main.rs"
+
+[dependencies]
+cosmic-mac-protocol = { path = "../cosmic-mac-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
