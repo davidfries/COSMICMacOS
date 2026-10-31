@@ -95,7 +95,12 @@ pub enum DimensionOutcome {
     Applied,
     /// The application applied a different value: it has a minimum or maximum on this axis.
     Clamped,
-    /// The application ignored the change entirely; the dimension is frozen.
+    /// The application ignored this particular change: the value stayed where it was.
+    ///
+    /// This is **not** proof that the dimension is permanently frozen.  A single request
+    /// cannot tell a minimum equal to the current size (the app refuses to shrink but can
+    /// grow) from a maximum or a genuinely frozen dimension.  Use
+    /// [`AxWindow::probe_size_constraints`] to distinguish those cases.
     Frozen,
 }
 
@@ -169,18 +174,20 @@ impl AppliedFrame {
 /// Per-axis constraint discovered by [`AxWindow::probe_size_constraints`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum AxisConstraint {
-    /// The axis followed the request; no minimum was detected.
+    /// The axis followed both the shrink and grow probes; no minimum was detected.
     #[default]
     Free,
-    /// The application refused to change this dimension at all.
-    Frozen {
-        /// The value the dimension is stuck at.
-        value: f64,
-    },
-    /// The application refused to shrink below this value.
+    /// The application refused to shrink below this value, but can still grow
+    /// (unless a grow clamp also produced a real maximum).
     Min {
         /// Smallest accepted value in logical pixels.
         min: f64,
+    },
+    /// The application refused both the shrink and the grow probe; the dimension is
+    /// genuinely stuck at this value, so the minimum and maximum are both `value`.
+    Frozen {
+        /// The value the dimension is stuck at.
+        value: f64,
     },
 }
 
@@ -226,7 +233,7 @@ pub struct SizeConstraints {
 }
 
 impl SizeConstraints {
-    /// Build a result for a window whose probe target equalled its current size.
+    /// Build a result for a window whose probe targets equalled its current size.
     fn unconstrained(max: Option<Size>) -> Self {
         SizeConstraints {
             min: None,
@@ -236,24 +243,49 @@ impl SizeConstraints {
         }
     }
 
-    /// Pure logic behind the probe: classify the applied size and merge a declared maximum.
+    /// Pure logic behind the probe: classify the shrink and grow results per axis and merge
+    /// any declared maximum.
     ///
-    /// `original` is the size before probing, `probe` the requested tiny size and `applied`
-    /// the size the application actually produced.
-    fn from_probe(original: Size, probe: Size, applied: Size, declared_max: Option<Size>) -> Self {
-        let width = classify_axis(original.width, probe.width, applied.width);
-        let height = classify_axis(original.height, probe.height, applied.height);
-        let min = if width.is_free() && height.is_free() {
+    /// `original` is the size before probing, `shrink` / `grow` are the requested probe sizes
+    /// and `applied_shrink` / `applied_grow` are what the application actually produced.
+    /// `grow` is `None` when the probe could not grow the window (no display cap), in which
+    /// case the classification degrades to shrink-only.
+    fn from_probes(
+        original: Size,
+        shrink: Size,
+        applied_shrink: Size,
+        grow: Option<Size>,
+        applied_grow: Option<Size>,
+        declared_max: Option<Size>,
+    ) -> Self {
+        let width = classify_axis(
+            original.width,
+            shrink.width,
+            applied_shrink.width,
+            grow.map(|size| size.width),
+            applied_grow.map(|size| size.width),
+        );
+        let height = classify_axis(
+            original.height,
+            shrink.height,
+            applied_shrink.height,
+            grow.map(|size| size.height),
+            applied_grow.map(|size| size.height),
+        );
+        let min = if width.constraint.is_free() && height.constraint.is_free() {
             None
         } else {
-            Some(Size::new(width.minimum(), height.minimum()))
+            Some(Size::new(
+                width.constraint.minimum(),
+                height.constraint.minimum(),
+            ))
         };
-        let max = merge_max(width, height, declared_max);
+        let max = merge_max(width.max, height.max, declared_max);
         SizeConstraints {
             min,
             max,
-            width,
-            height,
+            width: width.constraint,
+            height: height.constraint,
         }
     }
 }
@@ -262,7 +294,57 @@ impl SizeConstraints {
 pub const FRAME_TOLERANCE: f64 = 1.0;
 
 /// Size the probe shrinks to before reading back the application's minimum.
-const PROBE_SIZE: f64 = 1.0;
+const SHRINK_PROBE_SIZE: f64 = 1.0;
+
+/// How far the probe grows a window to detect a maximum.
+const GROW_STEP: f64 = 128.0;
+
+/// The grow probe is capped at this fraction of the main display's frame, so it never asks
+/// for an enormous window that the display would clamp for unrelated reasons.
+const GROW_DISPLAY_FRACTION: f64 = 0.5;
+
+/// The shrink target: 1×1, or the current size when an axis is already tiny.
+fn shrink_target(original: Size) -> Size {
+    Size::new(
+        if original.width > SHRINK_PROBE_SIZE + FRAME_TOLERANCE {
+            SHRINK_PROBE_SIZE
+        } else {
+            original.width
+        },
+        if original.height > SHRINK_PROBE_SIZE + FRAME_TOLERANCE {
+            SHRINK_PROBE_SIZE
+        } else {
+            original.height
+        },
+    )
+}
+
+/// The grow target, or `None` when the display cap cannot be queried or leaves no room to
+/// grow (the caller then degrades to shrink-only classification).
+fn grow_target(original: Size, cap: Option<Size>) -> Option<Size> {
+    let cap = cap?;
+    let width = (original.width + GROW_STEP)
+        .min(cap.width)
+        .max(original.width);
+    let height = (original.height + GROW_STEP)
+        .min(cap.height)
+        .max(original.height);
+    if width <= original.width + FRAME_TOLERANCE && height <= original.height + FRAME_TOLERANCE {
+        None
+    } else {
+        Some(Size::new(width, height))
+    }
+}
+
+/// Half of the main display's frame, used as the grow-probe cap.
+fn grow_cap() -> Option<Size> {
+    let display = crate::display::main_display().ok()?;
+    let cap = Size::new(
+        display.frame.size.width * GROW_DISPLAY_FRACTION,
+        display.frame.size.height * GROW_DISPLAY_FRACTION,
+    );
+    (cap.width > 0.0 && cap.height > 0.0).then_some(cap)
+}
 
 fn approx_equal(a: f64, b: f64) -> bool {
     (a - b).abs() <= FRAME_TOLERANCE
@@ -306,41 +388,101 @@ fn classify_position(
     }
 }
 
-fn classify_axis(original: f64, probe: f64, applied: f64) -> AxisConstraint {
-    if approx_equal(applied, probe) {
-        AxisConstraint::Free
-    } else if approx_equal(applied, original) {
-        AxisConstraint::Frozen { value: original }
+/// One axis finding: the shrink-side constraint plus any grow-side maximum.
+struct AxisFinding {
+    constraint: AxisConstraint,
+    max: Option<f64>,
+}
+
+/// Classify one axis from a shrink probe and an optional grow probe.
+///
+/// `Frozen` requires **both** probes to be refused.  A window whose minimum equals its
+/// natural size refuses to shrink but grows normally, which is [`AxisConstraint::Min`], not
+/// frozen.  A grow clamp that is not a full refusal is reported as a real maximum even when
+/// the axis has no minimum.  When the grow probe could not run, a refused shrink degrades to
+/// [`AxisConstraint::Frozen`] (the old shrink-only behaviour) because the two cases cannot be
+/// distinguished without growing the window.
+fn classify_axis(
+    original: f64,
+    shrink: f64,
+    applied_shrink: f64,
+    grow: Option<f64>,
+    applied_grow: Option<f64>,
+) -> AxisFinding {
+    let shrink_probed = shrink < original - FRAME_TOLERANCE;
+    let shrink_refused = shrink_probed && approx_equal(applied_shrink, original);
+    let min = if shrink_probed && applied_shrink > shrink + FRAME_TOLERANCE {
+        Some(applied_shrink.max(0.0))
     } else {
-        AxisConstraint::Min {
-            min: applied.max(0.0),
+        None
+    };
+
+    // Without a completed grow probe we cannot tell a natural-size minimum from a frozen
+    // dimension; keep the conservative shrink-only answer.
+    let Some(grow) = grow.filter(|grow| *grow > original + FRAME_TOLERANCE) else {
+        return shrink_only_finding(original, shrink_refused, min);
+    };
+    let Some(applied_grow) = applied_grow else {
+        return shrink_only_finding(original, shrink_refused, min);
+    };
+
+    let grow_refused = approx_equal(applied_grow, original);
+    if shrink_refused && grow_refused {
+        return AxisFinding {
+            constraint: AxisConstraint::Frozen { value: original },
+            max: Some(original),
+        };
+    }
+
+    // Only a value below the grow request is a real maximum.  An application that snaps the
+    // grow upward is not constraining the axis.
+    let max =
+        (applied_grow < grow - FRAME_TOLERANCE).then_some(applied_grow.max(original).max(0.0));
+    let constraint = min
+        .map(|min| AxisConstraint::Min { min })
+        .unwrap_or(AxisConstraint::Free);
+    AxisFinding { constraint, max }
+}
+
+/// Result when the grow probe could not run: a refused shrink is conservatively `Frozen`.
+fn shrink_only_finding(original: f64, shrink_refused: bool, min: Option<f64>) -> AxisFinding {
+    if shrink_refused {
+        AxisFinding {
+            constraint: AxisConstraint::Frozen { value: original },
+            max: Some(original),
+        }
+    } else {
+        AxisFinding {
+            constraint: min
+                .map(|min| AxisConstraint::Min { min })
+                .unwrap_or(AxisConstraint::Free),
+            max: None,
         }
     }
 }
 
 fn merge_max(
-    width: AxisConstraint,
-    height: AxisConstraint,
+    width_max: Option<f64>,
+    height_max: Option<f64>,
     declared_max: Option<Size>,
 ) -> Option<Size> {
-    let width_max = match (width.maximum(), declared_max.map(|size| size.width)) {
-        (Some(frozen), Some(declared)) => Some(frozen.min(declared)),
-        (Some(frozen), None) => Some(frozen),
-        (None, Some(declared)) => Some(declared),
-        (None, None) => None,
-    };
-    let height_max = match (height.maximum(), declared_max.map(|size| size.height)) {
-        (Some(frozen), Some(declared)) => Some(frozen.min(declared)),
-        (Some(frozen), None) => Some(frozen),
-        (None, Some(declared)) => Some(declared),
-        (None, None) => None,
-    };
+    let width_max = combine_max(width_max, declared_max.map(|size| size.width));
+    let height_max = combine_max(height_max, declared_max.map(|size| size.height));
     match (width_max, height_max) {
         (None, None) => None,
         (width, height) => Some(Size::new(
             width.unwrap_or(f64::MAX),
             height.unwrap_or(f64::MAX),
         )),
+    }
+}
+
+fn combine_max(probed: Option<f64>, declared: Option<f64>) -> Option<f64> {
+    match (probed, declared) {
+        (Some(probed), Some(declared)) => Some(probed.min(declared)),
+        (Some(probed), None) => Some(probed),
+        (None, Some(declared)) => Some(declared),
+        (None, None) => None,
     }
 }
 
@@ -735,49 +877,75 @@ impl AxWindow {
         Ok(AppliedFrame::from_frames(requested, applied, previous))
     }
 
-    /// Discover the minimum (and, when the app exposes it, maximum) size.
+    /// Discover the minimum and maximum size the application accepts.
     ///
-    /// **This momentarily resizes the window** — it shrinks the window to 1×1 for
-    /// roughly 50–100 ms, reads back what the application actually allowed, and
-    /// restores the original frame.  The platform layer never calls this
-    /// automatically; the daemon decides when a probe is worth the visible
-    /// flicker (for example once after a window is first managed, or after a
-    /// `SetFrame` was clamped).
+    /// **This momentarily resizes the window** — it shrinks the window to 1×1, reads
+    /// back what the application allowed, then grows it by [`GROW_STEP`] on each
+    /// axis (capped at [`GROW_DISPLAY_FRACTION`] of the main display, position
+    /// unchanged), reads that back too, and restores the original frame after each
+    /// step.  The platform layer never calls this automatically; the daemon decides
+    /// when a probe is worth the visible flicker (for example after a `SetFrame` was
+    /// clamped).
     ///
-    /// Applications can respond in three ways per dimension, reported through
-    /// [`AxisConstraint`]:
+    /// The two steps are what tell a **minimum equal to the current size** apart
+    /// from a **frozen** dimension.  Applications respond per axis:
     ///
-    /// * the requested probe size is applied → [`AxisConstraint::Free`];
-    /// * something between the probe and the original is applied → the application
-    ///   has a minimum on that axis ([`AxisConstraint::Min`]);
-    /// * the original size is unchanged → the dimension is frozen
-    ///   ([`AxisConstraint::Frozen`]), which System Settings does with its width.
+    /// * shrink applied fully **and** grow applied fully → [`AxisConstraint::Free`];
+    /// * the shrink stopped between 1×1 and the original size → the application
+    ///   has that minimum ([`AxisConstraint::Min`]);
+    /// * the shrink returned to the original size **and** the grow was rejected →
+    ///   the dimension is frozen ([`AxisConstraint::Frozen`]), which System
+    ///   Settings does with its width;
+    /// * the shrink returned to the original size **and** the grow was applied →
+    ///   the minimum equals the natural size ([`AxisConstraint::Min`]), which is
+    ///   what Notes' 642px width is: it refuses to shrink but widens happily.
     ///
-    /// A maximum is read directly from `AXMaxSize` / `AXMaximumSize` when the
-    /// application publishes it; the probe never grows a window to find a maximum.
+    /// A grow that stops short of the requested size is a **maximum**; it is
+    /// reported through [`SizeConstraints::max`] together with `AXMaxSize` /
+    /// `AXMaximumSize` when the application publishes one.
+    ///
+    /// If the main display cannot be queried the grow step is skipped and the
+    /// probe degrades to the shrink-only behaviour: in that case a minimum equal
+    /// to the natural size is reported as [`AxisConstraint::Frozen`], because the
+    /// two cannot be distinguished without growing the window.
     pub fn probe_size_constraints(&self) -> Result<SizeConstraints> {
         if !crate::ax::is_process_trusted() {
             return Err(PlatformError::AccessibilityDenied);
         }
         let original = self.current_frame()?;
         let declared_max = self.declared_max_size();
-        let probe = Size::new(
-            if original.size.width > PROBE_SIZE + FRAME_TOLERANCE {
-                PROBE_SIZE
-            } else {
-                original.size.width
-            },
-            if original.size.height > PROBE_SIZE + FRAME_TOLERANCE {
-                PROBE_SIZE
-            } else {
-                original.size.height
-            },
-        );
-        if probe == original.size {
+        let shrink = shrink_target(original.size);
+        let grow = grow_target(original.size, grow_cap());
+        if shrink == original.size && grow.is_none() {
             // Nothing to learn without growing the window.
             return Ok(SizeConstraints::unconstrained(declared_max));
         }
 
+        let shrink_applied = self.probe_once(original, shrink)?;
+        let grow_applied = match grow {
+            Some(grow) => match self.probe_once(original, grow) {
+                Ok(applied) => Some(applied),
+                Err(error) => {
+                    // A failed grow step must not lose the shrink result.
+                    log::debug!("probe({}): grow step failed: {error}", self.wid);
+                    None
+                }
+            },
+            None => None,
+        };
+        Ok(SizeConstraints::from_probes(
+            original.size,
+            shrink,
+            shrink_applied,
+            grow,
+            grow_applied,
+            declared_max,
+        ))
+    }
+
+    /// Apply one probe size at the window's current position, read back the size
+    /// the application produced, and always restore the original frame.
+    fn probe_once(&self, original: Rect, probe: Size) -> Result<Size> {
         let applied = self.set_frame(Rect::new(
             original.origin.x,
             original.origin.y,
@@ -798,12 +966,7 @@ impl AxWindow {
             }
             Err(err) => log::warn!("probe({}): could not restore frame: {err}", self.wid),
         }
-        Ok(SizeConstraints::from_probe(
-            original.size,
-            probe,
-            applied.applied.size,
-            declared_max,
-        ))
+        Ok(applied.applied.size)
     }
 
     /// Read an application-declared maximum size, if one of the known attribute
@@ -1206,23 +1369,37 @@ mod tests {
     #[test]
     fn probe_logic_detects_free_min_and_frozen_axes() {
         let original = Size::new(800.0, 600.0);
-        let probe = Size::new(1.0, 1.0);
+        let shrink = Size::new(1.0, 1.0);
+        let grow = Size::new(928.0, 728.0);
 
-        let free = SizeConstraints::from_probe(original, probe, probe, None);
+        let free =
+            SizeConstraints::from_probes(original, shrink, shrink, Some(grow), Some(grow), None);
         assert_eq!(free.width, AxisConstraint::Free);
         assert_eq!(free.height, AxisConstraint::Free);
         assert_eq!(free.min, None);
         assert_eq!(free.max, None);
 
-        let width_min = SizeConstraints::from_probe(original, probe, Size::new(642.0, 1.0), None);
+        // A real minimum: the shrink was clamped, the grow was applied.
+        let width_min = SizeConstraints::from_probes(
+            original,
+            shrink,
+            Size::new(642.0, 1.0),
+            Some(grow),
+            Some(grow),
+            None,
+        );
         assert_eq!(width_min.width, AxisConstraint::Min { min: 642.0 });
         assert_eq!(width_min.height, AxisConstraint::Free);
         assert_eq!(width_min.min, Some(Size::new(642.0, 0.0)));
+        assert_eq!(width_min.max, None);
 
-        let frozen = SizeConstraints::from_probe(
+        // A genuinely frozen dimension refuses both directions.
+        let frozen = SizeConstraints::from_probes(
             Size::new(715.0, 600.0),
-            probe,
+            shrink,
             Size::new(715.0, 1.0),
+            Some(grow),
+            Some(Size::new(715.0, 728.0)),
             None,
         );
         assert_eq!(frozen.width, AxisConstraint::Frozen { value: 715.0 });
@@ -1231,31 +1408,130 @@ mod tests {
     }
 
     #[test]
+    fn minimum_equal_to_natural_size_is_min_not_frozen() {
+        // The VM's Notes case: 642px is both its natural width and its minimum, but it can
+        // still grow.  Reporting Frozen here was the bug.
+        let constraints = SizeConstraints::from_probes(
+            Size::new(642.0, 600.0),
+            Size::new(1.0, 1.0),
+            Size::new(642.0, 1.0),
+            Some(Size::new(770.0, 728.0)),
+            Some(Size::new(770.0, 728.0)),
+            None,
+        );
+        assert_eq!(constraints.width, AxisConstraint::Min { min: 642.0 });
+        assert_eq!(constraints.min, Some(Size::new(642.0, 0.0)));
+        assert_eq!(constraints.max, None);
+    }
+
+    #[test]
+    fn grow_clamp_is_reported_as_a_maximum() {
+        // Grow-only maximum: the shrink was free, the grow stopped at 900.
+        let width_max = SizeConstraints::from_probes(
+            Size::new(800.0, 600.0),
+            Size::new(1.0, 1.0),
+            Size::new(1.0, 1.0),
+            Some(Size::new(928.0, 728.0)),
+            Some(Size::new(900.0, 728.0)),
+            None,
+        );
+        assert_eq!(width_max.width, AxisConstraint::Free);
+        assert_eq!(width_max.height, AxisConstraint::Free);
+        assert_eq!(width_max.min, None);
+        assert_eq!(width_max.max, Some(Size::new(900.0, f64::MAX)));
+
+        // A Min and a max on the same axis.
+        let range = SizeConstraints::from_probes(
+            Size::new(642.0, 600.0),
+            Size::new(1.0, 1.0),
+            Size::new(642.0, 1.0),
+            Some(Size::new(770.0, 728.0)),
+            Some(Size::new(700.0, 728.0)),
+            None,
+        );
+        assert_eq!(range.width, AxisConstraint::Min { min: 642.0 });
+        assert_eq!(range.max, Some(Size::new(700.0, f64::MAX)));
+    }
+
+    #[test]
+    fn grow_snapping_upward_is_not_a_maximum() {
+        let constraints = SizeConstraints::from_probes(
+            Size::new(800.0, 600.0),
+            Size::new(1.0, 1.0),
+            Size::new(1.0, 1.0),
+            Some(Size::new(928.0, 728.0)),
+            Some(Size::new(930.0, 730.0)),
+            None,
+        );
+        assert_eq!(constraints.width, AxisConstraint::Free);
+        assert_eq!(constraints.max, None);
+    }
+
+    #[test]
     fn declared_maximum_is_used_without_growing_the_window() {
         let original = Size::new(800.0, 600.0);
-        let probe = Size::new(1.0, 1.0);
+        let shrink = Size::new(1.0, 1.0);
         let declared = Size::new(4000.0, 3000.0);
-        let constraints = SizeConstraints::from_probe(original, probe, probe, Some(declared));
+        let constraints =
+            SizeConstraints::from_probes(original, shrink, shrink, None, None, Some(declared));
         assert_eq!(constraints.max, Some(declared));
         assert_eq!(constraints.min, None);
 
         // A frozen axis is at most its frozen value, even if AXMaxSize is larger.
-        let frozen = SizeConstraints::from_probe(
+        let frozen = SizeConstraints::from_probes(
             original,
-            probe,
+            shrink,
             Size::new(800.0, 1.0),
+            None,
+            None,
             Some(Size::new(4000.0, 3000.0)),
         );
         assert_eq!(frozen.max, Some(Size::new(800.0, 3000.0)));
+        assert_eq!(frozen.width, AxisConstraint::Frozen { value: 800.0 });
+    }
+
+    #[test]
+    fn shrink_only_probe_degrades_to_frozen() {
+        // Without a display we cannot grow, so a refused shrink is the conservative answer.
+        let constraints = SizeConstraints::from_probes(
+            Size::new(642.0, 600.0),
+            Size::new(1.0, 1.0),
+            Size::new(642.0, 1.0),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(constraints.width, AxisConstraint::Frozen { value: 642.0 });
+        assert_eq!(constraints.max, Some(Size::new(642.0, f64::MAX)));
     }
 
     #[test]
     fn probe_target_equal_to_current_size_reports_no_constraint() {
         let original = Size::new(1.0, 1.0);
-        let constraints = SizeConstraints::from_probe(original, original, original, None);
+        let constraints =
+            SizeConstraints::from_probes(original, original, original, None, None, None);
         assert!(constraints.width.is_free());
         assert!(constraints.height.is_free());
         assert_eq!(constraints.min, None);
+    }
+
+    #[test]
+    fn probe_target_helpers_respect_the_display_cap() {
+        assert_eq!(shrink_target(Size::new(800.0, 600.0)), Size::new(1.0, 1.0));
+        assert_eq!(shrink_target(Size::new(0.5, 0.5)), Size::new(0.5, 0.5));
+        assert_eq!(
+            grow_target(Size::new(800.0, 600.0), Some(Size::new(2000.0, 2000.0))),
+            Some(Size::new(928.0, 728.0))
+        );
+        assert_eq!(
+            grow_target(Size::new(800.0, 600.0), Some(Size::new(850.0, 700.0))),
+            Some(Size::new(850.0, 700.0))
+        );
+        assert_eq!(
+            grow_target(Size::new(800.0, 600.0), Some(Size::new(700.0, 500.0))),
+            None
+        );
+        assert_eq!(grow_target(Size::new(800.0, 600.0), None), None);
     }
 
     #[test]

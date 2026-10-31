@@ -87,7 +87,7 @@ fn help() {
          needs Accessibility:\n\
            ax-list                  enumerate through AX only\n\
            move <wid> <x> <y> <w> <h>\n\
-           probe <wid>              discover min/max size (momentarily shrinks it)\n\
+           probe <wid>              discover min/max size (momentarily shrinks and grows it)\n\
            --probe-window <wid>     same, as a flag\n\
            park <wid> [--seconds N] [--display N]\n\
            tap [--seconds N] [--post]\n\
@@ -332,7 +332,8 @@ fn move_window(args: &[String]) {
 }
 
 /// Discover a window's size constraints.  This *momentarily resizes the window*
-/// (a 1x1 probe for roughly 50-100 ms) and restores its frame afterwards.
+/// (a 1x1 shrink followed by a small grow, roughly 100-200 ms) and restores its
+/// frame afterwards.
 fn probe_window(wid: u32) {
     if !tcc::accessibility_trusted() {
         eprintln!("!! probe: needs Accessibility (AXPosition/AXSize are AX attributes)");
