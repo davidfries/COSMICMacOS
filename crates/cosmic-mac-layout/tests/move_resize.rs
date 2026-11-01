@@ -112,7 +112,7 @@ fn move_into_adjacent_stack_joins_it() {
     assert_eq!(harness.layout.focused(), Some(3));
     assert!(harness.layout.is_visible(3));
     assert!(!harness.layout.is_visible(1));
-    harness.assert_frame(3, 0.0, 0.0, 1000.0, 500.0);
+    harness.assert_frame(3, 0.0, 26.0, 1000.0, 474.0);
     harness.assert_synced();
 }
 
@@ -152,7 +152,7 @@ fn move_whole_stack_swaps_with_neighbour() {
     harness.act(Action::Move {
         direction: Direction::Right,
     });
-    harness.assert_frame(2, 500.0, 0.0, 500.0, 500.0);
+    harness.assert_frame(2, 500.0, 26.0, 500.0, 474.0);
     harness.assert_frame(3, 0.0, 0.0, 500.0, 500.0);
     assert_eq!(harness.layout.focused(), Some(2));
 }
@@ -393,7 +393,8 @@ fn swap_window_plain_with_stack_member() {
     assert_eq!(harness.layout.focused(), Some(3));
     assert!(harness.layout.is_visible(3));
     assert_eq!(harness.layout.active_stack().unwrap().active, 1);
-    harness.assert_frame(3, 0.0, 0.0, 500.0, 500.0);
+    // 3 now sits in the left stack, below the tab-bar strip; 2 is plain on the right.
+    harness.assert_frame(3, 0.0, 26.0, 500.0, 474.0);
     harness.assert_frame(2, 500.0, 0.0, 500.0, 500.0);
     harness.assert_synced();
 }
@@ -410,7 +411,7 @@ fn swap_window_stack_member_with_plain() {
     harness.act(Action::SwapWindow);
     assert_eq!(harness.layout.focused(), Some(3));
     harness.assert_frame(3, 500.0, 0.0, 500.0, 500.0);
-    harness.assert_frame(2, 0.0, 0.0, 500.0, 500.0);
+    harness.assert_frame(2, 0.0, 26.0, 500.0, 474.0);
     harness.assert_synced();
 }
 

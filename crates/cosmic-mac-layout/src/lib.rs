@@ -1534,8 +1534,14 @@ impl Layout {
         if let Some(maximized) = workspace.maximized
             && visible.contains_key(&maximized.wid)
         {
-            visible.insert(maximized.wid, self.work_area);
-            all.insert(maximized.wid, self.work_area);
+            // A stacked window keeps the tab bar's strip free at the top of the work area.
+            let frame = if workspace.tree.stack_containing(maximized.wid).is_some() {
+                geometry::below_stack_bar(self.work_area)
+            } else {
+                self.work_area
+            };
+            visible.insert(maximized.wid, frame);
+            all.insert(maximized.wid, frame);
         }
         WorkspaceFrames {
             visible,

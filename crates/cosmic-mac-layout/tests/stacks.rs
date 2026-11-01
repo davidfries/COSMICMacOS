@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use cosmic_mac_protocol::{Action, TreeNode};
+use cosmic_mac_protocol::{Action, Config, Rect, STACK_BAR_HEIGHT, TreeNode};
 
 fn stacked_pair() -> Harness {
     let mut harness = Harness::new();
@@ -24,7 +24,7 @@ fn toggle_stacking_with_sibling_window() {
     );
     assert_eq!(stack.active, 1);
     assert_eq!(harness.layout.focused(), Some(2));
-    harness.assert_frame(2, 0.0, 0.0, 1000.0, 500.0);
+    harness.assert_frame(2, 0.0, 26.0, 1000.0, 474.0);
     assert!(harness.layout.is_visible(2));
     assert!(!harness.layout.is_visible(1));
     harness.assert_synced();
@@ -132,7 +132,8 @@ fn unstack_creates_a_sibling_frame() {
     assert!(stack.is_none());
     assert_eq!(harness.layout.focused(), Some(3));
     harness.assert_frame(3, 500.0, 0.0, 500.0, 500.0);
-    harness.assert_frame(2, 0.0, 0.0, 500.0, 500.0);
+    // Still stacked with 1, below the tab-bar strip.
+    harness.assert_frame(2, 0.0, 26.0, 500.0, 474.0);
     assert!(harness.layout.is_visible(2));
     harness.assert_synced();
 }
@@ -186,7 +187,8 @@ fn stack_only_shows_active_member() {
     assert!(visible.contains_key(&2));
     assert!(!visible.contains_key(&1));
     assert!(harness.platform.hidden.contains(&1));
-    harness.assert_frame(1, 0.0, 0.0, 1000.0, 500.0);
+    // A parked member keeps the frame below the tab bar.
+    harness.assert_frame(1, 0.0, 26.0, 1000.0, 474.0);
     harness.assert_synced();
 }
 
@@ -199,7 +201,7 @@ fn stacking_emits_hide_for_inactive_member() {
     assert_eq!(hides(&commands), vec![1]);
     assert_eq!(
         set_frames(&commands).get(&2),
-        Some(&cosmic_mac_protocol::Rect::new(0.0, 0.0, 1000.0, 500.0))
+        Some(&cosmic_mac_protocol::Rect::new(0.0, 26.0, 1000.0, 474.0))
     );
     let changes = stack_changes(&commands);
     assert!(changes.last().unwrap().is_some());
@@ -315,7 +317,9 @@ fn active_stack_frame_follows_maximized_tab() {
     harness.act(Action::FocusWindow { wid: 2 });
     harness.act(Action::Maximize);
     let stack = harness.layout.active_stack().unwrap();
-    assert_eq!(stack.frame, WORK);
+    // The work area minus the tab-bar strip.
+    assert_eq!(stack.frame, Rect::new(0.0, 26.0, 1000.0, 474.0));
+    harness.assert_frame(2, 0.0, 26.0, 1000.0, 474.0);
     assert!(harness.layout.is_visible(2));
 }
 
@@ -326,4 +330,126 @@ fn stacking_after_unstack_can_stack_again() {
     harness.act(Action::ToggleStacking);
     let stack = harness.layout.active_stack().unwrap();
     assert_eq!(stack.tabs.len(), 2);
+}
+
+#[test]
+fn stack_members_get_the_tile_minus_the_tab_bar_strip() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    harness.add();
+    harness.act(Action::ToggleStacking);
+    assert_eq!(harness.shape(), "H[1 S[2 3]]");
+    let bar = STACK_BAR_HEIGHT;
+    // The plain window beside the stack keeps its full-height tile.
+    let plain = harness.frame(1);
+    assert_eq!((plain.y, plain.height), (0.0, 500.0));
+    // Both members, parked or visible, sit below the strip of the stack's full-height tile.
+    let member = harness.frame(3);
+    assert_eq!(harness.frame(2), member);
+    assert_eq!(member.x, plain.right());
+    assert_eq!((member.y, member.height), (bar, 500.0 - bar));
+    assert_eq!(harness.layout.visible_frames().len(), 2);
+    assert_eq!(harness.layout.active_stack().unwrap().frame, member);
+    // The strip still belongs to the stack's tile: tiles cover the work area exactly.
+    assert_tiles(WORK, &visible_tiles(&harness.layout));
+    harness.assert_synced();
+}
+
+#[test]
+fn stack_info_frame_is_the_visible_members_frame() {
+    let mut harness = stacked_pair();
+    for wid in [1, 2] {
+        harness.act(Action::FocusWindow { wid });
+        let stack = harness.layout.active_stack().unwrap();
+        assert_eq!(stack.frame, harness.frame(wid));
+        assert_eq!(stack.frame, Rect::new(0.0, 26.0, 1000.0, 474.0));
+        assert_eq!(harness.layout.stacks()[0].frame, stack.frame);
+        // The bar is drawn directly above this frame, inside the work area.
+        assert!(stack.frame.y - STACK_BAR_HEIGHT >= WORK.y);
+    }
+}
+
+#[test]
+fn a_constrained_member_is_centred_below_the_strip() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add_with(constrained(2, None, Some((1000.0, 300.0))));
+    harness.act(Action::ToggleStacking);
+    assert_eq!(harness.shape(), "S[1 2]");
+    // The 474pt window area leaves 174pt spare, split above and below.
+    harness.assert_frame(2, 0.0, 113.0, 1000.0, 300.0);
+    assert_eq!(
+        harness.layout.active_stack().unwrap().frame,
+        harness.frame(2)
+    );
+}
+
+#[test]
+fn a_stack_in_a_vertical_group_reserves_its_strip_inside_its_tile() {
+    let mut harness = Harness::with(Config::default(), BIG_WORK);
+    harness.add();
+    harness.add();
+    harness.add();
+    harness.act(Action::ToggleStacking);
+    assert_eq!(harness.shape(), "H[1 S[2 3]]");
+    harness.act(Action::ToggleOrientation);
+    assert_eq!(harness.shape(), "V[1 S[2 3]]");
+    // 800 split in two 400pt tiles; the stack's is the lower one.
+    harness.assert_frame(1, 0.0, 0.0, 1200.0, 400.0);
+    harness.assert_frame(3, 0.0, 426.0, 1200.0, 374.0);
+    harness.assert_frame(2, 0.0, 426.0, 1200.0, 374.0);
+    assert_tiles(BIG_WORK, &visible_tiles(&harness.layout));
+}
+
+#[test]
+fn a_maximized_stack_member_keeps_the_strip_free() {
+    let mut harness = stacked_pair();
+    harness.act(Action::Maximize);
+    let below_bar = Rect::new(0.0, 26.0, 1000.0, 474.0);
+    harness.assert_frame(2, 0.0, 26.0, 1000.0, 474.0);
+    assert_eq!(harness.layout.active_stack().unwrap().frame, below_bar);
+    harness.assert_synced();
+    // Un-maximizing returns it to the tile frame, which is the same below-bar frame here.
+    harness.act(Action::Maximize);
+    harness.assert_frame(2, 0.0, 26.0, 1000.0, 474.0);
+}
+
+#[test]
+fn a_maximized_stack_member_fills_the_work_area_below_the_strip_beside_others() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    harness.add();
+    harness.act(Action::ToggleStacking);
+    assert_eq!(harness.shape(), "H[1 S[2 3]]");
+    let tile_frame = harness.frame(3);
+    harness.act(Action::Maximize);
+    harness.assert_frame(3, 0.0, 26.0, 1000.0, 474.0);
+    assert_eq!(
+        harness.layout.active_stack().unwrap().frame,
+        Rect::new(0.0, 26.0, 1000.0, 474.0)
+    );
+    harness.act(Action::Maximize);
+    assert_eq!(harness.frame(3), tile_frame);
+}
+
+#[test]
+fn a_maximized_plain_window_keeps_the_whole_work_area() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    harness.act(Action::Maximize);
+    harness.assert_frame(2, 0.0, 0.0, 1000.0, 500.0);
+}
+
+#[test]
+fn unstacking_restores_full_height_tiles() {
+    let mut harness = stacked_pair();
+    harness.act(Action::ToggleStacking);
+    assert!(harness.layout.active_stack().is_none());
+    harness.assert_frame(1, 0.0, 0.0, 500.0, 500.0);
+    harness.assert_frame(2, 500.0, 0.0, 500.0, 500.0);
+    assert_tiles(WORK, &visible_tiles(&harness.layout));
+    harness.assert_synced();
 }

@@ -27,6 +27,8 @@
 //! 5. When even the sum of the minima does not fit, the minima are ignored for that group and
 //!    the space is divided by weight.  The application will still clamp its window, but the
 //!    layout never emits overlapping rectangles.
+//! 6. A stack reserves the top [`STACK_BAR_HEIGHT`] of its tile for the tab bar overlay.  Its
+//!    members are clamped and centred in the rest of the tile, so the bar never covers a window.
 
 use std::collections::{BTreeMap, BTreeSet};
 

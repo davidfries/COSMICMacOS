@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cosmic_mac_layout::Layout;
 use cosmic_mac_protocol::{
-    Action, Command, Config, Rect, Size, StackInfo, ToplevelInfo, TreeNode, WindowId,
+    Action, Command, Config, Rect, STACK_BAR_HEIGHT, Size, StackInfo, ToplevelInfo, TreeNode,
+    WindowId,
 };
 
 pub const WORK: Rect = Rect::new(0.0, 0.0, 1000.0, 500.0);
@@ -332,6 +333,27 @@ pub fn stack_changes(commands: &[Command]) -> Vec<Option<StackInfo>> {
 }
 
 /// Assert that `rects` exactly tile `area` (no overlap, no gaps).
+/// The tile every visible window was allocated: the visible frames, with each stack's frame
+/// grown back over the tab-bar strip above it.
+pub fn visible_tiles(layout: &Layout) -> Vec<Rect> {
+    let mut frames = layout.visible_frames();
+    for stack in layout.stacks() {
+        let wid = stack.tabs[stack.active].wid;
+        let frame = frames[&wid];
+        assert_eq!(frame, stack.frame, "stack {wid} frame");
+        frames.insert(
+            wid,
+            Rect::new(
+                frame.x,
+                frame.y - STACK_BAR_HEIGHT,
+                frame.width,
+                frame.height + STACK_BAR_HEIGHT,
+            ),
+        );
+    }
+    frames.into_values().collect()
+}
+
 pub fn assert_tiles(area: Rect, rects: &[Rect]) {
     let mut sum = 0.0;
     for (index, rect) in rects.iter().enumerate() {

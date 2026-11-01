@@ -177,9 +177,9 @@ Pop!_OS 24.04. Our semantics documentation should cite these:
   `(caffeinate -u -t 30 >/dev/null 2>&1 &)`; without the redirect the ssh
   call waits for caffeinate to exit.
 - **A title-bar drag needs time before the release**: dragged events and a
-  release posted within ~3 ms move nothing. Clicks on the tab-bar overlay
-  reach the window under it (a title-bar drag of a stack's visible member that
-  starts under the bar works). See "Drag to stack" for the event timing.
+  release posted within ~3 ms move nothing. The tab bar sits above the stack's
+  windows, so a stack member's own title bar (below the bar) is the drag
+  handle. See "Drag to stack" for the event timing.
 - **Accessibility is charged per launching context.** Over ssh the grant is
   sshd's, so a hand-started WM works; started by launchd, `cosmic-mac-wm` needs
   its own entry in System Settings > Privacy & Security > Accessibility or it
@@ -308,9 +308,14 @@ Pop!_OS 24.04. Our semantics documentation should cite these:
    `cached_displays()` serve the probe's grow origin and `display_frame`.
 4. No `Ping`/`CloseWindow{wid}`/tree-selector request variants in the protocol;
    `tree --workspace N` is composed by switching workspaces first (state-changing).
-5. Tab bar: drawn inside the active member's top edge (placing it above the
-   frame hid it behind the neighbour — focus-without-raise preserves z-order).
-   Tab clicks and the × glyph are display-only (milestone 2).
+5. Tab bar: a 26 pt strip (`STACK_BAR_HEIGHT`, protocol) at the top of the
+   stack's tile; the layout gives every member the tile minus that strip, so
+   the bar sits directly above the members' own title bar (traffic lights
+   visible) and no neighbour can cover it. `StackInfo.frame` and `TreeNode::Stack`
+   frames are the member (below-bar) frame; the tile in the tree/`nodes` stays
+   full height. A maximized stacked window gets the work area minus the strip.
+   Floating a stack member keeps its current (below-bar) frame. Tab clicks and
+   the × glyph are display-only (milestone 2).
 6. Multi-display: parking falls back to the cached main display frame; the
    layout is a single workspace pool (`assign_display` not implemented).
 7. Carbon hotkey fallback for Secure Event Input is documented
@@ -1030,7 +1035,9 @@ back, an edge resize is not fought while held and snaps back on release, fast
 drags (grace path below), and the vm-test drag phase. Evidence:
 `scratch/drag-stack-highlight.png` (mid-drag highlight),
 `scratch/drag-stack.png`, `scratch/drag-restack.png`,
-`scratch/vm-test-09-drag-stack.png`.
+`scratch/vm-test-09-drag-stack.png`. The stack-below-bar layout (windows below
+the tab bar, 2026-11-01) is shown in `scratch/stack-below-bar.png`; the drop
+highlight over a stack covers its window area (below the bar).
 
 - **Input**: a second, listen-only CGEventTap (`MouseTap` in platform
   `eventtap.rs`) for left down/dragged/up, on the WM's tap thread; dragged

@@ -104,8 +104,10 @@ The tree is an arena of nodes (`crates/cosmic-mac-layout/src/tree.rs`):
 * `Stack { windows, active }` — a leaf holding an ordered tab list and the active index.
 
 Weights normalise against the rectangle a group receives, so changing the work area, gaps or
-workspace does not require rescaling stored sizes. Only the active stack member occupies the
-stack's frame; the others are hidden.
+workspace does not require rescaling stored sizes. Only the active stack member is visible;
+the others are hidden. A stack's tile reserves its top `STACK_BAR_HEIGHT` (26 pt) for the tab
+bar overlay, and every member's frame is the tile minus that strip (after clamping), so the
+member's own title bar shows directly below the tabs.
 
 **Insertion.** A new tiled window is inserted next to the focused leaf (or the last tiled
 focus, or the first window). The split orientation is chosen from the reference frame's
@@ -171,7 +173,9 @@ A stack is a first-class leaf, not a group of hidden windows:
   inactive and `Show` + `SetFrame` for the newly active member. The daemon parks hidden
   members with the corner-park mechanism.
 * `Layout::active_stack()` / `Layout::stacks()` expose tab titles, the active index and the
-  frame so the daemon can draw the tab bar. `Command::StackChanged` is emitted when the
+  frame so the daemon can draw the tab bar. `StackInfo.frame` is the visible member's frame,
+  below the bar; the bar is drawn directly above it. A maximized stacked window gets the work
+  area minus the strip, so the bar stays visible. `Command::StackChanged` is emitted when the
   focused stack changes; `None` hides the bar.
 * Drag to stack: `Layout::drop_zone(wid, x, y)` names the tile whose middle third (both
   axes, cosmic-comp's stack region) holds the point; `wid`'s own tile is never a target and
@@ -349,7 +353,7 @@ The daemon translates each `Command` into platform operations:
   `SLPSPostEventRecordTo`), falling back to activation;
 * `Close` — AX close button / terminate;
 * `ActivateWorkspace` — update the display's visible workspace, panel state and journal;
-* `StackChanged` — create/position/hide the tab-bar overlay above the active member.
+* `StackChanged` — create/position/hide the tab-bar overlay, a 26 pt strip directly above the active member's frame.
 
 The layout engine assumes the platform can move windows to arbitrary global frames and that
 parked windows are not user-visible. It does not assume anything about z-order beyond

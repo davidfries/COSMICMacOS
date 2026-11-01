@@ -22,8 +22,9 @@ fn tabs(harness: &Harness) -> Vec<WindowId> {
         .unwrap_or_default()
 }
 
-fn visible_tiles(harness: &Harness) -> Vec<Rect> {
-    harness.layout.visible_frames().into_values().collect()
+/// Tiles including each stack's tab-bar strip; they must exactly cover the work area.
+fn tiles(harness: &Harness) -> Vec<Rect> {
+    visible_tiles(&harness.layout)
 }
 
 /// `H[1 2]`: two side-by-side 500×500 tiles.
@@ -55,7 +56,11 @@ fn window_onto_window_creates_a_stack() {
     assert_eq!(harness.layout.active_stack().unwrap().active, 1);
     assert_eq!(harness.layout.focused(), Some(1));
     assert_eq!(hides(&commands), vec![2]);
-    assert_eq!(set_frames(&commands).get(&1), Some(&WORK));
+    // The stack's tile minus the tab-bar strip.
+    assert_eq!(
+        set_frames(&commands).get(&1),
+        Some(&Rect::new(0.0, 26.0, 1000.0, 474.0))
+    );
     assert_eq!(focus_command(&commands), Some(1));
     assert!(stack_changes(&commands).last().unwrap().is_some());
     assert!(harness.layout.is_visible(1));
@@ -73,7 +78,7 @@ fn window_onto_an_existing_stack_becomes_its_last_tab() {
     assert_eq!(tabs(&harness), vec![2, 3, 1]);
     assert_eq!(harness.layout.active_stack().unwrap().active, 2);
     assert_eq!(harness.layout.focused(), Some(1));
-    harness.assert_frame(1, 0.0, 0.0, 1200.0, 800.0);
+    harness.assert_frame(1, 0.0, 26.0, 1200.0, 774.0);
     harness.assert_synced();
 }
 
@@ -108,7 +113,7 @@ fn a_member_leaving_a_stack_of_two_dissolves_it() {
     assert_eq!(shows(&commands), vec![2]);
     assert_eq!(hides(&commands), vec![1]);
     assert_eq!(harness.layout.stacks().len(), 1);
-    assert_tiles(BIG_WORK, &visible_tiles(&harness));
+    assert_tiles(BIG_WORK, &tiles(&harness));
     harness.assert_synced();
 }
 
@@ -124,7 +129,7 @@ fn a_member_leaving_a_larger_stack_keeps_the_rest_stacked() {
     assert_eq!(harness.shape(), "H[S[2 3 1] 4]");
     stack_onto(&mut harness, 1, 4);
     assert_eq!(harness.shape(), "H[S[2 3] S[4 1]]");
-    assert_tiles(BIG_WORK, &visible_tiles(&harness));
+    assert_tiles(BIG_WORK, &tiles(&harness));
     harness.assert_synced();
 }
 
@@ -160,9 +165,9 @@ fn a_window_from_a_nested_group_stacks_onto_a_top_level_window() {
     stack_onto(&mut harness, 2, 1);
     assert_eq!(harness.shape(), "H[S[1 2] 3]");
     assert_eq!(harness.layout.focused(), Some(2));
-    harness.assert_frame(2, 0.0, 0.0, 600.0, 800.0);
+    harness.assert_frame(2, 0.0, 26.0, 600.0, 774.0);
     harness.assert_frame(3, 600.0, 0.0, 600.0, 800.0);
-    assert_tiles(BIG_WORK, &visible_tiles(&harness));
+    assert_tiles(BIG_WORK, &tiles(&harness));
     harness.assert_synced();
 }
 
@@ -175,14 +180,14 @@ fn a_top_level_window_stacks_onto_a_window_in_a_nested_group() {
     stack_onto(&mut harness, 1, 4);
     assert_eq!(harness.shape(), "V[2 H[3 S[4 1]]]");
     assert_eq!(harness.layout.focused(), Some(1));
-    harness.assert_frame(1, 600.0, 400.0, 600.0, 400.0);
+    harness.assert_frame(1, 600.0, 426.0, 600.0, 374.0);
     harness.assert_frame(2, 0.0, 0.0, 1200.0, 400.0);
-    assert_tiles(BIG_WORK, &visible_tiles(&harness));
+    assert_tiles(BIG_WORK, &tiles(&harness));
     harness.assert_synced();
     // Out of the nested stack (dissolving it) onto another window.
     stack_onto(&mut harness, 1, 2);
     assert_eq!(harness.shape(), "V[S[2 1] H[3 4]]");
-    assert_tiles(BIG_WORK, &visible_tiles(&harness));
+    assert_tiles(BIG_WORK, &tiles(&harness));
     harness.assert_synced();
 }
 
@@ -194,8 +199,8 @@ fn stacking_ends_the_maximize_of_the_dragged_window() {
     harness.assert_frame(1, 0.0, 0.0, 1200.0, 800.0);
     stack_onto(&mut harness, 1, 2);
     assert_eq!(harness.shape(), "V[S[2 1] 3]");
-    // The stack's tile, not the work area.
-    harness.assert_frame(1, 0.0, 0.0, 1200.0, 400.0);
+    // The stack's tile minus the tab-bar strip, not the work area.
+    harness.assert_frame(1, 0.0, 26.0, 1200.0, 374.0);
     harness.assert_synced();
 }
 
@@ -253,7 +258,8 @@ fn a_stack_is_one_target_named_by_its_visible_member() {
         harness.layout.drop_zone(1, 900.0, 400.0),
         Some(DropZone::Stack {
             target: 3,
-            tile: Rect::new(600.0, 0.0, 600.0, 800.0)
+            // The window area below the tab bar.
+            tile: Rect::new(600.0, 26.0, 600.0, 774.0)
         })
     );
     // A stack member's own stack is its own tile.

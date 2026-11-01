@@ -198,7 +198,8 @@ fn toggle_window_floating_on_stack_member() {
     assert!(harness.layout.windows()[1].floating);
     assert!(harness.layout.is_visible(1));
     assert!(harness.layout.is_visible(2));
-    harness.assert_frame(2, 0.0, 0.0, 1000.0, 500.0);
+    // Floated at the frame it had: below the tab bar.
+    harness.assert_frame(2, 0.0, 26.0, 1000.0, 474.0);
     harness.assert_frame(1, 0.0, 0.0, 1000.0, 500.0);
     harness.assert_synced();
 }
@@ -317,7 +318,8 @@ fn toggle_tiling_off_cascades_hidden_stack_members() {
     );
     assert!(harness.layout.is_visible(1));
     assert!(harness.layout.is_visible(2));
-    harness.assert_frame(2, 0.0, 0.0, 1000.0, 500.0);
+    // Floated at the frame it had: below the tab bar.
+    harness.assert_frame(2, 0.0, 26.0, 1000.0, 474.0);
     harness.assert_frame(1, 200.0, 100.0, 600.0, 300.0);
     harness.assert_synced();
 }
