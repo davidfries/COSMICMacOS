@@ -361,6 +361,54 @@ struct AxEntry {
 // The observer and elements are immutable after setup.
 unsafe impl Send for AxEntry {}
 
+impl AxEntry {
+    /// Stop the application's observer and free its callback context.
+    fn release(self) {
+        let AxEntry {
+            observer,
+            app,
+            context,
+        } = self;
+        // Invalidate the source first so a notification still queued on the
+        // run loop cannot reach `ax_callback` with the freed context.
+        observer.invalidate_run_loop_source();
+        drop(observer);
+        drop(app);
+        // SAFETY: the observer is gone, so the context is no longer referenced.
+        unsafe { drop(Box::from_raw(context)) };
+    }
+}
+
+/// Observed applications to release: no longer in the window list **and** the
+/// process is gone.  An app that is merely hidden or has no on-screen window
+/// keeps its observer.
+fn pids_to_prune(
+    observed: impl IntoIterator<Item = libc::pid_t>,
+    listed: &[libc::pid_t],
+    is_dead: impl Fn(libc::pid_t) -> bool,
+) -> Vec<libc::pid_t> {
+    let mut prune: Vec<libc::pid_t> = observed
+        .into_iter()
+        .filter(|pid| !listed.contains(pid) && is_dead(*pid))
+        .collect();
+    prune.sort_unstable();
+    prune
+}
+
+/// Whether `pid` names no process at all (`kill(pid, 0)` fails with `ESRCH`).
+/// `EPERM` means the process exists but belongs to someone else.
+fn process_is_dead(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        // 0 and negative values address process groups, not one process.
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
 /// Installs the SkyLight and AX event sources and forwards a unified event
 /// stream.
 ///
@@ -499,20 +547,31 @@ impl PlatformObserver {
         Ok(())
     }
 
-    /// Observe every application that currently owns an on-screen window.
+    /// Observe every application that currently owns an on-screen window,
+    /// and release the observers of applications that have exited.
+    ///
+    /// Only the owner pids are enumerated ([`window::list_window_pids`], no AX
+    /// enrichment): this runs periodically on the run loop that delivers the
+    /// AX callbacks, and per-window AX reads would let one hung application
+    /// stall it.  Only a newly seen pid costs AX calls, in `observe_app`.
+    ///
+    /// Returns the number of listed applications that are observed.
     pub fn refresh_apps(&mut self) -> Result<usize> {
         if !crate::ax::is_process_trusted() {
             return Err(crate::error::PlatformError::AccessibilityDenied);
         }
-        let windows = window::list_windows()?;
-        let mut pids: Vec<libc::pid_t> = windows.iter().map(|window| window.pid).collect();
-        pids.sort_unstable();
-        pids.dedup();
+        let pids = window::list_window_pids()?;
         let mut observed = 0;
-        for pid in pids {
+        for &pid in &pids {
             match self.observe_app(pid) {
                 Ok(()) => observed += 1,
                 Err(err) => log::debug!("cannot observe pid {pid}: {err}"),
+            }
+        }
+        for pid in pids_to_prune(self.apps.keys().copied(), &pids, process_is_dead) {
+            if let Some(entry) = self.apps.remove(&pid) {
+                log::debug!("pid {pid} exited; releasing its AX observer");
+                entry.release();
             }
         }
         Ok(observed)
@@ -532,13 +591,39 @@ impl Drop for PlatformObserver {
         if let Some(slot) = AX_HANDLER.get() {
             *slot.lock().expect("ax handler poisoned") = None;
         }
-        // Dropping AxEntry releases the AXObserver; reclaim the callback context
-        // afterwards so no callback can observe a dangling pointer.
+        // Release each AXObserver before reclaiming its callback context so no
+        // callback can observe a dangling pointer.
         for (_, entry) in self.apps.drain() {
-            drop(entry.observer);
-            drop(entry.app);
-            // SAFETY: observer is gone, so the context is no longer referenced.
-            unsafe { drop(Box::from_raw(entry.context)) };
+            entry.release();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_unlisted_dead_applications_are_pruned() {
+        let dead = [30, 40];
+        let prune = pids_to_prune([40, 10, 20, 30], &[10, 30], |pid| dead.contains(&pid));
+        // 30 is dead but still listed (a stale window record); 20 is alive
+        // with no on-screen window (hidden app).  Only 40 goes.
+        assert_eq!(prune, vec![40]);
+        assert!(pids_to_prune([], &[10], |_| true).is_empty());
+        assert!(pids_to_prune([10, 20], &[], |_| false).is_empty());
+    }
+
+    #[test]
+    fn a_reaped_child_is_dead_and_this_process_is_not() {
+        assert!(!process_is_dead(std::process::id() as libc::pid_t));
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id() as libc::pid_t;
+        child.wait().expect("wait for the child");
+        assert!(process_is_dead(pid), "a reaped child must be ESRCH");
+        assert!(!process_is_dead(0), "process groups are never pruned");
+        assert!(!process_is_dead(-1));
     }
 }

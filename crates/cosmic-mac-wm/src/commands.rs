@@ -125,6 +125,11 @@ impl CommandApplier {
                 // The journal must be on disk before the first frame is
                 // touched, no matter what the platform answers.
                 self.record_original(*wid);
+                // Mark the window in flight before the first AX call: the
+                // move's notifications start while `set_frame` is still
+                // reading the frame back, and a failed call can still have
+                // moved the window part of the way.
+                self.mark_programmed(*wid, *rect);
                 let outcome = self.backend.set_frame(*wid, *rect)?;
                 self.visible.insert(*wid);
                 // Record what the window actually reached.  Recording the
@@ -176,7 +181,11 @@ impl CommandApplier {
     }
 
     fn show(&mut self, wid: WindowId) -> PlatformResult<()> {
-        self.backend.unpark(wid)?;
+        if let Some(restored) = self.backend.unpark(wid)? {
+            // Unparking moves the window back from the corner; its
+            // notifications are ours, not a user drag.
+            self.mark_programmed(wid, restored);
+        }
         self.visible.insert(wid);
         Ok(())
     }
@@ -186,6 +195,8 @@ impl CommandApplier {
     /// Returns the clamp when the app refused this frame too, so the layout
     /// owner can learn from it.
     pub fn reapply_frame(&mut self, wid: WindowId, rect: Rect) -> Option<ClampNotice> {
+        // In flight before the first AX call, as in `apply_one`.
+        self.mark_programmed(wid, rect);
         match self.backend.set_frame(wid, rect) {
             Ok(outcome) => {
                 self.mark_programmed(wid, outcome.applied);
@@ -226,13 +237,27 @@ impl CommandApplier {
         );
     }
 
-    /// Whether a platform move notification is an echo of our own change.
+    /// Whether a platform move notification is an echo of our own change,
+    /// judged as if it had been captured now.
+    ///
+    /// Prefer [`CommandApplier::is_echo_at`] with the time the platform
+    /// callback fired; events queue while the daemon runs a long AX batch.
+    pub fn is_echo(&mut self, wid: WindowId, frame: Rect) -> bool {
+        self.is_echo_at(wid, frame, Instant::now())
+    }
+
+    /// Whether a platform move notification captured at `captured` is an echo
+    /// of our own change.
     ///
     /// A notification matching the programmed frame is always swallowed; the
     /// entry is kept because SLS/AX often deliver several notifications for one
-    /// move.  A different frame is swallowed for [`DEFAULT_DEBOUNCE`] so
-    /// intermediate updates during the move cannot make us fight ourselves.
-    pub fn is_echo(&mut self, wid: WindowId, frame: Rect) -> bool {
+    /// move.  A different frame is swallowed when it was *captured* less than
+    /// [`DEFAULT_DEBOUNCE`] after the frame was programmed, so intermediate
+    /// updates during the move cannot make us fight ourselves.  There is no
+    /// lower bound: a notification captured before we programmed the frame is
+    /// stale as well.  The processing time does not matter, so notifications
+    /// that sat in the queue during a long AX batch stay echoes.
+    pub fn is_echo_at(&mut self, wid: WindowId, frame: Rect, captured: Instant) -> bool {
         let Some(programmed) = self.programmed.get(&wid).copied() else {
             return false;
         };
@@ -243,7 +268,11 @@ impl CommandApplier {
         if programmed.rect.approx_eq(frame, 2.0) {
             return true;
         }
-        if programmed.at.elapsed() < self.debounce {
+        if programmed
+            .at
+            .checked_add(self.debounce)
+            .is_none_or(|deadline| captured < deadline)
+        {
             return true;
         }
         // A different frame after the debounce is a genuine user move; stop
@@ -344,6 +373,8 @@ mod tests {
         display: Rect,
         /// Simulated minimum size per window.
         min_sizes: HashMap<WindowId, Size>,
+        /// When set, `set_frame` fails (after the AX call would have started).
+        fail_set_frame: bool,
     }
 
     struct MockBackend {
@@ -360,6 +391,7 @@ mod tests {
                     work_area,
                     display: Rect::new(0.0, 0.0, 1920.0, 1080.0),
                     min_sizes: HashMap::new(),
+                    fail_set_frame: false,
                 }),
             }
         }
@@ -381,6 +413,9 @@ mod tests {
         fn set_frame(&self, wid: WindowId, rect: Rect) -> PlatformResult<AppliedFrame> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::SetFrame(wid, rect));
+            if state.fail_set_frame {
+                return Err("cannot read the frame back".into());
+            }
             let mut applied = rect;
             if let Some(min) = state.min_sizes.get(&wid) {
                 applied.width = applied.width.max(min.width);
@@ -606,6 +641,57 @@ mod tests {
         // Simulate the debounce having expired.
         applier.set_debounce(Duration::ZERO);
         assert!(!applier.is_echo(1, Rect::new(0.0, 0.0, 50.0, 50.0)));
+    }
+
+    #[test]
+    fn echoes_are_judged_by_capture_time_not_processing_time() {
+        let (mut applier, _backend, _dir) = applier(&[(1, Rect::new(0.0, 0.0, 100.0, 100.0))]);
+        let queued = Instant::now();
+        let rect = Rect::new(10.0, 10.0, 200.0, 200.0);
+        applier.apply(&[Command::SetFrame { wid: 1, rect }]);
+        let intermediate = Rect::new(0.0, 0.0, 50.0, 50.0);
+        applier.set_debounce(Duration::from_millis(500));
+
+        // Captured inside the debounce: an echo whenever it is processed.
+        assert!(applier.is_echo_at(1, intermediate, Instant::now()));
+        // Captured before the frame was programmed: stale, even with no
+        // debounce left at all.
+        applier.set_debounce(Duration::ZERO);
+        assert!(applier.is_echo_at(1, intermediate, queued));
+        // Captured after the debounce: a user move, even though it is
+        // processed inside it.
+        applier.set_debounce(Duration::from_millis(500));
+        let late = Instant::now() + Duration::from_millis(600);
+        assert!(!applier.is_echo_at(1, intermediate, late));
+        // The user move ended the suppression for this window.
+        assert!(!applier.is_echo_at(1, rect, Instant::now()));
+    }
+
+    #[test]
+    fn a_failed_set_frame_still_leaves_the_window_in_flight() {
+        let (mut applier, backend, _dir) = applier(&[(1, Rect::new(0.0, 0.0, 100.0, 100.0))]);
+        backend.state.lock().unwrap().fail_set_frame = true;
+        let rect = Rect::new(10.0, 10.0, 200.0, 200.0);
+        applier.apply(&[Command::SetFrame { wid: 1, rect }]);
+        // The window may have moved part of the way before the call failed;
+        // its notifications are still ours.
+        applier.set_debounce(Duration::ZERO);
+        assert!(applier.is_echo(1, rect));
+        assert!(applier.reapply_frame(1, rect).is_none());
+        assert!(applier.is_echo(1, rect));
+    }
+
+    #[test]
+    fn unparking_records_the_restored_frame_as_programmed() {
+        let original = Rect::new(10.0, 20.0, 300.0, 200.0);
+        let (mut applier, _backend, _dir) = applier(&[(1, original)]);
+        applier.apply(&[Command::Hide { wid: 1 }]);
+        applier.apply(&[Command::Show { wid: 1 }]);
+        applier.set_debounce(Duration::ZERO);
+        assert!(
+            applier.is_echo(1, original),
+            "the move back from the park corner is not a user drag"
+        );
     }
 
     #[test]

@@ -231,7 +231,14 @@ depends on the daemon being long-running.
   a snapped +126 as a maximum. Fix: promote a post-probe candidate only when it
   lies inside the probe-confirmed range or is seen twice; treat a grow shortfall
   as a max only when it exceeds half of `GROW_STEP` or repeats.
-- **R2. Echo suppression and the focus debounce are timed at processing, not
+- ~~R2. Echo suppression and the focus debounce are timed at processing, not
+  capture~~ **done**: `Message::Platform(event, Instant)` stamps capture time
+  in the platform callback; `is_echo_at`/`is_recent_focus_event_at` compare
+  against `programmed.at + debounce`; `SetFrame`/`reapply` mark the window in
+  flight *before* the first AX call; `show()` marks the unparked frame; startup
+  batches all inserts and applies one compacted command list (6 windows: 6
+  `set_frame` calls, 1 focus). Original description kept below for context.
+- R2 (original). Echo suppression and the focus debounce are timed at processing, not
   capture** (`commands.rs is_echo`, `core.rs recent_focus`; `PlatformEvent`
   has no timestamp). During a long AX batch (startup, workspace switch, probe)
   queued intermediate frames age past 150 ms and are treated as user drags:
@@ -239,7 +246,14 @@ depends on the daemon being long-running.
   `AppActivated` can steal focus. Fix: stamp `Instant` in the platform
   callback, compare capture time against `programmed.at + debounce`, mark the
   window in flight before the first AX set, and batch startup into one sync.
-- **R3. The event tap shares the main run loop with blocking AX IPC**
+- ~~R3. The event tap shares the main run loop with blocking AX IPC~~ **done**:
+  the tap runs on its own `event-tap` thread/run loop (creation errors still
+  fail startup); `refresh_apps` enumerates owner pids only
+  (`window::list_window_pids`, no AX) and prunes observers of exited
+  processes (run-loop source invalidated before the context is freed);
+  `AXUIElementSetMessagingTimeout` is set globally to 1 s at startup.
+  Original description kept below for context.
+- R3 (original). The event tap shares the main run loop with blocking AX IPC**
   (`main.rs refresh_apps` every 2 s → `enrich_with_ax`, ~7 AX calls per window;
   AX callbacks call `element.frame()`; no `AXUIElementSetMessagingTimeout`,
   default ~6 s). A beach-balling app freezes keyboard input system-wide and
@@ -323,6 +337,34 @@ disable-by-timeout re-enable and key-up swallowing; layout clamping cannot
 panic and tiles never overlap; stack active-index bookkeeping; SLS/AX
 double-`WindowCreated` dedup; IPC malformed-line handling and socket
 permissions; bounded `handle_clamp` recursion.
+
+## Milestone 2 status
+
+- **Spike A passed** (branch `worktree-agent-a8a384014eaa80bb2`, commit
+  `ad1ef56`, to be merged): libcosmic pinned at `95236a9` (master 2026-10-27)
+  with `default-features = false` + winit/tokio/multi-window/wgpu builds on
+  macOS **unpatched** (clean release build 77 s) and renders through wgpu on
+  Metal in the VM ("Apple Paravirtual device"). `crates/cosmic-mac-panel` is
+  a 32 px bar with a label and a clock; after `window::open_events` fires,
+  `window::run_with_handle` reaches the winit `NSWindow` via the
+  raw-window-handle `NSView` and sets borderless, `NSStatusWindowLevel`,
+  CanJoinAllSpaces|Stationary and the top-edge frame. Evidence:
+  `scratch/spike-a-panel.png`, `scratch/spike-a-panel-tick.png`.
+- Open: the process activates like a regular app (Dock icon, takes focus at
+  launch); libcosmic/iced expose neither winit's activation policy nor a
+  non-activating panel. Work in progress: `setActivationPolicy(Accessory)` in
+  the window callback, and an `NSPanel` class swap or a small iced patch for
+  `NonactivatingPanel`.
+- The WM must learn to ignore the panel window (R4: level filter for windows
+  created after startup) and reserve its height from the work area.
+
+## Newer macOS VMs
+
+The planned macOS 27.2 VM cannot be installed from UTM on this host: the
+Virtualization framework reports "software update required", which means the
+**host** (macOS 15.6) must run at least the guest's major version to restore
+that IPSW. Testing on 26/27 therefore needs a host upgrade or another Mac.
+`docs/SKYLIGHT.md` already notes the macOS 26 SLS message-ID differences.
 
 ## Manual setup (one-time, already done on this VM)
 

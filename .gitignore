@@ -5,3 +5,6 @@ Cargo.lock.orig
 scratch/
 *.png
 !docs/**/*.png
+
+# Claude Code agent worktrees
+.claude/worktrees/

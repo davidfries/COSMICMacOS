@@ -18,7 +18,7 @@
 //! (a frozen dimension) is reported once and then left alone: the daemon never
 //! loops on it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,6 +55,10 @@ pub struct Core {
     /// window, so a window is probed at most once per session.
     constraints: HashMap<WindowId, LearnedConstraints>,
     constraint_stats: ConstraintStats,
+    /// While `Some`, [`Core::apply`] collects commands here instead of
+    /// applying them.  [`Core::startup`] uses it to sync the whole initial
+    /// layout once instead of re-applying every tile per inserted window.
+    batch: Option<Vec<Command>>,
 }
 
 /// What [`Core::startup`] did.
@@ -89,6 +93,7 @@ impl Core {
             session: SessionStore::new(session_path),
             constraints: HashMap::new(),
             constraint_stats: ConstraintStats::default(),
+            batch: None,
         }
     }
 
@@ -125,6 +130,13 @@ impl Core {
     /// next to its predecessor builds a chain of halved tiles (`1/2`, `1/4`,
     /// `1/8`, ...), which is why a restart with eight windows used to park
     /// Finder and Notes in tiny corner tiles.
+    ///
+    /// The inserts are batched: applied one by one, every insert re-framed the
+    /// tile it split and focused/raised windows, so windows moved several
+    /// times, focus changed per insert, and the daemon stayed busy long
+    /// enough for queued notifications to look like user drags.  The
+    /// collected commands are compacted with [`compact_commands`] and applied
+    /// once at the end: one `set_frame` per window and a single focus.
     pub fn startup(&mut self, windows: Vec<ToplevelInfo>) -> StartupReport {
         let work_area = self.layout.work_area();
         let previous = self.session.load();
@@ -163,6 +175,7 @@ impl Core {
         let front = windows.first().map(|info| info.wid);
         let order: Vec<WindowId> = windows.iter().map(|info| info.wid).collect();
         let mut added = 0;
+        self.batch = Some(Vec::new());
         for info in windows.into_iter().rev() {
             if let Some(reference) = self.largest_tile() {
                 self.focus_window(reference);
@@ -175,6 +188,10 @@ impl Core {
         {
             self.focus_window(front);
         }
+        // Batching off first: the sync goes through the normal path so clamps
+        // are probed and re-tiled as usual.
+        let batched = self.batch.take().unwrap_or_default();
+        self.apply(compact_commands(batched));
         self.persist_session();
         StartupReport {
             added,
@@ -183,25 +200,37 @@ impl Core {
         }
     }
 
-    /// Feed one platform event.
+    /// Feed one platform event, judged as if it had been captured now.
     pub fn platform_event(&mut self, event: PlatformEvent) {
+        self.platform_event_at(event, Instant::now());
+    }
+
+    /// Feed one platform event captured at `captured` (when the platform
+    /// callback fired, before it was queued).
+    ///
+    /// Echo suppression and the focus debounce compare against the capture
+    /// time, so events that waited in the queue during a long AX batch are
+    /// still recognised as consequences of our own changes.
+    pub fn platform_event_at(&mut self, event: PlatformEvent, captured: Instant) {
         match event {
             PlatformEvent::WindowCreated { wid, pid } => self.window_created(wid, pid),
             PlatformEvent::WindowDestroyed { wid } => self.window_destroyed(wid),
             PlatformEvent::WindowMoved { wid, frame }
-            | PlatformEvent::WindowResized { wid, frame } => self.window_geometry(wid, frame),
+            | PlatformEvent::WindowResized { wid, frame } => {
+                self.window_geometry(wid, frame, captured)
+            }
             PlatformEvent::WindowTitleChanged { wid, title } => self.title_changed(wid, title),
             PlatformEvent::WindowOrdered { wid } => self.window_ordered(wid),
             PlatformEvent::FocusChanged { wid, pid } => {
                 if let Some(wid) = wid {
-                    self.external_focus(u64::from(wid));
+                    self.external_focus(u64::from(wid), captured);
                 } else if let Some(pid) = pid {
-                    self.app_activated(pid);
+                    self.app_activated(pid, captured);
                 }
             }
             PlatformEvent::AppActivated { pid } => {
                 if let Some(pid) = pid {
-                    self.app_activated(pid);
+                    self.app_activated(pid, captured);
                 }
             }
             PlatformEvent::WindowHidden { .. } | PlatformEvent::WindowShown { .. } => {}
@@ -246,10 +275,10 @@ impl Core {
         self.apply(commands);
     }
 
-    fn window_geometry(&mut self, wid: u32, frame: cosmic_mac_platform::Rect) {
+    fn window_geometry(&mut self, wid: u32, frame: cosmic_mac_platform::Rect, captured: Instant) {
         let wid = u64::from(wid);
         let frame = rect_from_platform(frame);
-        if self.applier.is_echo(wid, frame) {
+        if self.applier.is_echo_at(wid, frame, captured) {
             return;
         }
         let Some(state) = self
@@ -324,11 +353,11 @@ impl Core {
         }
     }
 
-    fn external_focus(&mut self, wid: WindowId) {
+    fn external_focus(&mut self, wid: WindowId, captured: Instant) {
         if self.layout.window_info(wid).is_none() {
             return;
         }
-        if self.is_recent_focus_event() {
+        if self.is_recent_focus_event_at(captured) {
             return;
         }
         log::debug!("external focus -> window {wid}");
@@ -336,11 +365,11 @@ impl Core {
         self.apply(commands);
     }
 
-    fn app_activated(&mut self, pid: i32) {
+    fn app_activated(&mut self, pid: i32, captured: Instant) {
         if pid == self.self_pid {
             return;
         }
-        if self.is_recent_focus_event() {
+        if self.is_recent_focus_event_at(captured) {
             return;
         }
         // `windows()` is front-to-back; the first managed window of the
@@ -490,16 +519,27 @@ impl Core {
     }
 
     fn apply(&mut self, commands: Vec<Command>) {
+        let focused = commands.iter().find_map(|command| match command {
+            Command::Focus { wid } => Some(*wid),
+            _ => None,
+        });
+        if let Some(wid) = focused {
+            self.recent_focus = Some((wid, Instant::now()));
+        }
+        if let Some(batch) = &mut self.batch {
+            batch.extend(commands);
+            return;
+        }
         if !commands.is_empty() {
             log::debug!("commands: {commands:?}");
         }
-        if let Some(wid) = commands.iter().find_map(|command| match command {
-            Command::Focus { wid } => Some(*wid),
-            _ => None,
-        }) {
+        let clamps = self.applier.apply(&commands);
+        if let Some(wid) = focused {
+            // The focus call can come after a long run of `set_frame` calls in
+            // the same batch; restart the debounce once it has actually been
+            // made so its activation burst is still covered.
             self.recent_focus = Some((wid, Instant::now()));
         }
-        let clamps = self.applier.apply(&commands);
         for clamp in clamps {
             self.handle_clamp(clamp, 0);
         }
@@ -696,15 +736,62 @@ impl Core {
         self.apply(commands);
     }
 
-    fn is_recent_focus_event(&self) -> bool {
-        self.recent_focus
-            .is_some_and(|(_, at)| at.elapsed() < self.focus_debounce)
+    /// Whether a focus/activation event captured at `captured` belongs to the
+    /// burst macOS emits after our own focus change.  As with the move echo,
+    /// there is no lower bound: an event captured before our focus change is
+    /// stale.
+    fn is_recent_focus_event_at(&self, captured: Instant) -> bool {
+        self.recent_focus.is_some_and(|(_, at)| {
+            at.checked_add(self.focus_debounce)
+                .is_none_or(|deadline| captured < deadline)
+        })
     }
 
     #[cfg(test)]
     fn set_debounce(&mut self, debounce: Duration) {
         self.focus_debounce = debounce;
     }
+}
+
+/// Collapse a batch of layout commands to the ones whose final effect matters.
+///
+/// - the **last** `SetFrame` per window, at the position of that last
+///   occurrence;
+/// - the **last** `Focus` only; every `Raise`/`Unfocus` is dropped except the
+///   last `Raise` of that finally focused window;
+/// - `Hide`, `Show`, `Close` and `ActivateWorkspace` in their original order;
+/// - the **last** `StackChanged` only.
+fn compact_commands(commands: Vec<Command>) -> Vec<Command> {
+    let final_focus = commands.iter().rev().find_map(|command| match command {
+        Command::Focus { wid } => Some(*wid),
+        _ => None,
+    });
+    let mut framed = HashSet::new();
+    let mut focus_kept = false;
+    let mut raise_kept = false;
+    let mut stack_kept = false;
+    let mut kept = Vec::with_capacity(commands.len());
+    // Walk backwards so "first seen" is the last occurrence.
+    for command in commands.into_iter().rev() {
+        let keep = match &command {
+            Command::SetFrame { wid, .. } => framed.insert(*wid),
+            Command::Focus { .. } => !std::mem::replace(&mut focus_kept, true),
+            Command::Raise { wid } => {
+                final_focus == Some(*wid) && !std::mem::replace(&mut raise_kept, true)
+            }
+            Command::Unfocus => false,
+            Command::StackChanged { .. } => !std::mem::replace(&mut stack_kept, true),
+            Command::Hide { .. }
+            | Command::Show { .. }
+            | Command::Close { .. }
+            | Command::ActivateWorkspace { .. } => true,
+        };
+        if keep {
+            kept.push(command);
+        }
+    }
+    kept.reverse();
+    kept
 }
 
 fn rect_from_platform(rect: cosmic_mac_platform::Rect) -> cosmic_mac_protocol::Rect {
@@ -912,7 +999,9 @@ mod tests {
         }
         fn window_info(&self, wid: WindowId) -> Option<ToplevelInfo> {
             self.frame(wid).map(|frame| {
-                ToplevelInfo::new(wid, "com.example.app", "title").with_initial_frame(frame)
+                ToplevelInfo::new(wid, "com.example.app", "title")
+                    .with_pid(test_pid(wid))
+                    .with_initial_frame(frame)
             })
         }
         fn windows(&self) -> Vec<ToplevelInfo> {
@@ -922,7 +1011,9 @@ mod tests {
                 .iter()
                 .filter_map(|wid| state.frames.get(wid).copied().map(|frame| (*wid, frame)))
                 .map(|(wid, frame)| {
-                    ToplevelInfo::new(wid, "com.example.app", "title").with_initial_frame(frame)
+                    ToplevelInfo::new(wid, "com.example.app", "title")
+                        .with_pid(test_pid(wid))
+                        .with_initial_frame(frame)
                 })
                 .collect()
         }
@@ -936,6 +1027,11 @@ mod tests {
         fn display_frame(&self, _: WindowId) -> Rect {
             Rect::new(0.0, 0.0, 1920.0, 1080.0)
         }
+    }
+
+    /// Every test window belongs to its own application.
+    fn test_pid(wid: WindowId) -> i32 {
+        1000 + wid as i32
     }
 
     fn core_with(
@@ -1016,13 +1112,274 @@ mod tests {
         let original = Rect::new(0.0, 0.0, 400.0, 300.0);
         let (mut core, backend, _dir) = core(&[(1, original)]);
         core.startup(backend.windows());
-        core.set_debounce(Duration::ZERO);
+        // The *move* debounce lives in the applier; the core's own debounce
+        // only covers focus events.
+        core.applier.set_debounce(Duration::ZERO);
         let layout_frame = core.layout().frame_of(1).unwrap();
-        core.platform_event(PlatformEvent::WindowMoved {
-            wid: 1,
-            frame: PlatformRect::new(10.0, 10.0, 50.0, 50.0),
-        });
+        let moved = Rect::new(10.0, 10.0, 50.0, 50.0);
+        backend.state.lock().unwrap().frames.insert(1, moved);
+        let marker = backend.calls().len();
+        core.platform_event_at(
+            PlatformEvent::WindowMoved {
+                wid: 1,
+                frame: PlatformRect::new(moved.x, moved.y, moved.width, moved.height),
+            },
+            Instant::now(),
+        );
+        let calls = backend.calls();
+        assert!(
+            calls[marker..].contains(&Call::SetFrame(1, layout_frame)),
+            "the window must be snapped back to its tile: {calls:?}"
+        );
         assert_eq!(backend.frame(1), Some(layout_frame));
+    }
+
+    #[test]
+    fn queued_move_captured_inside_the_debounce_is_an_echo() {
+        let original = Rect::new(0.0, 0.0, 400.0, 300.0);
+        let (mut core, backend, _dir) = core(&[(1, original)]);
+        // Captured while the startup batch was still being applied.
+        let queued = Instant::now();
+        core.startup(backend.windows());
+        core.applier.set_debounce(Duration::from_millis(500));
+        // Captured right after the frame was programmed; processed whenever.
+        let captured = Instant::now();
+        let intermediate = PlatformRect::new(10.0, 10.0, 50.0, 50.0);
+        let marker = backend.calls().len();
+
+        core.platform_event_at(
+            PlatformEvent::WindowMoved {
+                wid: 1,
+                frame: intermediate,
+            },
+            captured,
+        );
+        // Even once the debounce has expired by processing-time standards
+        // (zero), an event captured *before* the frame was programmed is
+        // stale, not a user drag.
+        core.applier.set_debounce(Duration::ZERO);
+        core.platform_event_at(
+            PlatformEvent::WindowMoved {
+                wid: 1,
+                frame: intermediate,
+            },
+            queued,
+        );
+
+        let calls = backend.calls();
+        assert!(
+            calls[marker..].is_empty(),
+            "a queued echo must not snap back or invalidate: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn move_captured_after_the_debounce_is_a_user_move() {
+        let original = Rect::new(0.0, 0.0, 400.0, 300.0);
+        let (mut core, backend, _dir) = core(&[(1, original)]);
+        core.startup(backend.windows());
+        core.applier.set_debounce(Duration::from_millis(500));
+        let layout_frame = core.layout().frame_of(1).unwrap();
+        let moved = Rect::new(10.0, 10.0, 50.0, 50.0);
+        backend.state.lock().unwrap().frames.insert(1, moved);
+        // Processed well inside the debounce, but captured after it: the
+        // capture time decides.
+        let captured = Instant::now() + Duration::from_millis(600);
+        let marker = backend.calls().len();
+
+        core.platform_event_at(
+            PlatformEvent::WindowMoved {
+                wid: 1,
+                frame: PlatformRect::new(moved.x, moved.y, moved.width, moved.height),
+            },
+            captured,
+        );
+
+        let calls = backend.calls();
+        assert!(
+            calls[marker..].contains(&Call::SetFrame(1, layout_frame)),
+            "a move captured after the debounce must snap back: {calls:?}"
+        );
+        assert!(
+            calls[marker..].contains(&Call::ForgetProbe(1)),
+            "a user resize must invalidate the probe cache: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn app_activation_is_judged_by_capture_time() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        let queued = Instant::now();
+        core.startup(backend.windows());
+        assert_eq!(core.layout().focused(), Some(1));
+        let activated = PlatformEvent::AppActivated {
+            pid: Some(test_pid(2)),
+        };
+
+        // Captured inside the focus debounce: part of our own focus burst.
+        core.platform_event_at(activated.clone(), Instant::now());
+        assert_eq!(core.layout().focused(), Some(1));
+
+        // Captured before our focus change: stale even once the debounce is
+        // over by processing-time standards.
+        core.set_debounce(Duration::ZERO);
+        core.platform_event_at(activated.clone(), queued);
+        assert_eq!(core.layout().focused(), Some(1));
+
+        // Captured after the debounce: the user activated the app.
+        core.set_debounce(Duration::from_millis(250));
+        core.platform_event_at(activated, Instant::now() + Duration::from_millis(300));
+        assert_eq!(core.layout().focused(), Some(2));
+    }
+
+    #[test]
+    fn startup_syncs_each_window_once_and_focuses_once() {
+        const N: usize = 6;
+        let frames: Vec<(WindowId, Rect)> = (1..=N as WindowId)
+            .map(|wid| (wid, Rect::new(0.0, 0.0, 400.0, 300.0)))
+            .collect();
+        let (mut core, backend, _dir) = core(&frames);
+
+        let report = core.startup(backend.windows());
+
+        assert_eq!(report.added, N);
+        let calls = backend.calls();
+        let set_frames = calls
+            .iter()
+            .filter(|call| matches!(call, Call::SetFrame(..)))
+            .count();
+        assert!(
+            set_frames <= N + 2,
+            "startup must not re-apply every tile per insert: {set_frames} set_frame calls"
+        );
+        for wid in 1..=N as WindowId {
+            assert!(
+                core.applier().is_visible(wid),
+                "window {wid} was not framed"
+            );
+            assert_eq!(backend.frame(wid), core.layout().frame_of(wid));
+        }
+        let focuses: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| matches!(call, Call::Focus(_)))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(focuses.len(), 1, "exactly one focus call: {calls:?}");
+        assert_eq!(calls[focuses[0]], Call::Focus(1));
+        let last_frame = calls
+            .iter()
+            .rposition(|call| matches!(call, Call::SetFrame(..)))
+            .expect("frames");
+        assert!(
+            focuses[0] > last_frame,
+            "the focus must come after every frame: {calls:?}"
+        );
+        assert_eq!(core.layout().focused(), Some(1));
+    }
+
+    #[test]
+    fn compact_keeps_the_last_frame_per_window_at_its_last_position() {
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let b = Rect::new(0.0, 0.0, 20.0, 20.0);
+        let c = Rect::new(0.0, 0.0, 30.0, 30.0);
+        let compacted = compact_commands(vec![
+            Command::SetFrame { wid: 1, rect: a },
+            Command::SetFrame { wid: 2, rect: b },
+            Command::Show { wid: 3 },
+            Command::SetFrame { wid: 1, rect: c },
+            Command::SetFrame { wid: 3, rect: a },
+        ]);
+        assert_eq!(
+            compacted,
+            vec![
+                Command::SetFrame { wid: 2, rect: b },
+                Command::Show { wid: 3 },
+                Command::SetFrame { wid: 1, rect: c },
+                Command::SetFrame { wid: 3, rect: a },
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_keeps_only_the_final_focus_and_its_raise() {
+        let compacted = compact_commands(vec![
+            Command::Focus { wid: 1 },
+            Command::Raise { wid: 1 },
+            Command::Raise { wid: 2 },
+            Command::Unfocus,
+            Command::Focus { wid: 2 },
+            Command::Raise { wid: 3 },
+            Command::Raise { wid: 2 },
+            Command::Focus { wid: 1 },
+            Command::Raise { wid: 2 },
+        ]);
+        // The final focus is window 1; its last raise is kept where it was.
+        assert_eq!(
+            compacted,
+            vec![Command::Raise { wid: 1 }, Command::Focus { wid: 1 }]
+        );
+
+        let compacted = compact_commands(vec![
+            Command::Raise { wid: 2 },
+            Command::Focus { wid: 1 },
+            Command::Raise { wid: 1 },
+            Command::Raise { wid: 2 },
+            Command::Focus { wid: 2 },
+            Command::Raise { wid: 3 },
+        ]);
+        assert_eq!(
+            compacted,
+            vec![Command::Raise { wid: 2 }, Command::Focus { wid: 2 }]
+        );
+    }
+
+    #[test]
+    fn compact_drops_every_raise_without_a_focus() {
+        let compacted = compact_commands(vec![
+            Command::Raise { wid: 1 },
+            Command::Unfocus,
+            Command::Raise { wid: 2 },
+        ]);
+        assert!(compacted.is_empty(), "{compacted:?}");
+        assert!(compact_commands(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn compact_keeps_visibility_and_workspace_commands_and_the_last_stack() {
+        let stack = StackInfo {
+            workspace: 1,
+            tabs: Vec::new(),
+            active: 0,
+            frame: Rect::new(0.0, 0.0, 10.0, 10.0),
+        };
+        let compacted = compact_commands(vec![
+            Command::ActivateWorkspace { index: 2 },
+            Command::Hide { wid: 3 },
+            Command::StackChanged { stack: None },
+            Command::Show { wid: 4 },
+            Command::Close { wid: 5 },
+            Command::StackChanged {
+                stack: Some(stack.clone()),
+            },
+            Command::Hide { wid: 4 },
+            Command::ActivateWorkspace { index: 1 },
+        ]);
+        assert_eq!(
+            compacted,
+            vec![
+                Command::ActivateWorkspace { index: 2 },
+                Command::Hide { wid: 3 },
+                Command::Show { wid: 4 },
+                Command::Close { wid: 5 },
+                Command::StackChanged { stack: Some(stack) },
+                Command::Hide { wid: 4 },
+                Command::ActivateWorkspace { index: 1 },
+            ]
+        );
     }
 
     #[test]

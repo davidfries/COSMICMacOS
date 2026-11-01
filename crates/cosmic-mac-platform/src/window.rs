@@ -544,17 +544,36 @@ fn cg_window_record(wid: u32, options: CGWindowListOption) -> Result<Option<Wind
     Ok(None)
 }
 
-fn cg_dict_to_window(dict: &CFDictionary<CFString, CFType>) -> WindowInfo {
+/// The cheap fields of one CGWindowList record: no LaunchServices or AX
+/// lookups.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CgWindowBasics {
+    wid: u32,
+    pid: libc::pid_t,
+    level: i32,
+    frame: Rect,
+}
+
+impl CgWindowBasics {
+    /// The [`list_windows`] filter: a real window of another process, at the
+    /// normal application level, with a non-empty frame.
+    fn is_listed(&self, own_pid: libc::pid_t) -> bool {
+        self.wid != 0 && self.pid != own_pid && self.level == 0 && self.frame.is_non_empty()
+    }
+}
+
+fn own_pid() -> libc::pid_t {
+    std::process::id() as libc::pid_t
+}
+
+fn cg_dict_basics(dict: &CFDictionary<CFString, CFType>) -> CgWindowBasics {
     // SAFETY: the kCGWindow* statics are immutable CFStrings owned by
     // CoreGraphics and valid for the process lifetime.
-    let (key_number, key_pid, key_layer, key_onscreen, key_name, key_owner, key_bounds) = unsafe {
+    let (key_number, key_pid, key_layer, key_bounds) = unsafe {
         (
             kCGWindowNumber,
             kCGWindowOwnerPID,
             kCGWindowLayer,
-            kCGWindowIsOnscreen,
-            kCGWindowName,
-            kCGWindowOwnerName,
             kCGWindowBounds,
         )
     };
@@ -573,21 +592,6 @@ fn cg_dict_to_window(dict: &CFDictionary<CFString, CFType>) -> WindowInfo {
         .and_then(|value| value.downcast::<CFNumber>().ok())
         .and_then(|value| value.as_i32())
         .unwrap_or(0);
-    let _is_onscreen = dict
-        .get(key_onscreen)
-        .and_then(|value| value.downcast::<CFBoolean>().ok())
-        .map(|value| value.as_bool())
-        .unwrap_or(true);
-    let title = dict
-        .get(key_name)
-        .and_then(|value| value.downcast::<CFString>().ok())
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty());
-    let app_name = dict
-        .get(key_owner)
-        .and_then(|value| value.downcast::<CFString>().ok())
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty());
 
     let mut frame = Rect::default();
     if let Some(bounds) = dict.get(key_bounds)
@@ -605,6 +609,41 @@ fn cg_dict_to_window(dict: &CFDictionary<CFString, CFType>) -> WindowInfo {
             frame = Rect::from_cg(cg_rect);
         }
     }
+
+    CgWindowBasics {
+        wid,
+        pid,
+        level,
+        frame,
+    }
+}
+
+fn cg_dict_to_window(dict: &CFDictionary<CFString, CFType>) -> WindowInfo {
+    // SAFETY: the kCGWindow* statics are immutable CFStrings owned by
+    // CoreGraphics and valid for the process lifetime.
+    let (key_onscreen, key_name, key_owner) =
+        unsafe { (kCGWindowIsOnscreen, kCGWindowName, kCGWindowOwnerName) };
+    let CgWindowBasics {
+        wid,
+        pid,
+        level,
+        frame,
+    } = cg_dict_basics(dict);
+    let _is_onscreen = dict
+        .get(key_onscreen)
+        .and_then(|value| value.downcast::<CFBoolean>().ok())
+        .map(|value| value.as_bool())
+        .unwrap_or(true);
+    let title = dict
+        .get(key_name)
+        .and_then(|value| value.downcast::<CFString>().ok())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let app_name = dict
+        .get(key_owner)
+        .and_then(|value| value.downcast::<CFString>().ok())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
 
     let (bundle_id, localized_name) = app_identity(pid);
 
@@ -626,11 +665,9 @@ fn cg_dict_to_window(dict: &CFDictionary<CFString, CFType>) -> WindowInfo {
     }
 }
 
-/// All on-screen windows at normal application level.
-///
-/// This works without Accessibility. Titles and roles will be `None` and
-/// `resizable` defaults to `true` unless the process is trusted.
-pub fn list_windows() -> Result<Vec<WindowInfo>> {
+/// Call `visit` for every on-screen CGWindowList record (desktop elements
+/// excluded), front to back.
+fn for_each_on_screen_record(mut visit: impl FnMut(&CFDictionary<CFString, CFType>)) -> Result<()> {
     let options =
         CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
     let Some(array) = CGWindowListCopyWindowInfo(options, 0) else {
@@ -641,7 +678,6 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
     };
     // SAFETY: array of CFDictionary.
     let array: &CFArray<CFType> = unsafe { array.cast_unchecked() };
-    let mut windows = Vec::with_capacity(array.len());
     for index in 0..array.len() {
         let Some(value) = array.get(index) else {
             continue;
@@ -651,21 +687,54 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
         };
         // SAFETY: string-keyed dictionaries.
         let dict: &CFDictionary<CFString, CFType> = unsafe { dict.cast_unchecked() };
-        let window = cg_dict_to_window(dict);
-        if window.wid == 0
-            || window.pid == std::process::id() as libc::pid_t
-            || window.level != 0
-            || !window.frame.is_non_empty()
-        {
-            continue;
-        }
-        windows.push(window);
+        visit(dict);
     }
+    Ok(())
+}
+
+/// All on-screen windows at normal application level.
+///
+/// This works without Accessibility. Titles and roles will be `None` and
+/// `resizable` defaults to `true` unless the process is trusted.
+pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    let own_pid = own_pid();
+    let mut windows = Vec::new();
+    for_each_on_screen_record(|dict| {
+        if cg_dict_basics(dict).is_listed(own_pid) {
+            windows.push(cg_dict_to_window(dict));
+        }
+    })?;
 
     if crate::ax::is_process_trusted() {
         enrich_with_ax(&mut windows);
     }
     Ok(windows)
+}
+
+/// Owner pids of the windows [`list_windows`] would return, sorted and
+/// deduplicated.
+///
+/// Same enumeration and filters, but **no** AX enrichment and no
+/// LaunchServices lookup: nothing here talks to the applications, so a hung
+/// app cannot stall the caller.  Used for the periodic observer refresh.
+pub fn list_window_pids() -> Result<Vec<libc::pid_t>> {
+    let mut windows = Vec::new();
+    for_each_on_screen_record(|dict| windows.push(cg_dict_basics(dict)))?;
+    Ok(listed_pids(windows, own_pid()))
+}
+
+fn listed_pids(
+    windows: impl IntoIterator<Item = CgWindowBasics>,
+    own_pid: libc::pid_t,
+) -> Vec<libc::pid_t> {
+    let mut pids: Vec<libc::pid_t> = windows
+        .into_iter()
+        .filter(|window| window.is_listed(own_pid))
+        .map(|window| window.pid)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 /// AX-enrich `windows` in place. Failures are logged and ignored so that the
@@ -1331,6 +1400,34 @@ impl ParkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listed_pids_apply_the_list_windows_filter_and_dedup() {
+        let window = |wid: u32, pid: libc::pid_t, level: i32, frame: Rect| CgWindowBasics {
+            wid,
+            pid,
+            level,
+            frame,
+        };
+        let frame = Rect::new(0.0, 0.0, 400.0, 300.0);
+        let own = 7;
+        let pids = listed_pids(
+            [
+                window(10, 300, 0, frame),
+                window(11, 200, 0, frame),
+                window(12, 300, 0, frame),
+                // Filtered: no window id, our own window, a non-zero level and
+                // an empty frame.
+                window(0, 400, 0, frame),
+                window(13, own, 0, frame),
+                window(14, 500, 25, frame),
+                window(15, 600, 0, Rect::new(0.0, 0.0, 0.0, 300.0)),
+            ],
+            own,
+        );
+        assert_eq!(pids, vec![200, 300]);
+        assert!(listed_pids([], own).is_empty());
+    }
 
     #[test]
     fn dimension_classification_distinguishes_applied_clamped_and_frozen() {

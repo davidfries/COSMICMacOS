@@ -3,6 +3,7 @@
 //! the single-threaded [`Core`].
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use cosmic_mac_platform::PlatformEvent;
 use cosmic_mac_protocol::{Action, Config, Rect, Request, Response};
@@ -13,8 +14,11 @@ use crate::core::Core;
 use crate::ipc;
 /// A message for the layout owner.
 pub enum Message {
-    /// A window/application/display event from the platform observers.
-    Platform(PlatformEvent),
+    /// A window/application/display event from the platform observers, with
+    /// the time the platform callback fired.  Echo suppression and the focus
+    /// debounce compare against that capture time, not the time the event is
+    /// processed, because events queue while the daemon runs long AX batches.
+    Platform(PlatformEvent, Instant),
     /// A bound key combination.
     Key(Action),
     /// The main display's work area changed.
@@ -81,7 +85,7 @@ pub async fn run(
 
     while let Some(message) = rx.recv().await {
         match message {
-            Message::Platform(event) => core.platform_event(event),
+            Message::Platform(event, captured) => core.platform_event_at(event, captured),
             Message::Key(action) => core.action(action),
             Message::WorkArea(rect) => core.set_work_area(rect),
             Message::Ipc(request, response) => {

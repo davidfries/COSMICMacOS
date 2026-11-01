@@ -3,11 +3,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use cosmic_mac_platform::{EventTap, PlatformObserver, display, tcc};
+use cosmic_mac_platform::eventtap::TapHandler;
+use cosmic_mac_platform::{EventTap, PlatformObserver, ax, display, tcc};
 use cosmic_mac_protocol::Config;
 use objc2_app_kit::NSWorkspace;
-use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
+use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
 use tokio::sync::mpsc;
 
 use cosmic_mac_wm::backend::PlatformBackend;
@@ -30,6 +33,13 @@ fn main() {
         std::process::exit(1);
     }
 
+    // A slow or beach-balling app now fails our AX calls after
+    // AX_MESSAGING_TIMEOUT_SECS (1 s) instead of stalling the daemon for the
+    // ~6 s system default on every call.
+    if let Err(error) = ax::set_global_messaging_timeout(ax::AX_MESSAGING_TIMEOUT_SECS) {
+        log::warn!("cannot set the AX messaging timeout: {error}; AX calls keep the ~6 s default");
+    }
+
     if display::screens_have_separate_spaces() == Some(true) {
         log::warn!(
             "'Displays have separate Spaces' is ON; corner parking can leak windows across \
@@ -45,7 +55,8 @@ fn main() {
     log::info!("{} keybindings armed", keymap.len());
 
     // The backend and the observers must be created on the main thread: NSScreen
-    // work areas and the AX/event-tap run loop live here.
+    // work areas and the AX observer run loop live here.  The event tap runs on
+    // its own thread (see `spawn_event_tap`).
     let backend = Arc::new(MacPlatform::new());
     let work_area = backend.main_work_area();
 
@@ -63,20 +74,21 @@ fn main() {
     }
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let observer = match start_observers(
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (observer, tap_thread) = match start_observers(
         tx.clone(),
         Arc::new(keymap),
         Arc::new(config.passthrough.clone()),
         backend.clone(),
+        shutdown.clone(),
     ) {
-        Ok(observer) => observer,
+        Ok(started) => started,
         Err(error) => {
             log::error!("cannot start platform observers: {error}");
             std::process::exit(1);
         }
     };
 
-    let shutdown = Arc::new(AtomicBool::new(false));
     let runtime_shutdown = shutdown.clone();
     let socket_path = paths::socket_path();
     let journal_path = paths::journal_path();
@@ -117,11 +129,14 @@ fn main() {
     log::info!("cosmic-mac-wm running");
     observer.run(shutdown);
     let _ = runtime_thread.join();
+    // The tap thread polls the same shutdown flag and releases the tap.
+    let _ = tap_thread.join();
     log::info!("cosmic-mac-wm exited");
 }
 
 /// Sets the shutdown flag when dropped, so the main thread stops pumping its
-/// run loop (and releases the event tap) however the runtime thread ends.
+/// run loop and the tap thread releases the event tap, however the runtime
+/// thread ends.
 struct ShutdownOnDrop(Arc<AtomicBool>);
 
 impl Drop for ShutdownOnDrop {
@@ -130,10 +145,9 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
-/// Observers plus the event tap, owned by the main thread's run loop.
+/// The AX/SkyLight observers, owned by the main thread's run loop.
 struct ObserverRuntime {
     observer: PlatformObserver,
-    _tap: EventTap,
 }
 
 impl ObserverRuntime {
@@ -141,6 +155,8 @@ impl ObserverRuntime {
         let mut ticks = 0u32;
         // The AX observer sources are attached to this run loop; pumping it in
         // short slices also lets us refresh the observed app set periodically.
+        // The refresh only enumerates window owner pids (no AX reads), so it
+        // cannot block on a hung application.
         while !shutdown.load(Ordering::SeqCst) {
             let mode = unsafe { kCFRunLoopDefaultMode };
             CFRunLoop::run_in_mode(mode, 0.25, false);
@@ -159,10 +175,14 @@ fn start_observers(
     keymap: Arc<KeyMap>,
     passthrough: Arc<Vec<String>>,
     backend: Arc<MacPlatform>,
-) -> Result<ObserverRuntime, String> {
+    shutdown: Arc<AtomicBool>,
+) -> Result<(ObserverRuntime, JoinHandle<()>), String> {
     let event_tx = tx.clone();
     let handler: cosmic_mac_platform::observers::EventHandler = Arc::new(move |event| {
-        let _ = event_tx.send(Message::Platform(event));
+        // Stamp the event when the platform callback fires, before it waits in
+        // the channel behind a long AX batch.
+        let captured = Instant::now();
+        let _ = event_tx.send(Message::Platform(event, captured));
     });
     let mut observer = PlatformObserver::new(handler);
     observer
@@ -172,37 +192,7 @@ fn start_observers(
         .refresh_apps()
         .map_err(|error| format!("AX observers: {error}"))?;
 
-    let tap_tx = tx.clone();
-    let tap_keymap = keymap.clone();
-    let tap_passthrough = passthrough.clone();
-    // The static swallow list is empty: the handler decides per event, which
-    // is what makes the per-application `passthrough` list possible.
-    let tap = EventTap::new(
-        Vec::new(),
-        Box::new(move |key| {
-            let Some(action) = tap_keymap.lookup(key.keycode, key.modifiers()).cloned() else {
-                return false;
-            };
-            if is_passthrough(&tap_passthrough) {
-                return false;
-            }
-            // Autorepeat only re-sends directional focus/move/resize; holding a
-            // one-shot chord (Super+Q) must not close window after window.
-            // Repeats that are not dispatched are still swallowed below, so
-            // the app never sees them either.
-            if keybindings::dispatches(&action, key.is_key_down, key.is_repeat) {
-                if tap_tx.send(Message::Key(action)).is_err() {
-                    // The daemon is gone: never swallow keys on its behalf.
-                    return false;
-                }
-            } else if tap_tx.is_closed() {
-                return false;
-            }
-            // Swallow both down and up so the app never sees a stuck key.
-            true
-        }),
-    )
-    .map_err(|error| format!("global event tap: {error}"))?;
+    let tap_thread = spawn_event_tap(tx.clone(), keymap, passthrough, shutdown)?;
 
     let display_tx = tx.clone();
     display::set_display_change_handler(Arc::new(move || {
@@ -212,9 +202,89 @@ fn start_observers(
     }))
     .map_err(|error| format!("display change handler: {error}"))?;
 
-    Ok(ObserverRuntime {
-        observer,
-        _tap: tap,
+    Ok((ObserverRuntime { observer }, tap_thread))
+}
+
+/// Run the global event tap on its own thread and run loop.
+///
+/// The main run loop also delivers the AX observer callbacks, and AX calls
+/// block until the target application answers.  While the tap shared that
+/// loop, one beach-balling app stalled keyboard input system-wide until macOS
+/// disabled the tap.  Creation errors are sent back so they still fail daemon
+/// startup.
+fn spawn_event_tap(
+    tx: mpsc::UnboundedSender<Message>,
+    keymap: Arc<KeyMap>,
+    passthrough: Arc<Vec<String>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, String> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let thread = std::thread::Builder::new()
+        .name("event-tap".into())
+        .spawn(move || {
+            // `EventTap::new` adds its source to the *current* run loop, which
+            // is this thread's.
+            let tap = match EventTap::new(Vec::new(), key_handler(tx, keymap, passthrough)) {
+                Ok(tap) => tap,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!("global event tap: {error}")));
+                    return;
+                }
+            };
+            let _ = ready_tx.send(Ok(()));
+            while !shutdown.load(Ordering::SeqCst) {
+                let mode = unsafe { kCFRunLoopDefaultMode };
+                if CFRunLoop::run_in_mode(mode, 0.5, false) == CFRunLoopRunResult::Finished {
+                    // No source left in the mode (not expected while the tap
+                    // lives); never spin.
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+            drop(tap);
+        })
+        .map_err(|error| format!("cannot spawn the event-tap thread: {error}"))?;
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(thread),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(error)
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err("the event-tap thread exited during setup".into())
+        }
+    }
+}
+
+/// The tap callback: dispatch bound chords to the daemon and swallow them.
+fn key_handler(
+    tap_tx: mpsc::UnboundedSender<Message>,
+    tap_keymap: Arc<KeyMap>,
+    tap_passthrough: Arc<Vec<String>>,
+) -> TapHandler {
+    // The static swallow list is empty: the handler decides per event, which
+    // is what makes the per-application `passthrough` list possible.
+    Box::new(move |key| {
+        let Some(action) = tap_keymap.lookup(key.keycode, key.modifiers()).cloned() else {
+            return false;
+        };
+        if is_passthrough(&tap_passthrough) {
+            return false;
+        }
+        // Autorepeat only re-sends directional focus/move/resize; holding a
+        // one-shot chord (Super+Q) must not close window after window.
+        // Repeats that are not dispatched are still swallowed below, so
+        // the app never sees them either.
+        if keybindings::dispatches(&action, key.is_key_down, key.is_repeat) {
+            if tap_tx.send(Message::Key(action)).is_err() {
+                // The daemon is gone: never swallow keys on its behalf.
+                return false;
+            }
+        } else if tap_tx.is_closed() {
+            return false;
+        }
+        // Swallow both down and up so the app never sees a stuck key.
+        true
     })
 }
 
@@ -228,6 +298,9 @@ fn is_passthrough(patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| app_matches(pattern, &app_id))
 }
 
+/// Called from the tap thread.  `NSWorkspace` is not main-thread-only in
+/// objc2-app-kit (no `MainThreadMarker`); its `frontmostApplication` is
+/// refreshed by the main run loop, which the daemon keeps pumping.
 fn frontmost_bundle_id() -> Option<String> {
     let workspace = NSWorkspace::sharedWorkspace();
     let app = workspace.frontmostApplication()?;

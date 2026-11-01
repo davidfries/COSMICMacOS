@@ -33,6 +33,13 @@ pub const AX_VALUE_CG_POINT: u32 = 1;
 /// `kAXValueCGSizeType`.
 pub const AX_VALUE_CG_SIZE: u32 = 2;
 
+/// Messaging timeout the daemon sets for every AX call, in seconds.
+///
+/// The system default is about 6 s per call, so a beach-balling app used to
+/// stall the daemon for 6 s on every attribute it read.  With this timeout a
+/// slow app fails our AX calls after 1 s instead.
+pub const AX_MESSAGING_TIMEOUT_SECS: f32 = 1.0;
+
 // Attribute names used throughout the crate. Creating CFStrings for these on
 // every call is cheap and avoids depending on exported symbols that differ
 // between SDK versions.
@@ -90,6 +97,7 @@ unsafe extern "C" {
         settable: *mut u8,
     ) -> AxError;
     fn AXUIElementPerformAction(element: AxElementRef, action: *const c_void) -> AxError;
+    fn AXUIElementSetMessagingTimeout(element: AxElementRef, timeout: f32) -> AxError;
 
     fn AXValueCreate(value_type: u32, value: *const c_void) -> *const c_void;
     fn AXValueGetValue(value: *const c_void, value_type: u32, out: *mut c_void) -> bool;
@@ -461,6 +469,20 @@ impl Drop for AxElement {
     }
 }
 
+/// Set the default timeout for every AX call this process makes.
+///
+/// Apple documents that setting the messaging timeout on the system-wide
+/// element changes the global default for all elements.  A slow or hung
+/// application then fails our AX calls after `seconds` (with
+/// `kAXErrorCannotComplete`) instead of stalling the caller for the system
+/// default of about 6 s per call.  See [`AX_MESSAGING_TIMEOUT_SECS`].
+pub fn set_global_messaging_timeout(seconds: f32) -> Result<()> {
+    let system = AxElement::system_wide()?;
+    // SAFETY: valid system-wide element.
+    let err = unsafe { AXUIElementSetMessagingTimeout(system.as_ptr(), seconds) };
+    ax_ok("AXUIElementSetMessagingTimeout", err)
+}
+
 /// Whether this process is trusted for Accessibility.
 pub fn is_process_trusted() -> bool {
     // SAFETY: no arguments.
@@ -572,6 +594,23 @@ impl AxObserver {
             objc2_core_foundation::kCFRunLoopCommonModes
         });
         Ok(())
+    }
+
+    /// Stop delivering callbacks: invalidate the observer's run-loop source,
+    /// which removes it from every run loop it was added to.
+    ///
+    /// Call this before freeing a `refcon` passed to
+    /// [`AxObserver::add_notification`], so a message still queued on the run
+    /// loop cannot reach the callback with a dangling pointer.
+    pub fn invalidate_run_loop_source(&self) {
+        // SAFETY: valid observer.
+        let source = unsafe { AXObserverGetRunLoopSource(self.ptr) };
+        if source.is_null() {
+            return;
+        }
+        // SAFETY: the source is owned by the observer, which is alive.
+        let source = unsafe { &*(source as *const objc2_core_foundation::CFRunLoopSource) };
+        source.invalidate();
     }
 }
 
