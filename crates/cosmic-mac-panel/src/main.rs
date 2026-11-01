@@ -4,9 +4,10 @@
 //! A minimal libcosmic application proving that libcosmic (iced + winit +
 //! wgpu/Metal) builds and renders on macOS: one borderless window, the
 //! height of the COSMIC panel, with a label on the left and an `HH:MM` clock
-//! on the right, in cosmic's dark theme. Once the window is open its
-//! `NSWindow` is turned into a status-level, all-Spaces panel at the top of
-//! the main screen (see [`appkit`]). Real panel features (applets, dock,
+//! on the right, in cosmic's dark theme. Once the window is open the process
+//! becomes an accessory app (no Dock icon) and its `NSWindow` a
+//! non-activating, status-level, all-Spaces bar at the top of the main
+//! screen (see [`appkit`]). Real panel features (applets, dock,
 //! cosmic-panel-config) are milestone 2.
 
 mod appkit;
@@ -51,6 +52,9 @@ pub enum Message {
     WindowOpened(window::Id),
     /// Result of [`appkit::configure_panel_window`].
     WindowConfigured(Result<appkit::PanelWindow, String>),
+    /// The panel was clicked; logged to verify that clicks reach iced without
+    /// activating the app.
+    Clicked,
 }
 
 pub struct Panel {
@@ -76,6 +80,8 @@ impl cosmic::Application for Panel {
     fn init(mut core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
         // Render `view()` directly: no header bar, window border or rounded
         // corners from libcosmic's application template (applets do the same).
+        // `sharp_corners` only affects that template; the bar's own
+        // background sets a zero radius in `view()`.
         core.window.use_template = false;
         core.window.show_headerbar = false;
         core.window.sharp_corners = true;
@@ -108,7 +114,8 @@ impl cosmic::Application for Panel {
             Message::WindowConfigured(Ok(info)) => {
                 log::info!(
                     "panel NSWindow configured: windowNumber={} frame=({:.0},{:.0} {:.0}x{:.0}) \
-                     level={} styleMask={:#x} collectionBehavior={:#x}",
+                     level={} styleMask={:#x} collectionBehavior={:#x} activationPolicy={} \
+                     preventsActivation={}",
                     info.window_number,
                     info.frame.0,
                     info.frame.1,
@@ -117,10 +124,21 @@ impl cosmic::Application for Panel {
                     info.level,
                     info.style_mask,
                     info.collection_behavior,
+                    info.activation_policy,
+                    info.prevents_activation,
                 );
+                if !info.prevents_activation {
+                    log::warn!(
+                        "AppKit lacks _setPreventsActivation:; clicks on the panel will \
+                         activate it"
+                    );
+                }
             }
             Message::WindowConfigured(Err(err)) => {
                 log::error!("cannot configure the panel NSWindow: {err}");
+            }
+            Message::Clicked => {
+                log::info!("panel clicked ({})", appkit::activation_state());
             }
         }
         Task::none()
@@ -137,11 +155,18 @@ impl cosmic::Application for Panel {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        widget::container(content)
-            .class(cosmic::theme::Container::Background)
+        // `Container::Background` with square corners: the stock style rounds
+        // them with `radius_s`, which shows the wallpaper at the bar's ends.
+        let bar = widget::container(content)
+            .class(cosmic::theme::Container::custom(|theme| {
+                let mut style = cosmic::theme::Container::background(theme.cosmic(), false);
+                style.border.radius = 0.0.into();
+                style
+            }))
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+
+        widget::mouse_area(bar).on_press(Message::Clicked).into()
     }
 }
 
