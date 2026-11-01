@@ -766,13 +766,19 @@ impl Layout {
             self.workspaces[index].tiling_enabled = true;
             self.workspaces[index].maximized = None;
             let saved_focus = self.workspaces[index].focus;
-            for floating in floating {
-                self.insert_tiled(
-                    index,
-                    floating.wid,
-                    Some((floating.frame.width, floating.frame.height)),
-                );
+            // Insert next to the largest tile (as the daemon's startup does) rather than next
+            // to the focus, which would build a 1/2, 1/4, 1/8 ... chain.  Largest-tile
+            // insertion scrambles the order, so the windows are then dealt back onto the
+            // leaves in their previous order.
+            let order: Vec<WindowId> = floating.iter().map(|floating| floating.wid).collect();
+            for wid in &order {
+                let reference = self.largest_tile(index);
+                let orientation = self.insertion_orientation(index, reference, None);
+                self.workspaces[index]
+                    .tree
+                    .insert_window(*wid, reference, orientation);
             }
+            self.workspaces[index].tree.relabel_windows(&order);
             if let Some(focus) = saved_focus
                 && self.workspaces[index].tree.node_for_window(focus).is_some()
             {
@@ -852,6 +858,19 @@ impl Layout {
         };
         let Some(sibling) = adjacent_sibling_any(&workspace.tree, node) else {
             return;
+        };
+        // A group neighbour: stack with its nearest window (or stack), the group's first leaf
+        // when it follows the focused window and its last leaf when it precedes it.  Without
+        // this, Super+S did nothing whenever the focused window sat beside a group.
+        let sibling = if workspace.tree.group(sibling).is_some() {
+            let follows = workspace.tree.parent(node).and_then(|parent| {
+                let children = &workspace.tree.group(parent)?.children;
+                let at = |id| children.iter().position(|child| *child == id);
+                Some(at(sibling)? > at(node)?)
+            });
+            workspace.tree.edge_leaf(sibling, follows.unwrap_or(true))
+        } else {
+            sibling
         };
         // Detaching the focused window can lift the sibling into the parent's node id, so
         // identify the sibling by content and re-resolve it afterwards.
@@ -1172,6 +1191,31 @@ impl Layout {
             .visible_windows()
             .first()
             .and_then(|wid| workspace.tree.node_for_window(*wid))
+    }
+
+    /// The node of the largest visible tiled frame, for balanced bulk insertion.  Ties (within
+    /// half a square pixel) resolve to the last window in tree order, like the daemon's
+    /// startup: the most recently inserted (usually focused) window then ends up paired with
+    /// a window rather than beside a group, which `ToggleStacking` needs.
+    fn largest_tile(&self, index: usize) -> Option<NodeId> {
+        let workspace = &self.workspaces[index];
+        let geometry = geometry::compute(
+            &workspace.tree,
+            self.work_area,
+            self.config.gaps,
+            &self.infos,
+        );
+        let mut best: Option<(WindowId, f64)> = None;
+        for wid in workspace.tree.visible_windows() {
+            let Some(frame) = geometry.frames.get(&wid) else {
+                continue;
+            };
+            let area = frame.area();
+            if best.is_none_or(|(_, best_area)| area >= best_area - 0.5) {
+                best = Some((wid, area));
+            }
+        }
+        best.and_then(|(wid, _)| workspace.tree.node_for_window(wid))
     }
 
     fn insertion_orientation(

@@ -71,6 +71,8 @@ pub(crate) enum MoveOutcome {
     Swapped,
     /// The window joined the stack it was moved towards.
     JoinedStack,
+    /// The node left its group and became a sibling of that group in an ancestor.
+    LeftGroup,
     /// Nothing was in the requested direction.
     NoOp,
 }
@@ -242,6 +244,54 @@ impl Tree {
                     out.push(wid);
                 }
             }
+        }
+    }
+
+    /// Deal `order` onto the window leaves in tree order, keeping the tree's shape.
+    ///
+    /// Only applies when every leaf is a plain window and `order` holds exactly as many windows
+    /// as the tree; otherwise nothing changes and false is returned.
+    pub fn relabel_windows(&mut self, order: &[WindowId]) -> bool {
+        let Some(root) = self.root else {
+            return order.is_empty();
+        };
+        let mut leaves = Vec::new();
+        self.collect_leaves(root, &mut leaves);
+        if leaves.len() != order.len() || leaves.iter().any(|leaf| !self.is_window(*leaf)) {
+            return false;
+        }
+        for (leaf, wid) in leaves.into_iter().zip(order) {
+            self.replace_kind(leaf, NodeKind::Window(*wid));
+        }
+        true
+    }
+
+    /// The first (or last) leaf (window or stack) under `id` in tree order; `id` itself when
+    /// it is a leaf.
+    pub fn edge_leaf(&self, id: NodeId, first: bool) -> NodeId {
+        let mut current = id;
+        while let NodeKind::Group(group) = self.kind(current) {
+            let next = if first {
+                group.children.first()
+            } else {
+                group.children.last()
+            };
+            match next {
+                Some(child) => current = *child,
+                None => break,
+            }
+        }
+        current
+    }
+
+    fn collect_leaves(&self, id: NodeId, out: &mut Vec<NodeId>) {
+        match self.kind(id) {
+            NodeKind::Group(group) => {
+                for child in &group.children {
+                    self.collect_leaves(*child, out);
+                }
+            }
+            NodeKind::Window(_) | NodeKind::Stack(_) => out.push(id),
         }
     }
 
@@ -432,9 +482,19 @@ impl Tree {
 
     /// Move a node one slot towards `direction`.
     ///
-    /// A plain window moving towards a stack joins that stack.  Everything else swaps places
-    /// with the adjacent sibling (weights move with the children, so the moved window takes the
-    /// neighbour's exact frame).
+    /// Within its own group (the parent splits along the direction's axis and has a sibling on
+    /// that side) a plain window moving towards a stack joins that stack, and everything else
+    /// swaps places with the adjacent sibling (weights move with the children, so the moved
+    /// window takes the neighbour's exact frame).
+    ///
+    /// When the node's own group cannot move it (wrong axis, or the node already sits at that
+    /// edge of the group), the node leaves its group, as in i3 and cosmic-comp's
+    /// `move_current_node`: the nearest ancestor that splits along the axis receives it as a
+    /// new child, directly next to the branch holding the node on the `direction` side (even
+    /// when that branch sits at the ancestor's edge).  A group left with one child collapses
+    /// into it.  Nothing happens when the node is a direct child of an axis-aligned group at
+    /// that group's edge with no axis-aligned ancestor above, or when no group along the way
+    /// splits along the axis (the root is never wrapped in a new split).
     pub fn move_node(&mut self, node: NodeId, direction: Direction) -> MoveOutcome {
         let mut current = node;
         while let Some(parent) = self.parent(current) {
@@ -449,6 +509,10 @@ impl Tree {
             };
 
             if orientation.handles(direction) {
+                if current != node {
+                    self.move_out_of_group(node, parent, current, direction);
+                    return MoveOutcome::LeftGroup;
+                }
                 let target = if direction.is_forward() {
                     index.checked_add(1).filter(|next| *next < len)
                 } else {
@@ -485,6 +549,44 @@ impl Tree {
             current = parent;
         }
         MoveOutcome::NoOp
+    }
+
+    /// Detach `node` from its parent group and insert it into `ancestor` next to `branch` (the
+    /// child of `ancestor` that holds `node`), on the `direction` side.
+    ///
+    /// The node gets the average weight of its new siblings, so it takes an equal share of the
+    /// ancestor's extent and the others shrink proportionally.
+    fn move_out_of_group(
+        &mut self,
+        node: NodeId,
+        ancestor: NodeId,
+        branch: NodeId,
+        direction: Direction,
+    ) {
+        let old_parent = self.parent(node).expect("node has a parent");
+        let old_index = self.index_in_parent(node).expect("node in parent");
+        let old_group = self.group_mut(old_parent).expect("parent group");
+        old_group.children.remove(old_index);
+        old_group.sizes.remove(old_index);
+
+        let group = self.group_mut(ancestor).expect("ancestor group");
+        let branch_index = group
+            .children
+            .iter()
+            .position(|child| *child == branch)
+            .expect("branch in ancestor");
+        let weight = group.sizes.iter().sum::<f64>() / group.sizes.len() as f64;
+        let index = if direction.is_forward() {
+            branch_index + 1
+        } else {
+            branch_index
+        };
+        group.children.insert(index, node);
+        group.sizes.insert(index, weight);
+        self.get_mut(node).parent = Some(ancestor);
+        // The old group may be down to one child; lift it.  `node` now sits in a group of at
+        // least two children, so its own id survives normalisation.
+        self.normalize();
     }
 
     /// Resize the focused node along its group's axis.

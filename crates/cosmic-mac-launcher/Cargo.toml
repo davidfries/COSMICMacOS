@@ -1,0 +1,46 @@
+[package]
+name = "cosmic-mac-launcher"
+description = "cosmicMac launcher: COSMIC-style search overlay (apps, calculator, web search, WM windows)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cosmic-mac-launcher"
+path = "src/main.rs"
+
+[dependencies]
+log.workspace = true
+env_logger.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+# Reads `Contents/Info.plist` of app bundles (XML and binary). MIT.
+plist = "1"
+
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSImage",
+    "NSImageRep",
+    "NSPasteboard",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSView",
+    "NSWindow",
+    "NSWorkspace",
+    "objc2-core-foundation",
+] }
+
+# IPC payloads and the Unix-socket client of the window manager.
+cosmic-mac-protocol = { path = "../cosmic-mac-protocol" }
+cosmic-mac-ctl = { path = "../cosmic-mac-ctl" }
+
+# Pinned rev and feature set live in the workspace manifest.
+libcosmic.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

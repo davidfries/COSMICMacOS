@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cosmic_mac_layout::Layout;
-use cosmic_mac_protocol::{Action, Command, Config, Rect, Size, StackInfo, ToplevelInfo, WindowId};
+use cosmic_mac_protocol::{
+    Action, Command, Config, Rect, Size, StackInfo, ToplevelInfo, TreeNode, WindowId,
+};
 
 pub const WORK: Rect = Rect::new(0.0, 0.0, 1000.0, 500.0);
 pub const TALL_WORK: Rect = Rect::new(0.0, 0.0, 500.0, 1000.0);
@@ -211,6 +213,47 @@ impl Harness {
             self.layout.active_stack(),
             "platform stack diverged from layout"
         );
+    }
+}
+
+impl Harness {
+    /// Compact rendering of the active tiling tree: `H[1 V[2 3]]` for window 1 beside a
+    /// vertical group of 2 over 3 (`H` = side by side, `V` = stacked vertically), `S[1 2]` for
+    /// a stack, and an empty string for an empty tree.
+    pub fn shape(&self) -> String {
+        fn render(node: &TreeNode, out: &mut String) {
+            match node {
+                TreeNode::Group {
+                    orientation,
+                    children,
+                    ..
+                } => {
+                    out.push(if orientation.is_horizontal() {
+                        'H'
+                    } else {
+                        'V'
+                    });
+                    out.push('[');
+                    for (index, child) in children.iter().enumerate() {
+                        if index > 0 {
+                            out.push(' ');
+                        }
+                        render(child, out);
+                    }
+                    out.push(']');
+                }
+                TreeNode::Window { wid, .. } => out.push_str(&wid.to_string()),
+                TreeNode::Stack { tabs, .. } => {
+                    let wids: Vec<String> = tabs.iter().map(|tab| tab.wid.to_string()).collect();
+                    out.push_str(&format!("S[{}]", wids.join(" ")));
+                }
+            }
+        }
+        let mut out = String::new();
+        if let Some(tree) = self.layout.tree_snapshot() {
+            render(&tree, &mut out);
+        }
+        out
     }
 }
 

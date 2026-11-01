@@ -70,15 +70,51 @@ pub enum PlatformEvent {
         /// New title (requires Accessibility).
         title: Option<String>,
     },
-    /// A window was hidden or minimized.
+    /// A window was hidden, perhaps minimized.
+    ///
+    /// Comes from the SkyLight window-hidden notification, whose exact
+    /// semantics are unverified (it may also fire when a Space change orders
+    /// windows out).  Consumers should re-read the window's state instead of
+    /// assuming it was minimized.
     WindowHidden {
         /// Window ID.
         wid: u32,
     },
-    /// A window was shown or deminimized.
+    /// A window was shown, perhaps deminimized.
+    ///
+    /// From the SkyLight window-unhidden notification; the same caveat as
+    /// [`PlatformEvent::WindowHidden`] applies.
     WindowShown {
         /// Window ID.
         wid: u32,
+    },
+    /// A window was minimized (`AXWindowMiniaturized`).
+    ///
+    /// Authoritative, unlike [`PlatformEvent::WindowHidden`], but early: the
+    /// notification fires when the minimize animation starts, and the
+    /// window's `AXMinimized` attribute keeps reading false for about half a
+    /// second after it.
+    WindowMinimized {
+        /// Window ID.
+        wid: u32,
+    },
+    /// A minimized window was restored (`AXWindowDeminiaturized`).  The same
+    /// caveat as [`PlatformEvent::WindowMinimized`] applies to
+    /// `AXMinimized`.
+    WindowDeminimized {
+        /// Window ID.
+        wid: u32,
+    },
+    /// An application was hidden (Cmd+H, `AXApplicationHidden`): all of its
+    /// windows are off screen.
+    AppHidden {
+        /// The hidden application's PID.
+        pid: libc::pid_t,
+    },
+    /// A hidden application was shown again (`AXApplicationShown`).
+    AppShown {
+        /// The application's PID.
+        pid: libc::pid_t,
     },
     /// Focus moved.
     FocusChanged {
@@ -131,6 +167,37 @@ fn ax_handler() -> Option<EventHandler> {
         .and_then(|slot| slot.clone())
 }
 
+/// Which geometry notification to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeometryKind {
+    Moved,
+    Resized,
+}
+
+/// Build a move/resize event from a bounds read.
+///
+/// A failed read (typically a window that is closing) yields no event: a
+/// fabricated `Rect::default()` would look like a user move to the origin and
+/// provoke a snap-back attempt on a window that is going away.
+fn geometry_event(wid: u32, frame: Option<Rect>, kind: GeometryKind) -> Option<PlatformEvent> {
+    let Some(frame) = frame else {
+        log::debug!("window {wid}: bounds unreadable; dropping {kind:?} event");
+        return None;
+    };
+    Some(match kind {
+        GeometryKind::Moved => PlatformEvent::WindowMoved { wid, frame },
+        GeometryKind::Resized => PlatformEvent::WindowResized { wid, frame },
+    })
+}
+
+fn sls_bounds(wid: u32) -> Option<Rect> {
+    skylight::window_bounds(wid).ok().map(Rect::from_cg)
+}
+
+fn ax_frame(element: &AxElement) -> Option<Rect> {
+    element.frame().ok().flatten()
+}
+
 unsafe extern "C" fn sls_callback(
     event: u32,
     data: *mut c_void,
@@ -163,18 +230,10 @@ unsafe extern "C" fn sls_callback(
         sls_events::WINDOW_CLOSED => {
             read_u32(bytes, 0).map(|wid| PlatformEvent::WindowDestroyed { wid })
         }
-        sls_events::WINDOW_MOVED => read_u32(bytes, 0).map(|wid| {
-            let frame = skylight::window_bounds(wid)
-                .map(Rect::from_cg)
-                .unwrap_or_default();
-            PlatformEvent::WindowMoved { wid, frame }
-        }),
-        sls_events::WINDOW_RESIZED => read_u32(bytes, 0).map(|wid| {
-            let frame = skylight::window_bounds(wid)
-                .map(Rect::from_cg)
-                .unwrap_or_default();
-            PlatformEvent::WindowResized { wid, frame }
-        }),
+        sls_events::WINDOW_MOVED => read_u32(bytes, 0)
+            .and_then(|wid| geometry_event(wid, sls_bounds(wid), GeometryKind::Moved)),
+        sls_events::WINDOW_RESIZED => read_u32(bytes, 0)
+            .and_then(|wid| geometry_event(wid, sls_bounds(wid), GeometryKind::Resized)),
         sls_events::WINDOW_REORDERED => {
             read_u32(bytes, 0).map(|wid| PlatformEvent::WindowOrdered { wid })
         }
@@ -255,6 +314,25 @@ const WINDOW_NOTIFICATIONS: &[&str] = &[
     "AXUIElementDestroyed",
 ];
 
+/// Map an AX notification that carries no data beyond the element's window
+/// id and the observed application's pid (minimize, destroy, app activation
+/// and hiding).
+///
+/// Notifications that need further element reads (creation, geometry, title,
+/// focus) are decoded in [`ax_callback`]; unknown names yield `None`.  A
+/// window notification whose element has no window id yields `None` too.
+fn ax_state_event(name: &str, wid: Option<u32>, pid: libc::pid_t) -> Option<PlatformEvent> {
+    match name {
+        "AXWindowMiniaturized" => wid.map(|wid| PlatformEvent::WindowMinimized { wid }),
+        "AXWindowDeminiaturized" => wid.map(|wid| PlatformEvent::WindowDeminimized { wid }),
+        "AXUIElementDestroyed" => wid.map(|wid| PlatformEvent::WindowDestroyed { wid }),
+        "AXApplicationActivated" => Some(PlatformEvent::AppActivated { pid: Some(pid) }),
+        "AXApplicationHidden" => Some(PlatformEvent::AppHidden { pid }),
+        "AXApplicationShown" => Some(PlatformEvent::AppShown { pid }),
+        _ => None,
+    }
+}
+
 unsafe extern "C" fn ax_callback(
     _observer: AxObserverRef,
     element: crate::ax::AxElementRef,
@@ -302,14 +380,12 @@ unsafe extern "C" fn ax_callback(
                 None
             }
         }
-        "AXWindowMoved" => wid.map(|wid| PlatformEvent::WindowMoved {
-            wid,
-            frame: element.frame().ok().flatten().unwrap_or_default(),
-        }),
-        "AXWindowResized" => wid.map(|wid| PlatformEvent::WindowResized {
-            wid,
-            frame: element.frame().ok().flatten().unwrap_or_default(),
-        }),
+        "AXWindowMoved" => {
+            wid.and_then(|wid| geometry_event(wid, ax_frame(&element), GeometryKind::Moved))
+        }
+        "AXWindowResized" => {
+            wid.and_then(|wid| geometry_event(wid, ax_frame(&element), GeometryKind::Resized))
+        }
         "AXTitleChanged" => wid.map(|wid| PlatformEvent::WindowTitleChanged {
             wid,
             title: element
@@ -317,9 +393,6 @@ unsafe extern "C" fn ax_callback(
                 .ok()
                 .flatten(),
         }),
-        "AXWindowMiniaturized" => wid.map(|wid| PlatformEvent::WindowHidden { wid }),
-        "AXWindowDeminiaturized" => wid.map(|wid| PlatformEvent::WindowShown { wid }),
-        "AXUIElementDestroyed" => wid.map(|wid| PlatformEvent::WindowDestroyed { wid }),
         "AXFocusedWindowChanged" => {
             let focused = element
                 .copy_attribute(ATTR_FOCUSED_WINDOW)
@@ -340,11 +413,7 @@ unsafe extern "C" fn ax_callback(
                 pid: Some(context.pid),
             })
         }
-        "AXApplicationActivated" => Some(PlatformEvent::AppActivated {
-            pid: Some(context.pid),
-        }),
-        "AXApplicationHidden" | "AXApplicationShown" => None,
-        _ => None,
+        other => ax_state_event(other, wid, context.pid),
     };
 
     if let Some(event) = event {
@@ -356,6 +425,8 @@ struct AxEntry {
     observer: AxObserver,
     app: AxElement,
     context: *mut AxCallbackCtx,
+    /// Start time of the observed process, to detect pid reuse.
+    started: Option<ProcessStart>,
 }
 
 // The observer and elements are immutable after setup.
@@ -368,6 +439,7 @@ impl AxEntry {
             observer,
             app,
             context,
+            started: _,
         } = self;
         // Invalidate the source first so a notification still queued on the
         // run loop cannot reach `ax_callback` with the freed context.
@@ -407,6 +479,49 @@ fn process_is_dead(pid: libc::pid_t) -> bool {
         return false;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Process start time (seconds, microseconds), unique per incarnation of a pid.
+type ProcessStart = (u64, u64);
+
+/// Start time of `pid`, or `None` when it cannot be read (process gone).
+fn process_start(pid: libc::pid_t) -> Option<ProcessStart> {
+    if pid <= 0 {
+        return None;
+    }
+    // SAFETY: proc_bsdinfo is plain old data; zeroed is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable buffer of `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (written == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+/// Observed applications whose pid now names a different process than the one
+/// the observer was created for (the pid exited and was reused).  An
+/// unreadable current start time is not evidence of reuse.
+fn pids_reused(
+    observed: impl IntoIterator<Item = (libc::pid_t, Option<ProcessStart>)>,
+    current: impl Fn(libc::pid_t) -> Option<ProcessStart>,
+) -> Vec<libc::pid_t> {
+    let mut reused: Vec<libc::pid_t> = observed
+        .into_iter()
+        .filter(|&(pid, started)| match (started, current(pid)) {
+            (Some(then), Some(now)) => then != now,
+            _ => false,
+        })
+        .map(|(pid, _)| pid)
+        .collect();
+    reused.sort_unstable();
+    reused
 }
 
 /// Installs the SkyLight and AX event sources and forwards a unified event
@@ -542,6 +657,7 @@ impl PlatformObserver {
                 observer,
                 app,
                 context,
+                started: process_start(pid),
             },
         );
         Ok(())
@@ -561,6 +677,18 @@ impl PlatformObserver {
             return Err(crate::error::PlatformError::AccessibilityDenied);
         }
         let pids = window::list_window_pids()?;
+        // A pid that exited and was reused between two refreshes still has its
+        // old entry; drop it so the new process is observed below.
+        let reused = pids_reused(
+            self.apps.iter().map(|(&pid, entry)| (pid, entry.started)),
+            process_start,
+        );
+        for pid in reused {
+            if let Some(entry) = self.apps.remove(&pid) {
+                log::debug!("pid {pid} was reused; releasing its stale AX observer");
+                entry.release();
+            }
+        }
         let mut observed = 0;
         for &pid in &pids {
             match self.observe_app(pid) {
@@ -602,6 +730,98 @@ impl Drop for PlatformObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ax_state_notifications_map_to_events() {
+        let pid = 42;
+        assert_eq!(
+            ax_state_event("AXApplicationHidden", None, pid),
+            Some(PlatformEvent::AppHidden { pid })
+        );
+        assert_eq!(
+            ax_state_event("AXApplicationShown", None, pid),
+            Some(PlatformEvent::AppShown { pid })
+        );
+        assert_eq!(
+            ax_state_event("AXApplicationActivated", None, pid),
+            Some(PlatformEvent::AppActivated { pid: Some(pid) })
+        );
+        assert_eq!(
+            ax_state_event("AXWindowMiniaturized", Some(7), pid),
+            Some(PlatformEvent::WindowMinimized { wid: 7 })
+        );
+        assert_eq!(
+            ax_state_event("AXWindowDeminiaturized", Some(7), pid),
+            Some(PlatformEvent::WindowDeminimized { wid: 7 })
+        );
+        assert_eq!(
+            ax_state_event("AXUIElementDestroyed", Some(7), pid),
+            Some(PlatformEvent::WindowDestroyed { wid: 7 })
+        );
+        // Window notifications need the element's window id.
+        assert_eq!(ax_state_event("AXWindowMiniaturized", None, pid), None);
+        assert_eq!(ax_state_event("AXWindowDeminiaturized", None, pid), None);
+        assert_eq!(ax_state_event("AXUIElementDestroyed", None, pid), None);
+        // Unknown notifications are dropped.
+        assert_eq!(ax_state_event("AXSomethingElse", Some(7), pid), None);
+        // Every registered notification is decoded somewhere: the state ones
+        // here, the rest (which need element reads) in `ax_callback`.
+        let decoded_in_callback = [
+            "AXWindowCreated",
+            "AXFocusedWindowChanged",
+            "AXWindowMoved",
+            "AXWindowResized",
+            "AXTitleChanged",
+        ];
+        for name in APP_NOTIFICATIONS.iter().chain(WINDOW_NOTIFICATIONS) {
+            assert!(
+                decoded_in_callback.contains(name) || ax_state_event(name, Some(7), pid).is_some(),
+                "{name} is registered but never decoded"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_bounds_drop_the_geometry_event() {
+        let frame = Rect::new(1.0, 2.0, 30.0, 40.0);
+        assert_eq!(geometry_event(7, None, GeometryKind::Moved), None);
+        assert_eq!(geometry_event(7, None, GeometryKind::Resized), None);
+        assert_eq!(
+            geometry_event(7, Some(frame), GeometryKind::Moved),
+            Some(PlatformEvent::WindowMoved { wid: 7, frame })
+        );
+        assert_eq!(
+            geometry_event(7, Some(frame), GeometryKind::Resized),
+            Some(PlatformEvent::WindowResized { wid: 7, frame })
+        );
+    }
+
+    #[test]
+    fn only_a_changed_start_time_marks_a_reused_pid() {
+        let now = |pid: libc::pid_t| match pid {
+            10 => Some((100, 5)), // same incarnation
+            20 => Some((200, 9)), // reused
+            _ => None,            // unreadable: not evidence
+        };
+        let reused = pids_reused(
+            [
+                (20, Some((100, 0))),
+                (10, Some((100, 5))),
+                (30, Some((1, 1))),
+                (40, None),
+            ],
+            now,
+        );
+        assert_eq!(reused, vec![20]);
+    }
+
+    #[test]
+    fn this_process_has_a_stable_start_time() {
+        let pid = std::process::id() as libc::pid_t;
+        let first = process_start(pid).expect("own start time");
+        assert_eq!(process_start(pid), Some(first));
+        assert_eq!(process_start(0), None);
+    }
 
     #[test]
     fn only_unlisted_dead_applications_are_pruned() {

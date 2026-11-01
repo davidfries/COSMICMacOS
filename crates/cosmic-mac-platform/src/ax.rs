@@ -64,7 +64,6 @@ pub(crate) const ATTR_MINIMUM_SIZE: &str = "AXMinimumSize";
 pub(crate) const ATTR_MAX_SIZE: &str = "AXMaxSize";
 /// Alternate spelling used by some applications.
 pub(crate) const ATTR_MAXIMUM_SIZE: &str = "AXMaximumSize";
-#[allow(dead_code)]
 pub(crate) const ATTR_FULLSCREEN: &str = "AXFullScreen";
 #[allow(dead_code)]
 pub(crate) const ATTR_MAIN: &str = "AXMain";

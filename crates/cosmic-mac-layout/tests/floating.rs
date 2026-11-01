@@ -236,6 +236,53 @@ fn toggle_tiling_on_retiles_all_windows() {
 }
 
 #[test]
+fn toggle_tiling_on_rebuilds_a_balanced_tree_in_the_previous_order() {
+    // Inserting next to the focus built a halving chain: 1/2, 1/4 … 1/32 of the work area.
+    // Re-enabling tiling inserts next to the largest tile instead (as the daemon's startup
+    // does) and keeps the previous window order.
+    let mut harness = Harness::new();
+    for _ in 0..6 {
+        harness.add();
+    }
+    assert_eq!(harness.shape(), "H[1 2 V[3 H[4 V[5 6]]]]");
+    harness.act(Action::ToggleTiling);
+    harness.act(Action::ToggleTiling);
+
+    // Ties go to the last window, so the focused (last) window ends up paired with a window,
+    // which ToggleStacking needs.
+    assert_eq!(harness.shape(), "H[1 2 V[3 4] V[5 6]]");
+    harness.assert_frame(1, 0.0, 0.0, 250.0, 500.0);
+    harness.assert_frame(2, 250.0, 0.0, 250.0, 500.0);
+    harness.assert_frame(3, 500.0, 0.0, 250.0, 250.0);
+    harness.assert_frame(4, 500.0, 250.0, 250.0, 250.0);
+    harness.assert_frame(5, 750.0, 0.0, 250.0, 250.0);
+    harness.assert_frame(6, 750.0, 250.0, 250.0, 250.0);
+    let total = WORK.area();
+    for wid in 1..=6 {
+        assert!(harness.frame(wid).area() >= total / 8.0, "window {wid}");
+    }
+    assert_eq!(harness.layout.focused(), Some(6));
+    harness.assert_synced();
+}
+
+#[test]
+fn toggle_stacking_works_after_toggle_tiling_on() {
+    // The VM scenario stacks right after Super+Y twice; with three windows the focused one
+    // must have a window neighbour.  The VM's work area: its near-square halves split
+    // vertically, which is what put the focused window beside a group.
+    let mut harness = Harness::with(Config::default(), Rect::new(0.0, 25.0, 1920.0, 970.0));
+    for _ in 0..3 {
+        harness.add();
+    }
+    harness.act(Action::ToggleTiling);
+    harness.act(Action::ToggleTiling);
+    harness.act(Action::ToggleStacking);
+    let stack = harness.layout.active_stack().expect("a stack formed");
+    assert_eq!(stack.tabs.len(), 2);
+    harness.assert_synced();
+}
+
+#[test]
 fn toggle_tiling_off_cascades_hidden_stack_members() {
     let mut harness = Harness::new();
     harness.add();

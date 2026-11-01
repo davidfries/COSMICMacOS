@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded into the binary's __TEXT,__info_plist section by build.rs.
+     The identifier matches scripts/sign.sh ("com.cosmicmac.<binary>").
+     LSUIElement: agent app, no Dock icon or app menu; with a bundle
+     identifier present winit leaves the activation policy to this key
+     instead of forcing Regular at launch. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.cosmicmac.cosmic-mac-launcher</string>
+	<key>CFBundleName</key>
+	<string>cosmicMac Launcher</string>
+	<key>CFBundleExecutable</key>
+	<string>cosmic-mac-launcher</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>

@@ -216,18 +216,16 @@ windows between them, Super+Q closes; quitting the daemon restores every window.
 
 ## Milestone 2: Visual shell
 
-1. `cosmic-mac-session`: launchd agents for wm, overlay, panel, launcher; `install`/
-   `uninstall` subcommands; macOS defaults: Dock autohide with huge delay, `_HIHideMenuBar`,
-   wallpaper via `NSWorkspace.setDesktopImageURL` (cosmic-bg equivalent), reserve top/bottom
-   work-area for panel/dock in the layout engine.
-2. `cosmic-mac-panel`: port cosmic-panel's look (cosmic-panel-config RON honoured for size,
-   anchor, autohide, opacity) as two libcosmic windows (panel top, dock bottom) at status
-   level, all Spaces, non-activating. Applets in-process as libcosmic widgets, adapted from
-   cosmic-applets: time/date, workspaces (from WM IPC), app-list/dock (running apps from WM
-   IPC, pinned apps from cosmic-app-list-config, icons from `NSWorkspace` rasterised to PNG
-   cache), tiling toggle, battery (IOKit), audio (CoreAudio), network/Wi-Fi (CoreWLAN,
-   SystemConfiguration), power menu (logout/sleep/restart via `osascript`/`pmset`), status
-   area showing macOS menu-bar extras is out of scope (not accessible).
+1. `cosmic-mac-session`: launchd agents for the WM (and the launcher once it is resident);
+   `install`/`uninstall`/`status` subcommands. No macOS defaults are changed (menu bar and Dock
+   stay). Wallpaper via `NSWorkspace.setDesktopImageURL` is a possible follow-up.
+2. ~~`cosmic-mac-panel`~~ **dropped (2026-10-31)**: Spike A proved a libcosmic bar works, but
+   replacing the macOS menu bar means hiding it, and that hides every app's menus (File, Edit,
+   View), which COSMIC's panel never has to carry on Linux. The native menu bar and Dock stay.
+   Instead: a **menu-bar status item** (`NSStatusItem`) showing the active workspace, with a
+   menu to switch workspaces and toggle tiling. The WM keeps its shell-strip reservation
+   (`reserve.rs`) for a possible COSMIC dock later. `crates/cosmic-mac-panel` remains as Spike A
+   reference code.
 3. `cosmic-mac-launcher`: cosmic-launcher UI with pop-launcher service; plugins: apps
    (LaunchServices database + `/Applications`, `~/Applications`, `/System/Applications`),
    calc, web, files (`mdfind`), terminal, window switcher (Alt-Tab, Super+Tab via WM IPC).

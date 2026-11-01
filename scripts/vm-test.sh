@@ -406,6 +406,23 @@ case "${1:-}" in
     test-wids)
         ctl list-windows --json | python3 /tmp/cosmicmac-vm-assert.py test-wids
         ;;
+    close-finder-windows)
+        # Finder windows tile too, and where they land decides which window a
+        # directional focus or Super+S picks; the assertions assume only test
+        # windows are tiled.  Closed through the daemon (Accessibility): an
+        # AppleScript `tell Finder` needs an Automation grant and times out.
+        for wid in $(ctl list-windows --json | python3 -c 'import json,sys; print(" ".join(str(w["info"]["wid"]) for w in json.load(sys.stdin) if w["info"]["app_id"] == "com.apple.finder"))'); do
+            ctl focus "$wid" >/dev/null 2>&1 && ctl action close >/dev/null 2>&1 || true
+        done
+        sleep 1
+        ;;
+    focus-visible-test)
+        # Other apps' windows (a Finder window, say) may sit next to the test
+        # windows in the tree, so "focus left" can land on them; focus a test
+        # window explicitly before moving it.
+        wid="$(ctl list-windows --json | python3 /tmp/cosmicmac-vm-assert.py visible-test-wid)"
+        ctl focus "$wid"
+        ;;
     open-windows)
         open_windows "${2:?open-windows needs a count}"
         ;;
@@ -435,11 +452,18 @@ case "${1:-}" in
         echo "started pid $(cat "$PIDFILE")"
         ;;
     wait-daemon)
+        # The daemon waits for an active display before it binds the socket, so
+        # keep the (virtual) display awake while waiting.
         deadline=$((SECONDS + 20))
+        next_wake=0
         while (( SECONDS < deadline )); do
             if ctl ping >/dev/null 2>&1; then
                 echo "daemon ready"
                 exit 0
+            fi
+            if (( SECONDS >= next_wake )); then
+                caffeinate -u -t 1 &
+                next_wake=$((SECONDS + 4))
             fi
             sleep 0.25
         done
@@ -832,6 +856,13 @@ def main():
         print(" ".join(str(window["info"]["wid"]) for window in test_windows(read())))
         return
 
+    if mode == "visible-test-wid":
+        visible = [window for window in test_windows(read()) if window.get("visible")]
+        if not visible:
+            fail("no visible test window")
+        print(visible[0]["info"]["wid"])
+        return
+
     if mode == "tiled":
         mode_tiled(read(), int(sys.argv[2]))
         return
@@ -1102,6 +1133,8 @@ else
     fi
 fi
 
+run_remote "close Finder windows" "bash $HELPER close-finder-windows"
+
 COUNT="$(remote_capture "open and wait for test windows" \
     "bash $HELPER open-windows $WINDOWS" "$WINDOWS")"
 [[ -n "$COUNT" ]] || COUNT="$WINDOWS"
@@ -1140,7 +1173,7 @@ action workspace 1
 assert_workspaces "workspace 1 is active again" "workspace 1"
 assert_windows "windows are back on workspace 1" "visible $COUNT"
 
-action focus left
+run_remote "focus a visible test window" "bash $HELPER focus-visible-test"
 action move-to-workspace 2
 assert_workspaces "moving a window does not follow it" "workspace 1"
 assert_windows "one window left workspace 1" "visible $((COUNT - 1))"
@@ -1157,7 +1190,7 @@ action last-workspace
 assert_workspaces "last-workspace returns to workspace 2" "workspace 2"
 
 action workspace 1
-action focus left
+run_remote "focus a visible test window" "bash $HELPER focus-visible-test"
 action move-to-workspace 2
 assert_workspaces "the second move stays on workspace 1" "workspace 1"
 assert_windows "two windows left workspace 1" "visible $((COUNT - 2))"

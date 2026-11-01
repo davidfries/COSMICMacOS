@@ -8,10 +8,15 @@
 # Usage:
 #   scripts/deploy.sh                       # platform examples (ax-status, spikes)
 #   scripts/deploy.sh -p cosmic-mac-wm      # extra release crates
+#   scripts/deploy.sh -p cosmic-mac-wm -p cosmic-mac-session   # WM + installer
 #   scripts/deploy.sh --no-build            # just sign + copy what exists
 #   VM_HOST=dj@192.168.64.14 scripts/deploy.sh
 #
-# No launchd agents are installed or restarted by this script.
+# Every target/release/cosmic-mac-* binary that exists is deployed; Cargo's
+# `.d` dep-info files next to them are not.
+#
+# No launchd agents are installed or restarted by this script; run
+# `~/cosmicMac/bin/cosmic-mac-session install` in the VM for that.
 
 set -euo pipefail
 
@@ -32,7 +37,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+            # The leading comment block, without the shebang.
+            awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
             exit 0
             ;;
         *)
@@ -63,9 +69,10 @@ for candidate in \
     "$ROOT/target/release/examples/socket-probe"; do
     [[ -f "$candidate" ]] && BINARIES+=("$candidate")
 done
+# Cargo writes `cosmic-mac-<bin>.d` dep-info files next to the binaries.
 while IFS= read -r candidate; do
     [[ -n "$candidate" ]] && BINARIES+=("$candidate")
-done < <(find "$ROOT/target/release" -maxdepth 1 -type f -name 'cosmic-mac-*' 2>/dev/null || true)
+done < <(find "$ROOT/target/release" -maxdepth 1 -type f -name 'cosmic-mac-*' ! -name '*.d' 2>/dev/null || true)
 
 if [[ ${#BINARIES[@]} -eq 0 ]]; then
     echo "!! nothing to deploy; build first" >&2

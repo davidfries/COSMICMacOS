@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use cosmic_mac_layout::MIN_WINDOW_SIZE;
-use cosmic_mac_protocol::{Action, Direction};
+use cosmic_mac_protocol::{Action, Command, Config, Direction};
 
 #[test]
 fn move_left_swaps_with_left_sibling() {
@@ -468,4 +468,253 @@ fn maximizing_without_focus_is_a_noop() {
     let mut harness = Harness::new();
     let commands = harness.act(Action::Maximize);
     assert!(commands.is_empty());
+}
+
+// -----------------------------------------------------------------------------------------
+// Moving a window out of a nested group (i3 / cosmic-comp `move_current_node` semantics)
+// -----------------------------------------------------------------------------------------
+
+fn move_focused(harness: &mut Harness, wid: u64, direction: Direction) -> Vec<Command> {
+    harness.act(Action::FocusWindow { wid });
+    harness.act(Action::Move { direction })
+}
+
+/// `H[1 V[2 3]]` on a 1200x800 work area: window 1 beside a vertical group of 2 over 3.
+fn beside_vertical_group() -> Harness {
+    let mut harness = Harness::with(Config::default(), BIG_WORK);
+    harness.add();
+    harness.add();
+    harness.add();
+    assert_eq!(harness.shape(), "H[1 V[2 3]]");
+    harness
+}
+
+/// `H[1 V[2 4] 3]` on a 1000x500 work area.
+fn horizontal_with_nested_group() -> Harness {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    harness.add();
+    harness.act(Action::FocusWindow { wid: 2 });
+    harness.add();
+    assert_eq!(harness.shape(), "H[1 V[2 4] 3]");
+    harness
+}
+
+/// `V[1 H[2 4] 3]` on a 1000x500 work area.
+fn vertical_with_nested_group() -> Harness {
+    let mut harness = horizontal_with_nested_group();
+    harness.act(Action::FocusWindow { wid: 1 });
+    harness.act(Action::ToggleOrientation);
+    harness.act(Action::FocusWindow { wid: 2 });
+    harness.act(Action::ToggleOrientation);
+    assert_eq!(harness.shape(), "V[1 H[2 4] 3]");
+    harness
+}
+
+#[test]
+fn move_left_out_of_a_nested_group_pulls_the_window_out() {
+    // The reported case: in `[A | [B/C]]`, Move(B, Left) used to move the whole group and
+    // give `[[B/C] | A]`.  B leaves its group instead, and the group of one collapses.
+    let mut harness = beside_vertical_group();
+    move_focused(&mut harness, 2, Direction::Left);
+    assert_eq!(harness.shape(), "H[1 2 3]");
+    harness.assert_frame(1, 0.0, 0.0, 400.0, 800.0);
+    harness.assert_frame(2, 400.0, 0.0, 400.0, 800.0);
+    harness.assert_frame(3, 800.0, 0.0, 400.0, 800.0);
+    assert_eq!(harness.layout.focused(), Some(2));
+    harness.assert_synced();
+}
+
+#[test]
+fn move_lower_window_left_out_of_a_nested_group() {
+    let mut harness = beside_vertical_group();
+    move_focused(&mut harness, 3, Direction::Left);
+    assert_eq!(harness.shape(), "H[1 3 2]");
+    assert_eq!(harness.layout.focused(), Some(3));
+    harness.assert_synced();
+}
+
+#[test]
+fn move_left_and_right_out_of_a_nested_group() {
+    let mut harness = horizontal_with_nested_group();
+    move_focused(&mut harness, 2, Direction::Left);
+    assert_eq!(harness.shape(), "H[1 2 4 3]");
+    harness.assert_synced();
+
+    let mut harness = horizontal_with_nested_group();
+    move_focused(&mut harness, 2, Direction::Right);
+    assert_eq!(harness.shape(), "H[1 4 2 3]");
+    // The moved window takes an equal share; its new siblings shrink proportionally.
+    harness.assert_frame(1, 0.0, 0.0, 375.0, 500.0);
+    harness.assert_frame(4, 375.0, 0.0, 187.5, 500.0);
+    harness.assert_frame(2, 562.5, 0.0, 250.0, 500.0);
+    harness.assert_frame(3, 812.5, 0.0, 187.5, 500.0);
+    assert_eq!(harness.layout.focused(), Some(2));
+    harness.assert_synced();
+}
+
+#[test]
+fn move_up_and_down_out_of_a_nested_group() {
+    let mut harness = vertical_with_nested_group();
+    move_focused(&mut harness, 2, Direction::Up);
+    assert_eq!(harness.shape(), "V[1 2 4 3]");
+    harness.assert_synced();
+
+    let mut harness = vertical_with_nested_group();
+    move_focused(&mut harness, 2, Direction::Down);
+    assert_eq!(harness.shape(), "V[1 4 2 3]");
+    harness.assert_synced();
+
+    let mut harness = vertical_with_nested_group();
+    move_focused(&mut harness, 4, Direction::Down);
+    assert_eq!(harness.shape(), "V[1 2 4 3]");
+    assert_eq!(harness.layout.focused(), Some(4));
+    harness.assert_synced();
+}
+
+#[test]
+fn move_within_a_nested_group_still_swaps() {
+    let mut harness = horizontal_with_nested_group();
+    move_focused(&mut harness, 2, Direction::Down);
+    assert_eq!(harness.shape(), "H[1 V[4 2] 3]");
+    move_focused(&mut harness, 2, Direction::Up);
+    assert_eq!(harness.shape(), "H[1 V[2 4] 3]");
+
+    let mut harness = vertical_with_nested_group();
+    move_focused(&mut harness, 2, Direction::Right);
+    assert_eq!(harness.shape(), "V[1 H[4 2] 3]");
+    harness.assert_synced();
+}
+
+#[test]
+fn move_out_of_a_nested_group_at_the_ancestor_edge() {
+    // The vertical group sits at the root's right edge; B still leaves it, to the right.
+    let mut harness = beside_vertical_group();
+    move_focused(&mut harness, 2, Direction::Right);
+    assert_eq!(harness.shape(), "H[1 3 2]");
+    harness.assert_frame(1, 0.0, 0.0, 400.0, 800.0);
+    harness.assert_frame(3, 400.0, 0.0, 400.0, 800.0);
+    harness.assert_frame(2, 800.0, 0.0, 400.0, 800.0);
+    assert_eq!(harness.layout.focused(), Some(2));
+    harness.assert_synced();
+
+    let mut harness = beside_vertical_group();
+    move_focused(&mut harness, 3, Direction::Right);
+    assert_eq!(harness.shape(), "H[1 2 3]");
+    harness.assert_synced();
+}
+
+#[test]
+fn move_without_an_axis_aligned_ancestor_is_a_noop() {
+    // No group above the vertical one splits vertically, and the root is never wrapped in a
+    // new split.
+    let mut harness = beside_vertical_group();
+    for (wid, direction) in [(2, Direction::Up), (3, Direction::Down)] {
+        harness.act(Action::FocusWindow { wid });
+        let commands = harness.act(Action::Move { direction });
+        assert!(commands.is_empty(), "{wid} {direction:?}");
+        assert_eq!(harness.shape(), "H[1 V[2 3]]", "{wid} {direction:?}");
+    }
+    harness.assert_synced();
+}
+
+#[test]
+fn move_of_a_direct_child_at_the_outer_edge_is_a_noop() {
+    let mut harness = beside_vertical_group();
+    harness.act(Action::FocusWindow { wid: 1 });
+    let commands = harness.act(Action::Move {
+        direction: Direction::Left,
+    });
+    assert!(commands.is_empty());
+    assert_eq!(harness.shape(), "H[1 V[2 3]]");
+
+    let mut harness = vertical_with_nested_group();
+    for (wid, direction) in [(1, Direction::Up), (3, Direction::Down)] {
+        harness.act(Action::FocusWindow { wid });
+        let commands = harness.act(Action::Move { direction });
+        assert!(commands.is_empty(), "{wid} {direction:?}");
+        assert_eq!(harness.shape(), "V[1 H[2 4] 3]", "{wid} {direction:?}");
+    }
+    harness.assert_synced();
+}
+
+#[test]
+fn move_out_of_three_levels_of_nesting() {
+    // H[1 V[2 H[3 4]]]: window 4 was inserted next to 3 (600x400, wide).
+    let deep = || {
+        let mut harness = beside_vertical_group();
+        harness.add();
+        assert_eq!(harness.shape(), "H[1 V[2 H[3 4]]]");
+        harness
+    };
+
+    // Left from the innermost group skips the vertical group and lands in the root.
+    let mut harness = deep();
+    move_focused(&mut harness, 3, Direction::Left);
+    assert_eq!(harness.shape(), "H[1 3 V[2 4]]");
+    harness.assert_synced();
+
+    // Up leaves the innermost group into the middle (vertical) group.
+    let mut harness = deep();
+    move_focused(&mut harness, 3, Direction::Up);
+    assert_eq!(harness.shape(), "H[1 V[2 3 4]]");
+    harness.assert_synced();
+
+    // A same-axis sibling inside the innermost group is still a plain swap.
+    let mut harness = deep();
+    move_focused(&mut harness, 4, Direction::Left);
+    assert_eq!(harness.shape(), "H[1 V[2 H[4 3]]]");
+
+    // At the innermost group's right edge, 4 leaves through the vertical group to the root's
+    // right edge.
+    let mut harness = deep();
+    move_focused(&mut harness, 4, Direction::Right);
+    assert_eq!(harness.shape(), "H[1 V[2 3] 4]");
+    harness.assert_synced();
+
+    // Down and Up leave the innermost group into the vertical group, on either side of it.
+    let mut harness = deep();
+    move_focused(&mut harness, 4, Direction::Down);
+    assert_eq!(harness.shape(), "H[1 V[2 3 4]]");
+    let mut harness = deep();
+    move_focused(&mut harness, 4, Direction::Up);
+    assert_eq!(harness.shape(), "H[1 V[2 4 3]]");
+
+    // 2 is a direct child at the vertical group's top edge and the root splits horizontally.
+    let mut harness = deep();
+    harness.act(Action::FocusWindow { wid: 2 });
+    let commands = harness.act(Action::Move {
+        direction: Direction::Up,
+    });
+    assert!(commands.is_empty());
+    assert_eq!(harness.shape(), "H[1 V[2 H[3 4]]]");
+}
+
+#[test]
+fn a_stack_moves_out_of_a_nested_group_as_a_whole() {
+    let mut harness = beside_vertical_group();
+    harness.add();
+    harness.act(Action::ToggleStacking);
+    assert_eq!(harness.shape(), "H[1 V[2 S[3 4]]]");
+    harness.act(Action::Move {
+        direction: Direction::Left,
+    });
+    assert_eq!(harness.shape(), "H[1 S[3 4] 2]");
+    assert_eq!(harness.layout.focused(), Some(4));
+    harness.assert_synced();
+}
+
+#[test]
+fn moving_out_collapses_the_group_left_with_one_child() {
+    // V[1 H[2 4] 3]: moving 4 out leaves H[2], which must collapse into window 2.
+    let mut harness = vertical_with_nested_group();
+    move_focused(&mut harness, 4, Direction::Up);
+    assert_eq!(harness.shape(), "V[1 4 2 3]");
+    // 4 is now a direct child of the root, next to 1, so a further move swaps there.
+    harness.act(Action::Move {
+        direction: Direction::Up,
+    });
+    assert_eq!(harness.shape(), "V[4 1 2 3]");
+    harness.assert_synced();
 }

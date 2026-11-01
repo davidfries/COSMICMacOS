@@ -8,6 +8,7 @@
 //! * [`session`] — work area and tiling order of the previous run, used to
 //!   decide whether a restart may reuse the old tree order.
 //! * [`rules`] — float-by-default classification and the managed-window filter.
+//! * [`reserve`] — edge strips reserved from the work area for shell windows.
 //! * [`constraints`] — per-window size constraints learned from the platform.
 //! * [`commands`] — `Command` → platform calls, debounce and tab-bar updates.
 //! * [`core`] — the single-threaded layout owner fed by platform events and IPC.
@@ -24,6 +25,7 @@ pub mod journal;
 pub mod keybindings;
 pub mod macos;
 pub mod paths;
+pub mod reserve;
 pub mod rules;
 pub mod session;
 pub mod tabbar;

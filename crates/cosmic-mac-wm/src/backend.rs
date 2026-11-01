@@ -143,6 +143,14 @@ pub trait PlatformBackend: Send + Sync {
     fn window_info(&self, wid: WindowId) -> Option<ToplevelInfo>;
     /// Every on-screen window, front-to-back.
     fn windows(&self) -> Vec<ToplevelInfo>;
+    /// On-screen shell windows (the panel) at any level, whose strips are
+    /// reserved from the work area.
+    ///
+    /// [`PlatformBackend::windows`] only lists normal-level windows, so a
+    /// panel that is already running when the daemon starts is not in it.
+    fn shell_windows(&self) -> Vec<ToplevelInfo> {
+        Vec::new()
+    }
     /// Show, update or hide the stack tab bar.
     fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()>;
     /// Work area of the main display (top-left global coordinates).
@@ -153,3 +161,15 @@ pub trait PlatformBackend: Send + Sync {
 
 /// Convenience alias for the shared backend handle.
 pub type SharedBackend = Arc<dyn PlatformBackend>;
+
+/// Whether `frame` is where [`PlatformBackend::park`] leaves a window on
+/// `display_frame` (the platform's own test,
+/// [`cosmic_mac_platform::window::is_parked_frame`]).
+///
+/// A window found there without a journal entry was parked by a crashed run;
+/// its frame is not an original worth restoring.
+pub fn is_parked_frame(frame: Rect, display_frame: Rect) -> bool {
+    let platform =
+        |rect: Rect| cosmic_mac_platform::Rect::new(rect.x, rect.y, rect.width, rect.height);
+    cosmic_mac_platform::window::is_parked_frame(platform(frame), platform(display_frame))
+}

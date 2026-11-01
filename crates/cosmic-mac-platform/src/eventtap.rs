@@ -256,8 +256,14 @@ impl EventTap {
 impl Drop for EventTap {
     fn drop(&mut self) {
         CGEvent::tap_enable(&self.tap, false);
-        // SAFETY: the source and tap are released by CFMachPort/CFRunLoopSource
-        // Drop; reclaim our callback context.
+        // Invalidate the run-loop source (removing it from every run loop) and
+        // the mach port first, so no event still queued can reach
+        // `tap_callback` with the context freed below.
+        self.source.invalidate();
+        self.tap.invalidate();
+        // SAFETY: the source and port are invalidated, so the callback can no
+        // longer run; the CF objects themselves are released by their own
+        // Drop. Reclaim our callback context.
         unsafe { drop(Box::from_raw(self.context)) };
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "cosmic-mac-session"
+description = "cosmicMac session installer: launchd agents for the window manager"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "cosmic-mac-session"
+path = "src/main.rs"
+
+[dependencies]
+# getuid() for the launchd `gui/<uid>` domain.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

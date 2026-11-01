@@ -1,10 +1,13 @@
 # HANDOFF.md — cosmicMac
 
-> State as of 2026-10-31 (evening). Milestone 0 (spikes) **complete**, milestone 1
+> State as of 2026-10-31 (late evening). Milestone 0 (spikes) **complete**, milestone 1
 > (window manager) **implemented and passing the full VM integration scenario,
-> including the Super-key bindings driven through the event tap**.
-> Written after two rounds of parallel DeepSeek agent implementation plus manual
-> review, debugging and VM verification.
+> including the Super-key bindings driven through the event tap**. Code-review
+> backlog R1, R4, R5 (minimize and Cmd+H; **not** native full screen, see R11),
+> R6 and R6a are fixed. Milestone 2: the COSMIC panel is dropped in favour of the
+> native menu bar; the session installer and a launcher spike exist.
+> **All of this is uncommitted in the main checkout** (nothing committed since
+> `5fbec1c`).
 
 ## What this is
 
@@ -113,8 +116,37 @@ Pop!_OS 24.04. Our semantics documentation should cite these:
   tiles past the real 1728 px edge, and "learns" clamps that are really the
   screen edge. `vm-test.sh` now wakes the display (`caffeinate -u -t 3`) before
   starting the daemon; `scripts/vm-prep.sh --apply` (`pmset displaysleep 0`)
-  removes the cause. The daemon itself should refuse to start, or wait, when no
-  display is active (review backlog).
+  removes the cause. The daemon now waits for an active display before it
+  manages anything (R6a).
+- **`AXWindowMiniaturized` fires before `AXMinimized` reads true.** The
+  attribute reads false for about 0.5 s after the notification (the minimize
+  animation); the SkyLight window-hidden event (816) arrives at the same moment.
+  Re-reading the window on the notification therefore always says "not
+  minimized". The WM treats the AX minimize/deminimize notifications as
+  authoritative (`PlatformEvent::WindowMinimized/WindowDeminimized`) and ignores
+  read-based "it is back" triggers for 1.5 s after a minimize (`MINIMIZE_SETTLE`).
+- **Native full screen moves the window to a new Space, and that breaks the
+  usual reads.** Traced in the VM (TextEdit, `AXFullScreen` true/false): the
+  window moves/resizes to the whole display (0,0 1920×1080), SkyLight then sends
+  **`WindowDestroyed` for it** and later `WindowCreated` with the same wid, and
+  `CGWindowList`/AX reads of it fail during the transition. AX `AXWindows` only
+  lists windows on the **current** Space, so `ax_window()` fails ("window N not
+  found") for every window left on the desktop Space while the full-screen
+  Space is active. Several short-lived helper windows (levels change, wids like
+  3044/3045) appear and vanish during the animation; one was briefly managed.
+- **TextEdit resets its other windows' frames across a full-screen round trip**
+  (also without the WM): windows set to 0,25 960×970 through AX came back at
+  their cascade defaults (213,75 646×418 …). The WM tried to snap them back
+  while they were on the inactive Space, failed (not found) and never retried.
+- **An app stopped with SIGSTOP makes every AX call wait the full messaging
+  timeout** (1 s, error -25204). The journal replay's "1 s budget" is per pass,
+  and one pass over three windows took 9 s; observer registration for that pid
+  took another 5 s and failed, so the WM gets no AX notifications from that app
+  until it is re-observed.
+- **Accessibility is charged per launching context.** Over ssh the grant is
+  sshd's, so a hand-started WM works; started by launchd, `cosmic-mac-wm` needs
+  its own entry in System Settings > Privacy & Security > Accessibility or it
+  exits 1 ("Accessibility permission is not granted").
 
 ### Daemon/layout lessons
 
@@ -178,8 +210,28 @@ Pop!_OS 24.04. Our semantics documentation should cite these:
 
 ## Verification status
 
-- Host: `cargo test --workspace` (405), `cargo clippy --workspace
-  --all-targets -- -D warnings`, `cargo fmt --check` — all green.
+- Host: `cargo test --workspace` (616), `cargo clippy --workspace
+  --all-targets -- -D warnings`, `cargo fmt --check` — all green (clippy only
+  prints the known `block v0.1.6` future-incompat note).
+- VM checks of the review fixes (2026-10-31, hand-driven over ssh with
+  `RUST_LOG=debug`):
+  - R5 minimize: `AXMinimized` set through System Events and the real
+    minimize button (AXPress) both suspend the window at once and re-flow its
+    neighbours; it stays suspended past the settle time; setting `AXMinimized`
+    false re-tiles it. Cmd+H suspends and un-hiding resumes.
+  - R5 native full screen: **fails** (R11).
+  - R1 with Terminal: only `min 150×105` learned, no max; Terminal sits at
+    962×483 in its 960×485 tile (its character grid; no centring gaps). An
+    external move snaps back with no re-probe and keeps the constraints (one
+    extra clamp+retile, as expected).
+  - R6 crash: window parked on workspace 2, WM `kill -9`, TextEdit
+    `kill -STOP`, WM restarted (replay fails, entries kept), `kill -CONT`,
+    SIGTERM: every window back at its original frame, journal removed; the
+    corner frame was never recorded as an original.
+  - R4: Spotlight not tiled; the panel is not managed.
+  - R6a: the daemon waits for the display and starts when it wakes.
+  - `bash scripts/vm-test.sh` passes (66 assertions) on this uncommitted state,
+    including the minimize fix.
 - VM (`dj@192.168.64.14`, macOS 15.6, SIP on, fullscreen 1728×1080): full
   scenario green; evidence in `scratch/vm-test-0{1..6}-*.png`.
 - VM: the keybinding phase (synthetic chords via `send-key`) passes; evidence in
@@ -223,7 +275,10 @@ depends on the daemon being long-running.
 
 **Major**
 
-- **R1. Post-probe clamps still pin bounds** (`core.rs learn_constraints`,
+- ~~R1. Post-probe clamps still pin bounds~~ **done** (candidate promotion
+  needs a probe explanation or a repeat, `SNAP_TOLERANCE` 24, a grow shortfall
+  ≤ `GROW_STEP/2` is a snap; VM-checked with Terminal). Original:
+- R1 (original). **Post-probe clamps still pin bounds** (`core.rs learn_constraints`,
   `constraints.rs promote_candidates`, `window.rs` grow-probe max). After one
   successful probe every later directional candidate is promoted, so a
   grid-snapping app (Terminal: 900→896, 500→504) ends up with `max=896×496`
@@ -259,28 +314,63 @@ depends on the daemon being long-running.
   default ~6 s). A beach-balling app freezes keyboard input system-wide and
   gets the tap disabled. Fix: tap on its own thread/run loop; `refresh_apps`
   collects pids without AX enrichment; set a 0.25–0.5 s messaging timeout.
-- **R4. Windows created after startup skip the level and minimized filters**
+- ~~R4. Windows created after startup skip the level and minimized filters~~
+  **done** (`ToplevelInfo.level/minimized/fullscreen`, `rules::is_manageable`,
+  `WindowLevelChanged` drops a managed window). Original:
+- R4 (original). **Windows created after startup skip the level and minimized filters**
   (`core.rs` window-created → `MacPlatform::window_info`; `to_toplevel` drops
   `level`/`is_minimized`; startup filters `level == 0 && !is_minimized`).
   Spotlight, launcher panels and overlays ≥40×30 get tiled. Fix: carry level
   and minimized into `ToplevelInfo` and require level 0 plus an AX role.
-- **R5. Minimize, Cmd+H and native fullscreen are ignored** (`WindowHidden`/
+- R5. **Minimize and Cmd+H done; native full screen still broken (R11).**
+  Suspended windows leave the layout and come back on the active workspace
+  with their learned constraints (`Core::suspended`, `AppHidden/AppShown`,
+  `WindowMinimized/WindowDeminimized`, `CommandApplier::release_window`).
+  Original:
+- R5 (original). **Minimize, Cmd+H and native fullscreen are ignored** (`WindowHidden`/
   `WindowShown` dropped in `core.rs`; `AXApplicationHidden/Shown` dropped in
   `observers.rs`). Cmd+M leaves a hole, focus lands on the invisible window,
   and a re-tile of a minimized window can probe it and pin `Frozen`. Fix:
   remove/suspend on hide, re-insert on show, never probe a minimized window.
-- **R6a. Startup with no active display uses a hardcoded 1920×1080 work area**
+- ~~R6a. Startup with no active display uses a hardcoded 1920×1080 work area~~
+  **done** (startup waits for an active display; zero displays keep the last
+  area). Original:
+- R6a (original). **Startup with no active display uses a hardcoded 1920×1080 work area**
   (`macos.rs main_display_frames_now` fallback). Seen when the VM display was
   asleep: wrong tiles, false clamps learned. Fix: when enumeration yields no
   display, wait for the display-reconfiguration callback (or poll) before
   managing anything, and never persist constraints learned before the first
   real work area.
-- **R6. Journal replay discards entries it failed to restore**
+- ~~R6. Journal replay discards entries it failed to restore~~ **done**
+  (failed entries kept and retried at startup, corner frames never recorded,
+  entries carry the owner pid; VM crash scenario passes). Original:
+- R6 (original). **Journal replay discards entries it failed to restore**
   (`journal.rs restore`). A transient AX error after `kill -9` leaves a window
   at the park corner, the new daemon records the corner as its original frame,
   and a clean shutdown later parks it for good. Fix: write failed entries back
   and retry; prefer a stale entry in `record_original`; treat a startup frame
   at the corner as parked.
+- **R11. Native full screen loses the window** (found in the VM while checking
+  R5). Entering full screen: the move to the display-sized frame triggers the
+  full-screen re-read, but AX cannot read the window mid-transition, so it is
+  not suspended; SkyLight's `WindowDestroyed` for it then makes the WM forget it
+  (constraints and journal entry too), and the later `WindowCreated` read fails
+  ("disappeared before it could be inspected"). After leaving full screen the
+  window stays unmanaged. The app's other windows are moved by the app while
+  their Space is inactive, the snap-back fails (AX cannot see other Spaces) and
+  is never retried, so they stay out of their tiles. Transition helper windows
+  can be managed briefly. Needs a design decision, roughly: treat a destroy that
+  follows a display-sized frame (or of a window SkyLight still knows) as
+  "left for a full-screen Space" and suspend instead of forgetting; a delayed
+  re-check (`Message::Recheck(wid)` from a tokio timer in `daemon.rs`) for
+  reads that fail during a transition; re-assert the active workspace's tiles
+  when the desktop Space becomes active again (a Space-change notification);
+  ignore windows created during a transition until they settle.
+- **R12. Commands that fail while an app is unresponsive are never retried.**
+  In the R6 run the startup `SetFrame`s for the stopped TextEdit failed
+  (-25204); after `kill -CONT` the layout believed the windows were tiled while
+  one was still at the park corner (ACTUAL column shows it). Also its AX
+  observers failed to register and are not retried for a live pid.
 - ~~R7. Closing a window trims the active empty workspace~~ fixed (layout).
   **Semantics changed with it:** the active workspace is never trimmed, and an
   empty trailing workspace is trimmed when the user *leaves* it (`switch_to`).
@@ -303,33 +393,33 @@ depends on the daemon being long-running.
   layout~~ fixed.
 - ~~Key autorepeat re-fires one-shot actions (holding Super+Q closes window
   after window)~~ fixed (repeats only pass for Focus/Move/Resize).
-- Moving a window out of a nested group moves the whole group
-  (`tree.rs move_node`: in `[A | [B/C]]`, Move(B, Left) yields `[[B/C] | A]`).
-  cosmic-comp/i3 pull B out of its group. No test covers it.
-- ToggleTiling off→on rebuilds a halving chain (`lib.rs` re-insert next to the
-  focused window): areas 1/2, 1/4 … 1/32. Use the largest-tile insertion the
-  startup path already uses.
-- Startup is quadratic (`core.rs startup`: every insert re-applies every
-  visible tile, plus 2N Focus/Raise). Batch inserts and sync once (also
-  shrinks R2's window).
+- ~~Moving a window out of a nested group moves the whole group~~ fixed (i3
+  semantics, including at the ancestor edge).
+- ~~ToggleTiling off→on rebuilds a halving chain~~ fixed (re-insert next to
+  the largest tile, ties → last window, then relabel to keep the order).
+  ToggleStacking beside a group now stacks with the group's nearest leaf
+  (`Tree::edge_leaf`).
+- ~~Startup is quadratic~~ fixed with R2 (batched inserts, one sync).
 - Windows rejected at creation (0×0, AX not ready) are never re-checked.
   Re-evaluate unknown wids on later Resized/Title events.
-- Drop order in `EventTap` / `PlatformObserver`: context freed without
-  `CFMachPortInvalidate` / run-loop-source removal (theoretical today).
-- AX observers are never removed for dead pids; a reused pid is never
-  observed again (`observers.rs refresh_apps`).
+- ~~Drop order in `EventTap` / `PlatformObserver`~~ fixed (invalidate first).
+- ~~AX observers are never removed for dead pids; a reused pid is never
+  observed again~~ fixed (dead pids pruned; reuse detected by process start
+  time).
 - SLS callbacks run on the pump thread, not the main run loop as documented;
   title events do AX work there; the 10 ms sleep loop wakes 100×/s. Block on
   the event port with `mach_msg` instead.
-- A failed `window_bounds` read becomes a `WindowMoved` to `Rect::default()`
-  (`observers.rs`), causing a snap-back attempt on a closing window. Drop it.
+- ~~A failed `window_bounds` read becomes a `WindowMoved` to `Rect::default()`~~
+  fixed (the event is dropped).
 - IPC: line length unbounded; invalid UTF-8 closes the connection without an
   error reply (socket is 0600, low impact).
-- Hollow test: `user_move_of_a_tiled_window_snaps_back` sets the focus
-  debounce, not the applier's, so the event is swallowed as an echo and the
-  snap-back never runs. Zero the applier debounce and assert a `SetFrame`.
-- Missing coverage: stale echoes after the debounce, minimize, journal restore
-  errors, post-probe candidate promotion (R1).
+- ~~Hollow test `user_move_of_a_tiled_window_snaps_back`~~ fixed (zeroes the
+  applier's debounce).
+- ~~Missing coverage: minimize, journal restore errors, post-probe candidate
+  promotion (R1)~~ covered with R1/R5/R6. Stale echoes after the debounce:
+  `move_captured_after_the_debounce_is_a_user_move`.
+- Terminal costs one extra clamp+retile per layout change (its grid never
+  matches the tile; R1 note).
 
 **Confirmed solid by the review** (no need to re-check): journal atomic writes
 and corrupt-file handling; CF ownership in `ax.rs` and the tab bar; tap
@@ -340,8 +430,24 @@ permissions; bounded `handle_clamp` recursion.
 
 ## Milestone 2 status
 
-- **Spike A passed** (branch `worktree-agent-a8a384014eaa80bb2`, commit
-  `ad1ef56`, to be merged): libcosmic pinned at `95236a9` (master 2026-10-27)
+- **Decision (2026-10-31): no COSMIC top panel.** Replacing the macOS menu bar
+  means hiding it, which hides every app's menus. The native menu bar and Dock
+  stay; a menu-bar `NSStatusItem` showing the active workspace (menu: switch
+  workspace, toggle tiling) replaces the panel. PLAN.md milestone 2 items 1–2
+  are rewritten accordingly. `crates/cosmic-mac-panel` stays as Spike A
+  reference code, and the WM keeps its shell-strip reservation (`reserve.rs`,
+  `rules::SHELL_APP_IDS`) for a possible COSMIC dock.
+- **Launcher spike** (`crates/cosmic-mac-launcher`, uncommitted): a libcosmic
+  overlay with its own `Plugin` trait (pop-launcher's plugins crate does not
+  build on macOS) and plugins apps, calc, web and windows (over WM IPC). In the
+  VM it renders centred with app icons, takes keyboard focus, `=2^10` + Return
+  copies 1024, Escape quits. Open: startup takes ~1.1 s (a resident mode is
+  likely needed); the `Info.plist` embedded by `build.rs` does not take effect
+  (bundle id None; it starts with the Regular policy, then switches to
+  Accessory, so a Dock icon may flash); the WM does not spawn it on a Super tap
+  yet.
+- **Spike A passed** and is merged into `main` (`ad1ef56`, `6cc9230`, merge
+  `5fbec1c`): libcosmic pinned at `95236a9` (master 2026-10-27)
   with `default-features = false` + winit/tokio/multi-window/wgpu builds on
   macOS **unpatched** (clean release build 77 s) and renders through wgpu on
   Metal in the VM ("Apple Paravirtual device"). `crates/cosmic-mac-panel` is
@@ -350,13 +456,88 @@ permissions; bounded `handle_clamp` recursion.
   raw-window-handle `NSView` and sets borderless, `NSStatusWindowLevel`,
   CanJoinAllSpaces|Stationary and the top-edge frame. Evidence:
   `scratch/spike-a-panel.png`, `scratch/spike-a-panel-tick.png`.
-- Open: the process activates like a regular app (Dock icon, takes focus at
-  launch); libcosmic/iced expose neither winit's activation policy nor a
-  non-activating panel. Work in progress: `setActivationPolicy(Accessory)` in
-  the window callback, and an `NSPanel` class swap or a small iced patch for
-  `NonactivatingPanel`.
+- Done in `6cc9230`: `setActivationPolicy(Accessory)` (no Dock icon) and
+  private `-[NSWindow _setPreventsActivation:YES]` (guarded by
+  `respondsToSelector:`) so clicks on the bar do not activate it. An `NSPanel`
+  class swap does not work and is unsafe with winit's KVO subclass.
+- Open: the panel still takes focus for ~100 ms at launch, because iced builds
+  winit's event loop with no activation policy. Fix with a small `iced_winit`
+  patch or by launching it as a `.app` with `LSBackgroundOnly`/`LSUIElement`
+  (planned for the `cosmic-mac-session` installer).
 - The WM must learn to ignore the panel window (R4: level filter for windows
   created after startup) and reserve its height from the work area.
+
+### Session installer (`cosmic-mac-session`)
+
+- **Verified end to end in the VM (2026-11-01)** once `cosmic-mac-wm` had its
+  own Accessibility grant (without it the launchd-started WM exits 1; see the
+  platform facts): `install` → WM running under launchd, macOS shows
+  "Background Items Added"; window parked on ws2 + `kill -9` → launchd restarted
+  the WM within ~1 s, the journal restored all 3 windows and they were re-tiled;
+  `uninstall` → clean shutdown, frames restored, journal removed. The grant
+  survives redeploys because the binaries are signed with the stable identity
+  (an unchanged binary was used for this check). Installs the WM
+  as a launchd agent; it changes no macOS defaults (the native menu bar and Dock
+  stay as they are).
+- `install [--bin-dir DIR] [--dry-run]` writes
+  `~/Library/LaunchAgents/com.cosmicmac.wm.plist` atomically (mode 0644):
+  `<bin-dir>/cosmic-mac-wm`, `RunAtLoad`, `KeepAlive { SuccessfulExit = false }`
+  (restart after a crash, not after the clean exit 0 that follows SIGTERM),
+  `ThrottleInterval 5`, `ProcessType Interactive`,
+  `LimitLoadToSessionType Aqua`, `RUST_LOG=info`, stdout/stderr to
+  `~/Library/Logs/cosmicMac/wm.log`. Then it runs
+  `launchctl bootstrap gui/<uid>`. If the label is already loaded, it boots it
+  out first and polls `launchctl print` until it is gone, because bootout can
+  return before the process exits ("36: Operation now in progress") and
+  bootstrap then fails with "5: Input/output error". That makes reinstall
+  idempotent. `--bin-dir` defaults to the directory of the running
+  `cosmic-mac-session`.
+- `uninstall [--dry-run]` runs `launchctl bootout` (SIGTERM, so the WM restores
+  every window) in reverse agent order and removes the plists. `status` shows
+  for each agent whether its plist is installed, whether launchd has it loaded,
+  and its state, pid, last exit code and program.
+- `--dry-run` prints every change (commands, file writes, directories)
+  without making it. Read-only `launchctl print` queries still run, so the
+  plan matches the machine.
+- The agent list is `AGENTS` in `crates/cosmic-mac-session/src/agents.rs`. The
+  launcher, or a menu-bar helper, is one more entry each. A bundled app names
+  its executable relative to `--bin-dir`
+  (`Foo.app/Contents/MacOS/foo`). Every `launchctl` call goes through a
+  `CommandRunner` trait. 36 host tests use a scripted fake runner and a temp
+  home, plus one `plutil` lint/round-trip of the generated plist.
+- In the VM: first stop any WM started by hand or by `vm-test.sh`
+  (`bash /tmp/cosmicmac-vm-helpers.sh stop-daemon`, or
+  `kill -TERM $(pgrep -x cosmic-mac-wm)`), because two daemons would fight
+  over the windows. Then:
+
+  ```
+  scripts/deploy.sh -p cosmic-mac-wm -p cosmic-mac-session
+  ssh dj@192.168.64.14 '~/cosmicMac/bin/cosmic-mac-session install --dry-run'
+  ssh dj@192.168.64.14 '~/cosmicMac/bin/cosmic-mac-session install'
+  ssh dj@192.168.64.14 '~/cosmicMac/bin/cosmic-mac-session status'
+  ssh dj@192.168.64.14 'tail ~/Library/Logs/cosmicMac/wm.log'
+  ```
+
+  Checked (2026-11-01): Accessibility holds when launchd (not sshd) starts the
+  binary; macOS shows a "Background Items Added" notice and lists the agent
+  under Login Items > Allow in the Background; after `kill -9` launchd restarts
+  the WM (at most one start per 5 s) and the new process replays the frame
+  journal; `uninstall` restores the frames;
+  a redeploy followed by `install` swaps in the new binary. `vm-test.sh`
+  reuses a reachable daemon and leaves it running, so it also works against
+  the agent.
+
+### VM scenario changes (`scripts/vm-test.sh`)
+
+- Keeps the display awake while it waits for the daemon.
+- Closes Finder windows through the WM, because AppleScript `tell Finder` needs
+  an Automation grant over ssh and times out (a permission prompt may be
+  pending in the VM).
+- Focuses a visible test window explicitly before move-to-workspace.
+- Other apps' windows still take part in the tiling: an extra Terminal window
+  left open made the Super+S stacking assertion pair a test window with it
+  ("found 1"). Close stray windows before a run.
+- `deploy.sh` no longer copies `.d` dep-info files; `--help` fixed.
 
 ## Newer macOS VMs
 
@@ -381,9 +562,15 @@ that IPSW. Testing on 26/27 therefore needs a host upgrade or another Mac.
 
 1. ~~Super-key acceptance~~ done (scripted). Milestone 1 exit criteria are met.
 2. ~~Backlog 1–3~~ done; backlog 4–8 remain.
-3. Review backlog R1–R6 (above), R2 and R3 first: they decide whether the
-   daemon can be left running all day.
-4. Milestone 2: `cosmic-mac-session` (launchd agents, defaults), panel/dock
-   (libcosmic Spike A first), launcher (pop-launcher in-process). Spike C's
-   AppKit result already proves the tab-bar anchor path.
-5. First ship: `gh repo create` (private), push, tag.
+3. ~~Review backlog R1–R6~~ done except native full screen: **R11** (design
+   needed: Space transitions, delayed re-checks) and **R12** (retry commands
+   and observer registration after an unresponsive app recovers).
+4. ~~Session installer under launchd~~ verified in the VM (install, `kill -9`
+   restart + journal replay, uninstall).
+5. Milestone 2: menu-bar status item (likely in the WM process, like the tab
+   bar overlay); WM IPC event subscription if it lives out of process; launcher
+   activation from the WM (tap Super), resident mode, bundle id; theming.
+6. Minor backlog: SLS pump `mach_msg`, IPC line limit / UTF-8 error reply,
+   windows rejected at creation never re-checked.
+7. Commit the uncommitted work, then first ship: `gh repo create` (private),
+   push, tag.

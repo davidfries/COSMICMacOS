@@ -3,7 +3,8 @@
 //! Enumeration uses the public `CGWindowListCopyWindowInfo` as the source of
 //! truth for *what is on screen* (window IDs, stacking layer, bounds, owner
 //! PID). When the Accessibility grant is present, each window is enriched with
-//! AX data: title, role/subrole, resizability and dialog-ness.
+//! AX data: title, role/subrole, resizability, dialog-ness and the
+//! minimized/full-screen state.
 //!
 //! Operations that change geometry (`set_frame`, `set_position`, `set_size`,
 //! `minimize`, `close`) require Accessibility. `raise` and
@@ -25,9 +26,9 @@ use objc2_core_graphics::{
 use objc2_foundation::NSString;
 
 use crate::ax::{
-    ACTION_PRESS, ACTION_RAISE, ATTR_CLOSE_BUTTON, ATTR_MAX_SIZE, ATTR_MAXIMUM_SIZE,
-    ATTR_MINIMIZED, ATTR_POSITION, ATTR_ROLE, ATTR_SIZE, ATTR_SUBROLE, ATTR_TITLE, ATTR_WINDOWS,
-    AxElement,
+    ACTION_PRESS, ACTION_RAISE, ATTR_CLOSE_BUTTON, ATTR_FULLSCREEN, ATTR_MAX_SIZE,
+    ATTR_MAXIMUM_SIZE, ATTR_MINIMIZED, ATTR_POSITION, ATTR_ROLE, ATTR_SIZE, ATTR_SUBROLE,
+    ATTR_TITLE, ATTR_WINDOWS, AxElement,
 };
 use crate::error::{PlatformError, Result};
 use crate::geometry::{Point, Rect, Size};
@@ -73,6 +74,8 @@ pub struct WindowInfo {
     pub is_floating: bool,
     /// Minimized (AXMinimized).
     pub is_minimized: bool,
+    /// In native full screen (AXFullScreen): the window fills its own Space.
+    pub is_fullscreen: bool,
     /// True when the record was enriched through Accessibility.
     pub ax_backed: bool,
 }
@@ -84,7 +87,7 @@ impl WindowInfo {
     /// This filter is intentionally conservative: the WM decides float rules
     /// from `is_dialog`, `resizable`, bundle id and title.
     pub fn is_normal(&self) -> bool {
-        self.level == 0 && !self.is_minimized
+        self.level == 0 && !self.is_minimized && !self.is_fullscreen
     }
 }
 
@@ -299,6 +302,17 @@ const SHRINK_PROBE_SIZE: f64 = 1.0;
 /// How far the probe grows a window to detect a maximum.
 const GROW_STEP: f64 = 128.0;
 
+/// Largest grow shortfall that is read as resize-grid snapping rather than a maximum.
+///
+/// Apps with a resize increment answer a grow with the nearest cell: Terminal and iTerm
+/// snap to their character cell (7×14 px at Terminal's default font), so a +128 px grow
+/// comes back a few pixels short.  Recording that as a maximum pinned Terminal a few pixels
+/// above its current size for the session.  A real maximum refuses most of the step, so only
+/// a shortfall of more than half of [`GROW_STEP`] counts; that also leaves room for apps with
+/// coarser increments.  A real maximum closer than that is not lost: the daemon learns it
+/// when its own clamps stop at the same value from two different requests.
+const GROW_SNAP_LIMIT: f64 = GROW_STEP / 2.0;
+
 /// The grow probe is capped at this fraction of the main display's frame, so it never asks
 /// for an enormous window that the display would clamp for unrelated reasons.
 const GROW_DISPLAY_FRACTION: f64 = 0.5;
@@ -408,8 +422,9 @@ struct AxisFinding {
 ///
 /// `Frozen` requires **both** probes to be refused.  A window whose minimum equals its
 /// natural size refuses to shrink but grows normally, which is [`AxisConstraint::Min`], not
-/// frozen.  A grow clamp that is not a full refusal is reported as a real maximum even when
-/// the axis has no minimum.  When the grow probe could not run, a refused shrink degrades to
+/// frozen.  A grow that falls more than [`GROW_SNAP_LIMIT`] short of the request is reported
+/// as a real maximum even when the axis has no minimum; a smaller shortfall is grid snapping.
+/// When the grow probe could not run, a refused shrink degrades to
 /// [`AxisConstraint::Frozen`] (the old shrink-only behaviour) because the two cases cannot be
 /// distinguished without growing the window.
 fn classify_axis(
@@ -444,10 +459,11 @@ fn classify_axis(
         };
     }
 
-    // Only a value below the grow request is a real maximum.  An application that snaps the
-    // grow upward is not constraining the axis.
+    // Only a grow that fell well short of the request is a real maximum.  An application that
+    // snaps the grow to its resize grid lands within a cell of the request, and one that snaps
+    // it upward is not constraining the axis at all.
     let max =
-        (applied_grow < grow - FRAME_TOLERANCE).then_some(applied_grow.max(original).max(0.0));
+        (grow - applied_grow > GROW_SNAP_LIMIT).then_some(applied_grow.max(original).max(0.0));
     let constraint = min
         .map(|min| AxisConstraint::Min { min })
         .unwrap_or(AxisConstraint::Free);
@@ -555,10 +571,16 @@ struct CgWindowBasics {
 }
 
 impl CgWindowBasics {
+    /// The [`list_windows_all_levels`] filter: a real window of another
+    /// process with a non-empty frame, at any level.
+    fn is_foreign_window(&self, own_pid: libc::pid_t) -> bool {
+        self.wid != 0 && self.pid != own_pid && self.frame.is_non_empty()
+    }
+
     /// The [`list_windows`] filter: a real window of another process, at the
     /// normal application level, with a non-empty frame.
     fn is_listed(&self, own_pid: libc::pid_t) -> bool {
-        self.wid != 0 && self.pid != own_pid && self.level == 0 && self.frame.is_non_empty()
+        self.is_foreign_window(own_pid) && self.level == 0
     }
 }
 
@@ -661,6 +683,7 @@ fn cg_dict_to_window(dict: &CFDictionary<CFString, CFType>) -> WindowInfo {
         is_dialog: false,
         is_floating: false,
         is_minimized: false,
+        is_fullscreen: false,
         ax_backed: false,
     }
 }
@@ -708,6 +731,27 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
     if crate::ax::is_process_trusted() {
         enrich_with_ax(&mut windows);
     }
+    Ok(windows)
+}
+
+/// All on-screen windows of other processes at **any** level, front to back.
+///
+/// Same enumeration as [`list_windows`] without the level filter, from
+/// CGWindowList data only: no AX enrichment, so nothing here talks to the
+/// applications and a hung app cannot stall the caller.  Roles and the
+/// minimized/full-screen flags are not filled in, and titles are CoreGraphics
+/// titles only.  The owning app's bundle id and name come from
+/// `NSRunningApplication`.
+/// Used to find shell windows (the panel at the status level) that are
+/// already on screen.
+pub fn list_windows_all_levels() -> Result<Vec<WindowInfo>> {
+    let own_pid = own_pid();
+    let mut windows = Vec::new();
+    for_each_on_screen_record(|dict| {
+        if cg_dict_basics(dict).is_foreign_window(own_pid) {
+            windows.push(cg_dict_to_window(dict));
+        }
+    })?;
     Ok(windows)
 }
 
@@ -774,6 +818,7 @@ fn enrich_with_ax(windows: &mut [WindowInfo]) {
                 .ok()
                 .flatten()
                 .unwrap_or(false);
+            window.is_fullscreen = is_fullscreen(&element);
             window.resizable = element.is_settable(ATTR_SIZE).unwrap_or(true);
             window.is_dialog = is_dialog_role(window.role.as_deref(), window.subrole.as_deref());
             window.is_floating = window.subrole.as_deref() == Some("AXFloatingWindow");
@@ -782,6 +827,18 @@ fn enrich_with_ax(windows: &mut [WindowInfo]) {
             }
         }
     }
+}
+
+/// Whether a window element is in native full screen (`AXFullScreen`).
+///
+/// Windows that cannot go full screen do not publish the attribute; that, and
+/// a failed read, count as not full screen.
+fn is_fullscreen(element: &AxElement) -> bool {
+    element
+        .bool_attribute(ATTR_FULLSCREEN)
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 fn is_dialog_role(role: Option<&str>, subrole: Option<&str>) -> bool {
@@ -824,6 +881,7 @@ pub fn list_ax_windows(pid: libc::pid_t) -> Result<Vec<WindowInfo>> {
             level: skylight::window_level(wid).unwrap_or(0),
             resizable: element.is_settable(ATTR_SIZE).unwrap_or(true),
             is_minimized: element.bool_attribute(ATTR_MINIMIZED)?.unwrap_or(false),
+            is_fullscreen: is_fullscreen(&element),
             ax_backed: true,
         });
     }
@@ -852,6 +910,7 @@ pub fn window_info(wid: u32) -> Result<Option<WindowInfo>> {
             .ok()
             .flatten()
             .unwrap_or(false);
+        info.is_fullscreen = is_fullscreen(&window.element);
         if let Ok(Some(frame)) = window.frame() {
             info.frame = frame;
         }
@@ -907,10 +966,10 @@ impl AxWindow {
     /// the request succeeded.
     pub fn set_frame(&self, frame: Rect) -> Result<AppliedFrame> {
         let previous = self.frame()?;
-        self.element.set_size_attribute(ATTR_SIZE, frame.size)?;
+        self.set_size_best_effort(frame.size);
         self.element
             .set_point_attribute(ATTR_POSITION, frame.origin)?;
-        self.element.set_size_attribute(ATTR_SIZE, frame.size)?;
+        self.set_size_best_effort(frame.size);
 
         // Read back. AppKit can clamp a size after the move (screen edges,
         // aspect ratio); one corrective pass is enough in practice.
@@ -924,10 +983,23 @@ impl AxWindow {
             );
             self.element
                 .set_point_attribute(ATTR_POSITION, frame.origin)?;
-            self.element.set_size_attribute(ATTR_SIZE, frame.size)?;
+            self.set_size_best_effort(frame.size);
             applied = self.current_frame()?;
         }
         Ok(AppliedFrame::from_frames(frame, applied, previous))
+    }
+
+    /// Set the size, tolerating a refusal.
+    ///
+    /// Some windows reject `AXSize` outright (Calculator answers
+    /// `kAXErrorFailure` even though the attribute reports settable).  Failing
+    /// the whole `set_frame` then left such a window unmoved: never placed,
+    /// never restored from the journal.  The position is still applied, and the
+    /// read-back reports the refused size as a clamp.
+    fn set_size_best_effort(&self, size: Size) {
+        if let Err(error) = self.element.set_size_attribute(ATTR_SIZE, size) {
+            log::debug!("window {}: size {size:?} refused: {error}", self.wid);
+        }
     }
 
     /// Move without resizing.
@@ -980,9 +1052,11 @@ impl AxWindow {
     ///   the minimum equals the natural size ([`AxisConstraint::Min`]), which is
     ///   what Notes' 642px width is: it refuses to shrink but widens happily.
     ///
-    /// A grow that stops short of the requested size is a **maximum**; it is
-    /// reported through [`SizeConstraints::max`] together with `AXMaxSize` /
-    /// `AXMaximumSize` when the application publishes one.
+    /// A grow that stops more than [`GROW_SNAP_LIMIT`] short of the requested
+    /// size is a **maximum**; it is reported through [`SizeConstraints::max`]
+    /// together with `AXMaxSize` / `AXMaximumSize` when the application
+    /// publishes one.  A grow that stops only a few pixels short is the app
+    /// snapping to its resize grid (Terminal), not a maximum.
     ///
     /// If the main display cannot be queried the grow step is skipped and the
     /// probe degrades to the shrink-only behaviour: in that case a minimum equal
@@ -1294,12 +1368,46 @@ pub fn close(wid: u32) -> Result<()> {
     ax_window(wid)?.close()
 }
 
+/// How far, in points, a window's top-left corner may sit up or left of
+/// [`park_origin`] and still count as parked for [`is_parked_frame`].
+///
+/// [`ParkStore::park`] puts the corner exactly at the park origin; the slack
+/// absorbs read-back rounding and small nudges by the app or macOS.  A window
+/// that far into the bottom-right corner shows at most a 9×9 pt sliver, which
+/// is no usable position, so a false positive costs nothing.  Missing a parked
+/// window is expensive: the daemon would journal the corner as the window's
+/// original frame and park it for good on shutdown.
+pub const PARKED_FRAME_SLACK: f64 = 8.0;
+
+/// Where [`ParkStore::park`] moves a window's top-left corner on
+/// `display_frame`: 1 px inside the display's bottom-right corner, so 1 px of
+/// the window stays visible.
+pub fn park_origin(display_frame: Rect) -> Point {
+    Point::new(display_frame.max_x() - 1.0, display_frame.max_y() - 1.0)
+}
+
+/// Whether `frame` is where [`ParkStore::park`] leaves a window on
+/// `display_frame`: its top-left corner is at [`park_origin`] (within
+/// [`PARKED_FRAME_SLACK`]) or further right and down, off the display (the
+/// display shrank since the window was parked).
+///
+/// An empty `display_frame` cannot be judged and yields `false`.
+pub fn is_parked_frame(frame: Rect, display_frame: Rect) -> bool {
+    if !display_frame.is_non_empty() {
+        return false;
+    }
+    let origin = park_origin(display_frame);
+    frame.origin.x >= origin.x - PARKED_FRAME_SLACK
+        && frame.origin.y >= origin.y - PARKED_FRAME_SLACK
+}
+
 /// Saved frames for parked windows.
 ///
 /// The WM parks inactive workspace members and inactive stack members at the
-/// bottom-right corner of their display with 1 px visible. This store keeps the
-/// original frame so `unpark` can restore it exactly. It is in-memory; the
-/// daemon's crash journal is a separate concern.
+/// bottom-right corner of their display with 1 px visible (see
+/// [`park_origin`]). This store keeps the original frame so `unpark` can
+/// restore it exactly. It is in-memory; the daemon's crash journal is a
+/// separate concern.
 #[derive(Debug, Default)]
 pub struct ParkStore {
     saved: Mutex<HashMap<u32, Rect>>,
@@ -1325,8 +1433,7 @@ impl ParkStore {
             *saved.entry(wid).or_insert(current)
         };
         // 1 px of the window's left edge remains visible at the display corner.
-        let target = Point::new(display_frame.max_x() - 1.0, display_frame.max_y() - 1.0);
-        set_position(wid, target)?;
+        set_position(wid, park_origin(display_frame))?;
         Ok(Some(saved))
     }
 
@@ -1402,6 +1509,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parked_frames_are_recognised_at_the_park_origin() {
+        let display = Rect::new(0.0, 0.0, 1728.0, 1080.0);
+        let parked =
+            |x: f64, y: f64, display: Rect| is_parked_frame(Rect::new(x, y, 800.0, 600.0), display);
+        assert_eq!(park_origin(display), Point::new(1727.0, 1079.0));
+        // Exactly where `park` leaves it, and a few points off.
+        assert!(parked(1727.0, 1079.0, display));
+        assert!(parked(1720.0, 1072.0, display));
+        // Beyond the corner: parked on a display that has since shrunk.
+        assert!(parked(1919.0, 1199.0, display));
+        // A real window, one in the bottom-right quarter and ones that only
+        // touch a single edge are not parked.
+        assert!(!parked(100.0, 100.0, display));
+        assert!(!parked(1200.0, 700.0, display));
+        assert!(!parked(1727.0, 500.0, display));
+        assert!(!parked(500.0, 1079.0, display));
+        // A secondary display's corner is judged against that display.
+        let right = Rect::new(1728.0, 0.0, 1920.0, 1200.0);
+        assert!(parked(3647.0, 1199.0, right));
+        assert!(!parked(1727.0, 1079.0, right));
+        // An empty display frame cannot be judged.
+        assert!(!parked(1727.0, 1079.0, Rect::default()));
+    }
+
+    #[test]
     fn listed_pids_apply_the_list_windows_filter_and_dedup() {
         let window = |wid: u32, pid: libc::pid_t, level: i32, frame: Rect| CgWindowBasics {
             wid,
@@ -1427,6 +1559,28 @@ mod tests {
         );
         assert_eq!(pids, vec![200, 300]);
         assert!(listed_pids([], own).is_empty());
+    }
+
+    #[test]
+    fn all_levels_filter_keeps_raised_windows_and_drops_unreal_ones() {
+        let window = |wid: u32, pid: libc::pid_t, level: i32, frame: Rect| CgWindowBasics {
+            wid,
+            pid,
+            level,
+            frame,
+        };
+        let frame = Rect::new(0.0, 0.0, 1440.0, 32.0);
+        let own = 7;
+        // A status-level panel is a foreign window but not a listed one.
+        let panel = window(10, 300, 25, frame);
+        assert!(panel.is_foreign_window(own));
+        assert!(!panel.is_listed(own));
+        assert!(window(11, 300, 0, frame).is_foreign_window(own));
+        assert!(window(11, 300, 0, frame).is_listed(own));
+        // No window id, our own window and an empty frame are never listed.
+        assert!(!window(0, 300, 25, frame).is_foreign_window(own));
+        assert!(!window(12, own, 25, frame).is_foreign_window(own));
+        assert!(!window(13, 300, 25, Rect::new(0.0, 0.0, 1440.0, 0.0)).is_foreign_window(own));
     }
 
     #[test]
@@ -1539,19 +1693,33 @@ mod tests {
 
     #[test]
     fn grow_clamp_is_reported_as_a_maximum() {
-        // Grow-only maximum: the shrink was free, the grow stopped at 900.
+        // Grow-only maximum: the shrink was free, the grow stopped at 850, refusing more
+        // than half of the step.
         let width_max = SizeConstraints::from_probes(
             Size::new(800.0, 600.0),
             Size::new(1.0, 1.0),
             Size::new(1.0, 1.0),
             Some(Size::new(928.0, 728.0)),
-            Some(Size::new(900.0, 728.0)),
+            Some(Size::new(850.0, 728.0)),
             None,
         );
         assert_eq!(width_max.width, AxisConstraint::Free);
         assert_eq!(width_max.height, AxisConstraint::Free);
         assert_eq!(width_max.min, None);
-        assert_eq!(width_max.max, Some(Size::new(900.0, f64::MAX)));
+        assert_eq!(width_max.max, Some(Size::new(850.0, f64::MAX)));
+
+        // A full refusal of the grow (the shrink still worked) is a maximum at the
+        // current size.
+        let refused = SizeConstraints::from_probes(
+            Size::new(800.0, 600.0),
+            Size::new(1.0, 1.0),
+            Size::new(1.0, 1.0),
+            Some(Size::new(928.0, 728.0)),
+            Some(Size::new(800.0, 728.0)),
+            None,
+        );
+        assert_eq!(refused.width, AxisConstraint::Free);
+        assert_eq!(refused.max, Some(Size::new(800.0, f64::MAX)));
 
         // A Min and a max on the same axis.
         let range = SizeConstraints::from_probes(
@@ -1564,6 +1732,55 @@ mod tests {
         );
         assert_eq!(range.width, AxisConstraint::Min { min: 642.0 });
         assert_eq!(range.max, Some(Size::new(700.0, f64::MAX)));
+    }
+
+    #[test]
+    fn grow_snapping_short_of_the_request_is_not_a_maximum() {
+        // Terminal at 896×504 with 7×14px cells: the +128 grow comes back as +126 wide and
+        // +126 high.  Recording that as a maximum was the bug.
+        let terminal = SizeConstraints::from_probes(
+            Size::new(896.0, 504.0),
+            Size::new(1.0, 1.0),
+            Size::new(140.0, 70.0),
+            Some(Size::new(1024.0, 632.0)),
+            Some(Size::new(1022.0, 630.0)),
+            None,
+        );
+        assert_eq!(terminal.width, AxisConstraint::Min { min: 140.0 });
+        assert_eq!(terminal.height, AxisConstraint::Min { min: 70.0 });
+        assert_eq!(terminal.min, Some(Size::new(140.0, 70.0)));
+        assert_eq!(terminal.max, None, "a grid snap is not a maximum");
+
+        // The threshold: a shortfall of exactly half the step is still a snap, more is not.
+        let probe = |applied_width: f64| {
+            SizeConstraints::from_probes(
+                Size::new(800.0, 600.0),
+                Size::new(1.0, 1.0),
+                Size::new(1.0, 1.0),
+                Some(Size::new(928.0, 728.0)),
+                Some(Size::new(applied_width, 728.0)),
+                None,
+            )
+            .max
+        };
+        assert_eq!(probe(928.0 - GROW_SNAP_LIMIT), None);
+        assert_eq!(
+            probe(927.0 - GROW_SNAP_LIMIT),
+            Some(Size::new(927.0 - GROW_SNAP_LIMIT, f64::MAX))
+        );
+
+        // A grow the display cap shortened to less than the limit cannot tell a maximum from
+        // a snap, even when it is refused outright; the daemon's repeated clamps decide.
+        let capped = SizeConstraints::from_probes(
+            Size::new(800.0, 600.0),
+            Size::new(1.0, 1.0),
+            Size::new(1.0, 1.0),
+            Some(Size::new(850.0, 650.0)),
+            Some(Size::new(800.0, 600.0)),
+            None,
+        );
+        assert_eq!(capped.width, AxisConstraint::Free);
+        assert_eq!(capped.max, None);
     }
 
     #[test]

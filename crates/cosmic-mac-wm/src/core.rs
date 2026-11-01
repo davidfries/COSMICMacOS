@@ -17,6 +17,31 @@
 //! siblings can absorb the difference.  A window that still refuses its tile
 //! (a frozen dimension) is reported once and then left alone: the daemon never
 //! loops on it.
+//!
+//! # Shell windows
+//!
+//! The cosmicMac panel is never managed.  [`Core`] tracks the frames of shell
+//! windows ([`rules::is_shell_window`]) and tiles into the display's work area
+//! minus the edge strips they cover ([`reserve::reserve_edges`]), like a
+//! Wayland layer-shell exclusive zone.  The panel window appears at a default
+//! position and moves to the top edge afterwards, so the reservation follows
+//! its move/resize notifications and is released when it closes.
+//!
+//! # Suspended windows
+//!
+//! A managed window that is minimized, hidden with its application (Cmd+H) or
+//! in native full screen is **suspended**: removed from the layout so its
+//! siblings re-flow and focus moves on, but remembered together with its
+//! learned size constraints.  When it is back it is re-added like a new
+//! window, on the active workspace, with the constraints re-attached.  Most
+//! platform notifications are only triggers: a window is suspended or resumed
+//! on what a fresh [`PlatformBackend::window_info`] read reports, because
+//! SkyLight's window-hidden notification may also fire for Space changes.  The
+//! Accessibility minimize and deminimize notifications are the exception: they
+//! are authoritative, because they fire as the animation starts, while the
+//! `AXMinimized` attribute still reads the old value for about half a second
+//! ([`MINIMIZE_SETTLE`]).  A suspended window is not in the layout, so it is
+//! never framed, parked, focused or probed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,6 +58,7 @@ use crate::backend::PlatformBackend;
 use crate::commands::{ClampNotice, CommandApplier};
 use crate::constraints::{self, ConstraintStats, LearnedConstraints};
 use crate::journal::Journal;
+use crate::reserve;
 use crate::rules;
 use crate::session::{SessionState, SessionStore};
 
@@ -59,6 +85,49 @@ pub struct Core {
     /// applying them.  [`Core::startup`] uses it to sync the whole initial
     /// layout once instead of re-applying every tile per inserted window.
     batch: Option<Vec<Command>>,
+    /// The display's work area (`NSScreen.visibleFrame`), before shell
+    /// reservations.  The effective area handed to the layout and the applier
+    /// is this minus [`Core::shell_strips`].
+    base_work_area: Rect,
+    /// Last known frame of every shell window (the panel).  An empty rect
+    /// (frame not known yet) reserves nothing.
+    shell_strips: HashMap<WindowId, Rect>,
+    /// Managed windows taken out of the layout while they are minimized,
+    /// hidden or in native full screen.  Their learned constraints stay in
+    /// [`Core::constraints`].
+    suspended: HashMap<WindowId, Suspended>,
+}
+
+/// A managed window that is out of the layout until it is back on screen.
+#[derive(Debug, Clone)]
+struct Suspended {
+    /// The record the layout held when the window was suspended (its `pid`
+    /// is what [`PlatformEvent::AppShown`] matches).
+    info: ToplevelInfo,
+    /// Its application is hidden.  Only [`PlatformEvent::AppShown`] for that
+    /// application clears this; a window event alone does not prove that a
+    /// hidden application's window is visible again.
+    app_hidden: bool,
+    /// When [`PlatformEvent::WindowMinimized`] suspended it.  Until
+    /// [`MINIMIZE_SETTLE`] after this, a read that reports the window not
+    /// minimized does not resume it: the attribute has not caught up yet.
+    minimized_at: Option<Instant>,
+}
+
+/// How long after an Accessibility minimize notification a window's
+/// `AXMinimized` attribute may still read false (measured at about 0.5 s in
+/// the VM, for the minimize animation).  Within it, only the deminimize
+/// notification resumes the window.
+const MINIMIZE_SETTLE: Duration = Duration::from_millis(1500);
+
+/// What asks [`Core::try_resume_at`] to re-check a suspended window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeTrigger {
+    /// Some notification that the window may be back; a fresh read decides.
+    Read,
+    /// `AXWindowDeminiaturized`: the window is no longer minimized, whatever
+    /// a read still reports.
+    Deminimized,
 }
 
 /// What [`Core::startup`] did.
@@ -74,7 +143,12 @@ pub struct StartupReport {
 }
 
 impl Core {
-    /// Create a core with an initial work area.
+    /// Create a core with the display's initial work area.  Shell windows
+    /// tracked later are reserved from it.
+    ///
+    /// The journal is opened with whatever is already on disk: entries a
+    /// crashed run left behind and `journal::restore_stale` could not restore
+    /// stay those windows' original frames.
     pub fn new(
         config: Config,
         work_area: Rect,
@@ -83,7 +157,7 @@ impl Core {
         session_path: PathBuf,
     ) -> Self {
         let layout = Layout::with_work_area(config, work_area);
-        let applier = CommandApplier::new(backend, Journal::new(journal_path), work_area);
+        let applier = CommandApplier::new(backend, Journal::open(journal_path), work_area);
         Core {
             layout,
             applier,
@@ -94,6 +168,9 @@ impl Core {
             constraints: HashMap::new(),
             constraint_stats: ConstraintStats::default(),
             batch: None,
+            base_work_area: work_area,
+            shell_strips: HashMap::new(),
+            suspended: HashMap::new(),
         }
     }
 
@@ -115,6 +192,36 @@ impl Core {
     /// Clamp/probe/retile counters (diagnostics and tests).
     pub fn constraint_stats(&self) -> ConstraintStats {
         self.constraint_stats
+    }
+
+    /// Whether `wid` is suspended: minimized, hidden or in native full screen,
+    /// and out of the layout until it is back.
+    pub fn is_suspended(&self, wid: WindowId) -> bool {
+        self.suspended.contains_key(&wid)
+    }
+
+    /// Track shell windows that were already on screen at startup (they are
+    /// not in [`PlatformBackend::windows`], which lists normal-level windows
+    /// only) and reserve their strips.
+    ///
+    /// Call before [`Core::startup`] so the initial layout tiles into the
+    /// reserved area and the session records the effective work area.  The
+    /// session is deliberately not written here: `startup` still has to read
+    /// the previous run's tiling order.
+    pub fn track_shell_windows(&mut self, windows: Vec<ToplevelInfo>) {
+        for info in windows {
+            if !rules::is_shell_window(&info) {
+                continue;
+            }
+            let frame = info.initial_frame.unwrap_or(Rect::ZERO);
+            log::info!(
+                "shell window {} ({}) at {frame:?}; reserving its strip",
+                info.wid,
+                info.app_id
+            );
+            self.shell_strips.insert(info.wid, frame);
+        }
+        self.update_effective_work_area();
     }
 
     /// Startup enumeration.  `windows` must be front-to-back (the order of
@@ -157,7 +264,7 @@ impl Core {
 
         let mut windows: Vec<ToplevelInfo> = windows
             .into_iter()
-            .filter(rules::is_manageable)
+            .filter(|info| !rules::is_shell_window(info) && rules::is_manageable(info))
             .filter(|info| self.layout.window_info(info.wid).is_none())
             .collect();
         if let Some(previous) = &previous
@@ -233,8 +340,17 @@ impl Core {
                     self.app_activated(pid, captured);
                 }
             }
-            PlatformEvent::WindowHidden { .. } | PlatformEvent::WindowShown { .. } => {}
-            PlatformEvent::WindowLevelChanged { .. } => {}
+            PlatformEvent::WindowHidden { wid } => self.window_hidden(wid),
+            PlatformEvent::WindowShown { wid } => {
+                self.try_resume_at(u64::from(wid), captured, ResumeTrigger::Read);
+            }
+            PlatformEvent::WindowMinimized { wid } => self.window_minimized(wid, captured),
+            PlatformEvent::WindowDeminimized { wid } => {
+                self.try_resume_at(u64::from(wid), captured, ResumeTrigger::Deminimized);
+            }
+            PlatformEvent::AppHidden { pid } => self.app_hidden(pid),
+            PlatformEvent::AppShown { pid } => self.app_shown(pid),
+            PlatformEvent::WindowLevelChanged { wid } => self.window_level_changed(wid),
             PlatformEvent::DisplayChanged => {}
             PlatformEvent::UnhandledSls { event, wid, len } => {
                 log::debug!("unhandled SLS event {event} wid={wid:?} len={len}");
@@ -244,13 +360,34 @@ impl Core {
 
     fn window_created(&mut self, wid: u32, pid: i32) {
         let wid = u64::from(wid);
-        if pid == self.self_pid || self.layout.window_info(wid).is_some() {
+        if self.suspended.contains_key(&wid) {
+            // SkyLight reports a window that re-appears on a Space as created;
+            // a suspended one may be back.  Never add it a second time.
+            self.try_resume(wid);
+            return;
+        }
+        if pid == self.self_pid
+            || self.layout.window_info(wid).is_some()
+            || self.shell_strips.contains_key(&wid)
+        {
             return;
         }
         let Some(info) = self.applier.backend().window_info(wid) else {
             log::debug!("window {wid} disappeared before it could be inspected");
             return;
         };
+        if rules::is_shell_window(&info) {
+            // Tracked even without a frame: its move/resize notifications
+            // fill it in.  Never managed.
+            let frame = info.initial_frame.unwrap_or(Rect::ZERO);
+            log::info!(
+                "shell window {wid} ({}) appeared at {frame:?}; reserving its strip",
+                info.app_id
+            );
+            self.shell_strips.insert(wid, frame);
+            self.recompute_work_area();
+            return;
+        }
         if !rules::is_manageable(&info) {
             log::debug!("ignoring unmanaged window {wid} ({})", info.app_id);
             return;
@@ -265,6 +402,45 @@ impl Core {
 
     fn window_destroyed(&mut self, wid: u32) {
         let wid = u64::from(wid);
+        if self.shell_strips.remove(&wid).is_some() {
+            log::info!("shell window {wid} closed; releasing its strip");
+            self.recompute_work_area();
+            return;
+        }
+        self.stop_managing(wid);
+    }
+
+    /// A managed window that leaves the normal level (a window turned into an
+    /// overlay or a floating panel) is no longer managed, like a closed one.
+    /// A window that returns to level 0 is not picked up again.
+    fn window_level_changed(&mut self, wid: u32) {
+        let wid = u64::from(wid);
+        if self.layout.window_info(wid).is_none() {
+            return;
+        }
+        let Some(info) = self.applier.backend().window_info(wid) else {
+            return;
+        };
+        if info.level == 0 {
+            return;
+        }
+        log::info!(
+            "window {wid} ({}) moved to level {}; no longer managing it",
+            info.app_id,
+            info.level
+        );
+        if !self.applier.is_visible(wid) {
+            // Parked on another workspace: bring it back from the corner
+            // first, or it would stay there once we stop managing it.
+            self.apply(vec![Command::Show { wid }]);
+        }
+        self.stop_managing(wid);
+    }
+
+    /// Remove a window from the layout (or from the suspended set) and forget
+    /// the applier's and the learned-constraint state for it.
+    fn stop_managing(&mut self, wid: WindowId) {
+        self.suspended.remove(&wid);
         let commands = if self.layout.window_info(wid).is_some() {
             self.layout.window_removed(wid)
         } else {
@@ -275,9 +451,246 @@ impl Core {
         self.apply(commands);
     }
 
+    /// A window was hidden or minimized, according to the platform.
+    ///
+    /// SkyLight's window-hidden notification may also fire when a Space
+    /// change orders windows out, so it is only a trigger: the window is
+    /// suspended when a fresh read reports it minimized (or in full screen).
+    fn window_hidden(&mut self, wid: u32) {
+        let wid = u64::from(wid);
+        if self.layout.window_info(wid).is_none() {
+            return;
+        }
+        if !self.suspend_if_away(wid) {
+            log::debug!("window {wid}: hidden notification, but not minimized; ignoring it");
+        }
+    }
+
+    /// Accessibility reported the window minimized: suspend it without a
+    /// re-read, which would still report it on screen.
+    fn window_minimized(&mut self, wid: u32, captured: Instant) {
+        let wid = u64::from(wid);
+        if self.layout.window_info(wid).is_none() {
+            return;
+        }
+        self.suspend(wid, "was minimized", false);
+        if let Some(suspended) = self.suspended.get_mut(&wid) {
+            suspended.minimized_at = Some(captured);
+        }
+    }
+
+    /// Re-read a managed window and suspend it when it is minimized or in
+    /// native full screen.  Returns whether it was suspended.
+    fn suspend_if_away(&mut self, wid: WindowId) -> bool {
+        if self.layout.window_info(wid).is_none() {
+            return false;
+        }
+        let Some(reason) = self
+            .applier
+            .backend()
+            .window_info(wid)
+            .as_ref()
+            .and_then(away_reason)
+        else {
+            return false;
+        };
+        self.suspend(wid, reason, false);
+        true
+    }
+
+    /// Take a managed window out of the layout until it is back on screen.
+    ///
+    /// The rest of the layout re-flows and focus moves on, as for a closed
+    /// window.  Unlike [`Core::stop_managing`], the learned constraints and
+    /// the journal entry are kept ([`CommandApplier::release_window`]); a
+    /// window parked on another workspace stays parked and is not moved.
+    fn suspend(&mut self, wid: WindowId, reason: &str, app_hidden: bool) {
+        let Some(info) = self.layout.window_info(wid).cloned() else {
+            return;
+        };
+        log::info!(
+            "window {wid} ({}) {reason}; suspending it until it is back",
+            info.app_id
+        );
+        let commands = self.layout.window_removed(wid);
+        self.applier.release_window(wid);
+        self.suspended.insert(
+            wid,
+            Suspended {
+                info,
+                app_hidden,
+                minimized_at: None,
+            },
+        );
+        self.apply(commands);
+    }
+
+    /// Re-read a suspended window and put it back into the layout when it is
+    /// manageable again (not minimized, not in full screen, normal level).
+    ///
+    /// It is added like a new window, on the active workspace, with its
+    /// learned constraints re-attached.  Returns whether it was resumed.
+    fn try_resume(&mut self, wid: WindowId) -> bool {
+        self.try_resume_at(wid, Instant::now(), ResumeTrigger::Read)
+    }
+
+    /// [`Core::try_resume`] for a trigger captured at `captured`.
+    ///
+    /// A window minimized less than [`MINIMIZE_SETTLE`] before `captured`
+    /// stays suspended on a [`ResumeTrigger::Read`]: its attribute still
+    /// reads false during the minimize animation, and the animation itself
+    /// sends move and focus notifications.  [`ResumeTrigger::Deminimized`]
+    /// overrides the minimized flag of the read for the same reason.
+    fn try_resume_at(&mut self, wid: WindowId, captured: Instant, trigger: ResumeTrigger) -> bool {
+        let Some(suspended) = self.suspended.get_mut(&wid) else {
+            return false;
+        };
+        if trigger == ResumeTrigger::Deminimized {
+            suspended.minimized_at = None;
+        }
+        if suspended.app_hidden {
+            return false;
+        }
+        if suspended
+            .minimized_at
+            .is_some_and(|at| captured < at + MINIMIZE_SETTLE)
+        {
+            return false;
+        }
+        let had_ax_data = suspended.info.role.is_some();
+        let Some(mut info) = self.applier.backend().window_info(wid) else {
+            // Gone; its destroy notification cleans up.
+            return false;
+        };
+        if trigger == ResumeTrigger::Deminimized {
+            info.minimized = false;
+        }
+        if had_ax_data && info.role.is_none() {
+            // Accessibility did not answer, so the minimized and full-screen
+            // flags read as false without meaning it.  Wait for the next
+            // trigger instead of tiling a window that may still be away.
+            log::debug!("window {wid}: unreadable through AX; keeping it suspended");
+            return false;
+        }
+        if rules::is_shell_window(&info) || !rules::is_manageable(&info) {
+            return false;
+        }
+        self.suspended.remove(&wid);
+        let info = match self.constraints.get(&wid).copied() {
+            Some(learned) => constraints::attach(info, learned),
+            None => info,
+        };
+        log::info!("window {wid} ({}) is back; managing it again", info.app_id);
+        self.add_window(info);
+        true
+    }
+
+    /// An application was hidden (Cmd+H): suspend every managed window it
+    /// owns, on any workspace, and re-flow once.
+    fn app_hidden(&mut self, pid: i32) {
+        for suspended in self.suspended.values_mut() {
+            if suspended.info.pid == pid {
+                // Minimized earlier: it now needs the application shown too.
+                suspended.app_hidden = true;
+            }
+        }
+        let wids: Vec<WindowId> = self
+            .layout
+            .windows()
+            .into_iter()
+            .filter(|state| state.info.pid == pid)
+            .map(|state| state.info.wid)
+            .collect();
+        if wids.is_empty() {
+            return;
+        }
+        self.batched(|core| {
+            for wid in wids {
+                core.suspend(wid, "was hidden with its application", true);
+            }
+        });
+    }
+
+    /// A hidden application was shown again: resume its suspended windows
+    /// that are back (a minimized one stays suspended).
+    fn app_shown(&mut self, pid: i32) {
+        let mut wids: Vec<WindowId> = self
+            .suspended
+            .iter_mut()
+            .filter(|(_, suspended)| suspended.info.pid == pid)
+            .map(|(wid, suspended)| {
+                suspended.app_hidden = false;
+                *wid
+            })
+            .collect();
+        if wids.is_empty() {
+            return;
+        }
+        wids.sort_unstable();
+        self.batched(|core| {
+            for wid in wids {
+                core.try_resume(wid);
+            }
+        });
+    }
+
+    /// Whether `frame` contains the display's whole work area (within a
+    /// pixel), which a window in native full screen does.
+    ///
+    /// The cheap pre-check before re-reading a window for full screen: a tile
+    /// never exceeds the work area, and a tile-sized frame at the tile's
+    /// position is an echo, so ordinary drags and resizes never pay for the
+    /// extra read.  Uses the main display's area (multi-display is not
+    /// modelled yet).
+    fn contains_work_area(&self, frame: Rect) -> bool {
+        let area = self.base_work_area;
+        frame.x <= area.x + 1.0
+            && frame.y <= area.y + 1.0
+            && frame.right() + 1.0 >= area.right()
+            && frame.bottom() + 1.0 >= area.bottom()
+    }
+
+    /// Run `f` with the layout commands collected, then apply them once,
+    /// compacted, dropping commands for windows that have left the layout in
+    /// the meantime (an earlier re-flow may have framed a window suspended
+    /// later in the same batch).
+    fn batched(&mut self, f: impl FnOnce(&mut Self)) {
+        if self.batch.is_some() {
+            f(self);
+            return;
+        }
+        self.batch = Some(Vec::new());
+        f(self);
+        let mut commands = compact_commands(self.batch.take().unwrap_or_default());
+        commands.retain(|command| {
+            command_window(command).is_none_or(|wid| self.layout.window_info(wid).is_some())
+        });
+        self.apply(commands);
+    }
+
     fn window_geometry(&mut self, wid: u32, frame: cosmic_mac_platform::Rect, captured: Instant) {
         let wid = u64::from(wid);
         let frame = rect_from_platform(frame);
+        if let Some(strip) = self.shell_strips.get_mut(&wid) {
+            // A failed bounds read arrives as an empty frame; keep the last
+            // known one.
+            if frame.is_empty() || *strip == frame {
+                return;
+            }
+            log::debug!("shell window {wid} moved to {frame:?}");
+            *strip = frame;
+            self.recompute_work_area();
+            return;
+        }
+        if self.suspended.contains_key(&wid) {
+            // Leaving full screen resizes the window back; it may be manageable
+            // again.
+            self.try_resume_at(wid, captured, ResumeTrigger::Read);
+            return;
+        }
+        // The size the app last accepted; read it before the echo check, which
+        // forgets it once it judges this a user move.
+        let accepted = self.applier.programmed_frame(wid);
         if self.applier.is_echo_at(wid, frame, captured) {
             return;
         }
@@ -289,6 +702,13 @@ impl Core {
         else {
             return;
         };
+        // Entering native full screen resizes the window over the whole
+        // display.  Check for it before the snap-back below would fight the
+        // transition; the extra read only happens for frames that contain the
+        // work area.
+        if self.contains_work_area(frame) && self.suspend_if_away(wid) {
+            return;
+        }
         if !state.visible {
             // A parked window being moved by us (or the compositor) is not a
             // user move; never fight it.
@@ -304,9 +724,13 @@ impl Core {
         // platform probe cache and the learned bounds so the next clamp probes
         // the application again instead of trusting a stale minimum/maximum.
         // A pure move (title-bar drag) keeps the size, and with it a good probe.
+        // Compare with the size the app last accepted, not the layout tile: a
+        // grid-snapping app (Terminal) always sits a few px off its tile, so a
+        // plain drag would otherwise count as a resize.
         let tolerance = crate::backend::AppliedFrame::TOLERANCE;
-        if (frame.width - state.frame.width).abs() > tolerance
-            || (frame.height - state.frame.height).abs() > tolerance
+        let known = accepted.unwrap_or(state.frame);
+        if (frame.width - known.width).abs() > tolerance
+            || (frame.height - known.height).abs() > tolerance
         {
             self.invalidate_constraints(wid);
         }
@@ -354,6 +778,13 @@ impl Core {
     }
 
     fn external_focus(&mut self, wid: WindowId, captured: Instant) {
+        if self.suspended.contains_key(&wid) {
+            // A suspended window that takes focus is probably back (a
+            // full-screen exit whose resize was read too early, a deminimize
+            // whose notification was missed).  Re-check it; resuming focuses it.
+            self.try_resume_at(wid, captured, ResumeTrigger::Read);
+            return;
+        }
         if self.layout.window_info(wid).is_none() {
             return;
         }
@@ -440,6 +871,11 @@ impl Core {
                 for wid in managed {
                     let _ = self.layout.window_removed(wid);
                 }
+                // Suspended windows were restored from the journal as well;
+                // they are not managed again when they come back either.
+                for wid in std::mem::take(&mut self.suspended).into_keys() {
+                    self.constraints.remove(&wid);
+                }
                 // The discarded commands included the tab bar's removal; hide the
                 // overlay explicitly so it does not float over a restored window.
                 if let Err(error) = self.applier.sync_stack_bar(None) {
@@ -451,24 +887,50 @@ impl Core {
         }
     }
 
-    /// Display work area changed.  Every window is re-tiled onto the new area
-    /// by the layout, and the new area is recorded for the next restart.
+    /// Display work area changed.  Shell strips are reserved from the new
+    /// area, every window is re-tiled onto the result by the layout, and the
+    /// result is recorded for the next restart.
     pub fn set_work_area(&mut self, work_area: Rect) {
-        if work_area == self.applier.work_area() {
-            return;
+        self.base_work_area = work_area;
+        self.recompute_work_area();
+    }
+
+    /// Recompute the effective work area after the display's area or a shell
+    /// strip changed; re-tile and persist when it actually changed.
+    fn recompute_work_area(&mut self) {
+        if self.update_effective_work_area() {
+            self.persist_session();
         }
-        log::info!("work area changed to {work_area:?}");
+    }
+
+    /// Hand the display's work area minus the shell strips to the applier
+    /// and the layout.  Returns false (and does nothing) when it is unchanged.
+    fn update_effective_work_area(&mut self) -> bool {
+        let strips: Vec<Rect> = self.shell_strips.values().copied().collect();
+        let work_area = reserve::reserve_edges(self.base_work_area, &strips);
+        if work_area == self.applier.work_area() {
+            return false;
+        }
+        if work_area == self.base_work_area {
+            log::info!("work area changed to {work_area:?}");
+        } else {
+            log::info!(
+                "work area changed to {work_area:?} (display {:?} minus shell strips)",
+                self.base_work_area
+            );
+        }
         self.applier.set_work_area(work_area);
         let commands = self.layout.set_work_area(work_area);
         self.apply(commands);
-        self.persist_session();
+        true
     }
 
-    /// Restore every touched window and drop the journal.
+    /// Restore every touched window; the journal keeps only the entries whose restore failed.
     pub fn shutdown(&mut self) {
         self.persist_session();
         let restored = self.applier.restore_all();
         self.constraints.clear();
+        self.suspended.clear();
         log::info!("shutdown: restored {restored} windows");
     }
 
@@ -554,6 +1016,18 @@ impl Core {
     /// React to a frame the platform refused: learn the window's constraint,
     /// re-tile the layout with it and re-apply the recomputed frames.
     fn handle_clamp(&mut self, clamp: ClampNotice, depth: u8) {
+        if self.layout.window_info(clamp.wid).is_none() {
+            // Suspended or closed since the frame was applied: never probe a
+            // window the layout does not hold.
+            return;
+        }
+        // A window minimized (or gone full screen) before its notification
+        // arrived refuses its tile for that reason, not because of a size
+        // limit.  Suspend it instead of probing it, which would pin a bogus
+        // bound.
+        if self.suspend_if_away(clamp.wid) {
+            return;
+        }
         if depth >= MAX_CONSTRAINT_PASSES {
             // The re-tile could not fix it either (a frozen dimension).  Log
             // once per window and dimension, then leave the window alone.
@@ -578,7 +1052,9 @@ impl Core {
     /// frozen dimension, so the authoritative answer comes from the platform's
     /// shrink **and** grow probe.  Candidates are promoted only after that
     /// probe succeeds; a failed probe keeps them as evidence but never pins a
-    /// bound.
+    /// bound.  Even then a candidate needs the probe to explain it or a repeat
+    /// from a different request (see [`LearnedConstraints::promote_candidates`]),
+    /// so a grid-snapping app is never pinned at a snapped size.
     fn learn_constraints(&mut self, clamp: ClampNotice) {
         let wid = clamp.wid;
         self.constraints
@@ -591,8 +1067,10 @@ impl Core {
             .get(&wid)
             .is_some_and(|constraints| constraints.probed)
         {
-            // Already probed this session: the new observation can tighten the
-            // confirmed bounds (for example a Terminal grid snap).
+            // Already probed this session: the new observation tightens the
+            // confirmed bounds only when the probe explains it or it repeats an
+            // earlier clamp from a different request.  A Terminal grid snap
+            // does neither.
             self.constraints
                 .entry(wid)
                 .or_default()
@@ -670,7 +1148,7 @@ impl Core {
     /// **never** pin a bound by itself: `got > want` only proves the app would
     /// not shrink to `want`, not that the dimension is frozen.  If a probe has
     /// already confirmed the window, the candidate is merged into the
-    /// authoritative bounds.
+    /// authoritative bounds under the same rules as any other clamp.
     fn record_stuck(&mut self, clamp: ClampNotice) {
         let wid = clamp.wid;
         let Some(want) = self.layout.frame_of(wid) else {
@@ -794,6 +1272,32 @@ fn compact_commands(commands: Vec<Command>) -> Vec<Command> {
     kept
 }
 
+/// Why a window is temporarily out of view, if it is: minimized or in native
+/// full screen.  (A hidden application is reported per application, not
+/// per window.)
+fn away_reason(info: &ToplevelInfo) -> Option<&'static str> {
+    if info.minimized {
+        Some("was minimized")
+    } else if info.fullscreen {
+        Some("entered native full screen")
+    } else {
+        None
+    }
+}
+
+/// The window a command targets, if any.
+fn command_window(command: &Command) -> Option<WindowId> {
+    match command {
+        Command::SetFrame { wid, .. }
+        | Command::Raise { wid }
+        | Command::Hide { wid }
+        | Command::Show { wid }
+        | Command::Focus { wid }
+        | Command::Close { wid } => Some(*wid),
+        Command::Unfocus | Command::ActivateWorkspace { .. } | Command::StackChanged { .. } => None,
+    }
+}
+
 fn rect_from_platform(rect: cosmic_mac_platform::Rect) -> cosmic_mac_protocol::Rect {
     cosmic_mac_protocol::Rect::new(
         rect.origin.x,
@@ -837,7 +1341,60 @@ mod tests {
         min_sizes: HashMap<WindowId, Size>,
         frozen_width: HashMap<WindowId, f64>,
         frozen_height: HashMap<WindowId, f64>,
+        /// Resize-grid cell per window (Terminal-style snapping).
+        grids: HashMap<WindowId, Size>,
+        /// Enforced maximum per window, and whether the probe reports it.
+        max_sizes: HashMap<WindowId, (Size, bool)>,
         probe_fails: bool,
+        /// Per-window metadata that differs from the defaults (app id
+        /// `com.example.app`, its own pid, level 0, not minimized, not full
+        /// screen, readable through AX).
+        overrides: HashMap<WindowId, InfoOverride>,
+        /// `window_info` calls, to check that hot paths do not re-read.
+        info_reads: usize,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct InfoOverride {
+        app_id: Option<&'static str>,
+        pid: Option<i32>,
+        level: i32,
+        minimized: bool,
+        fullscreen: bool,
+        /// AX does not answer: like the real backend, the record falls back to
+        /// CoreGraphics data, without a role and with the minimized and
+        /// full-screen flags reading false.
+        ax_unreadable: bool,
+    }
+
+    impl State {
+        /// The record the backend reports for `wid` at `frame`.
+        fn toplevel(&self, wid: WindowId, frame: Rect) -> ToplevelInfo {
+            let info = self.overrides.get(&wid).cloned().unwrap_or_default();
+            let mut toplevel =
+                ToplevelInfo::new(wid, info.app_id.unwrap_or("com.example.app"), "title")
+                    .with_pid(info.pid.unwrap_or(test_pid(wid)))
+                    .with_initial_frame(frame)
+                    .with_level(info.level);
+            if !info.ax_unreadable {
+                toplevel.role = Some("AXWindow".into());
+                toplevel = toplevel
+                    .with_minimized(info.minimized)
+                    .with_fullscreen(info.fullscreen);
+            }
+            toplevel
+        }
+
+        /// Every window, front-to-back.
+        fn toplevels(&self) -> Vec<ToplevelInfo> {
+            self.order
+                .iter()
+                .filter_map(|wid| {
+                    let frame = self.frames.get(wid).copied()?;
+                    Some(self.toplevel(*wid, frame))
+                })
+                .collect()
+        }
     }
 
     struct TestBackend {
@@ -856,9 +1413,67 @@ mod tests {
                     min_sizes: HashMap::new(),
                     frozen_width: HashMap::new(),
                     frozen_height: HashMap::new(),
+                    grids: HashMap::new(),
+                    max_sizes: HashMap::new(),
                     probe_fails: false,
+                    overrides: HashMap::new(),
+                    info_reads: 0,
                 }),
             }
+        }
+
+        /// A window that appears after startup (front-most).
+        fn add_window(&self, wid: WindowId, frame: Rect) {
+            let mut state = self.state.lock().unwrap();
+            state.frames.insert(wid, frame);
+            state.order.insert(0, wid);
+        }
+
+        /// A window that closed.
+        fn remove_window(&self, wid: WindowId) {
+            let mut state = self.state.lock().unwrap();
+            state.frames.remove(&wid);
+            state.order.retain(|other| *other != wid);
+        }
+
+        fn set_app_id(&self, wid: WindowId, app_id: &'static str) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().app_id = Some(app_id);
+        }
+
+        fn set_level(&self, wid: WindowId, level: i32) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().level = level;
+        }
+
+        fn set_minimized(&self, wid: WindowId, minimized: bool) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().minimized = minimized;
+        }
+
+        fn set_fullscreen(&self, wid: WindowId, fullscreen: bool) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().fullscreen = fullscreen;
+        }
+
+        fn set_pid(&self, wid: WindowId, pid: i32) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().pid = Some(pid);
+        }
+
+        fn set_ax_unreadable(&self, wid: WindowId, unreadable: bool) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().ax_unreadable = unreadable;
+        }
+
+        /// Move or resize a window behind the daemon's back (the user, the
+        /// app or the system did it).
+        fn set_frame_externally(&self, wid: WindowId, frame: Rect) {
+            self.state.lock().unwrap().frames.insert(wid, frame);
+        }
+
+        fn info_reads(&self) -> usize {
+            self.state.lock().unwrap().info_reads
         }
 
         fn calls(&self) -> Vec<Call> {
@@ -875,6 +1490,22 @@ mod tests {
 
         fn simulate_frozen_width(&self, wid: WindowId, width: f64) {
             self.state.lock().unwrap().frozen_width.insert(wid, width);
+        }
+
+        /// Terminal-style resize grid: widths round down to `cell.width`,
+        /// heights to the nearest `cell.height`.  The probe reports no maximum,
+        /// as the platform's grow probe does for a snapped grow.
+        fn simulate_grid(&self, wid: WindowId, cell: Size) {
+            self.state.lock().unwrap().grids.insert(wid, cell);
+        }
+
+        /// An enforced maximum; `probe_reports` says whether the probe finds it.
+        fn set_max_size(&self, wid: WindowId, size: Size, probe_reports: bool) {
+            self.state
+                .lock()
+                .unwrap()
+                .max_sizes
+                .insert(wid, (size, probe_reports));
         }
 
         fn fail_probes(&self) {
@@ -908,6 +1539,14 @@ mod tests {
             if let Some(frozen) = state.frozen_height.get(&wid) {
                 applied.height = *frozen;
             }
+            if let Some(cell) = state.grids.get(&wid) {
+                applied.width = (applied.width / cell.width).floor() * cell.width;
+                applied.height = (applied.height / cell.height).round() * cell.height;
+            }
+            if let Some((max, _)) = state.max_sizes.get(&wid) {
+                applied.width = applied.width.min(max.width);
+                applied.height = applied.height.min(max.height);
+            }
             if let Some(min) = state.min_sizes.get(&wid) {
                 applied.width = applied.width.max(min.width);
                 applied.height = applied.height.max(min.height);
@@ -927,6 +1566,10 @@ mod tests {
             let mut min_height = min.map(|size| size.height);
             let mut max_width = None;
             let mut max_height = None;
+            if let Some((max, true)) = state.max_sizes.get(&wid).copied() {
+                max_width = Some(max.width);
+                max_height = Some(max.height);
+            }
             if let Some(frozen) = state.frozen_width.get(&wid) {
                 min_width = Some(*frozen);
                 max_width = Some(*frozen);
@@ -998,23 +1641,22 @@ mod tests {
             self.frame(wid)
         }
         fn window_info(&self, wid: WindowId) -> Option<ToplevelInfo> {
-            self.frame(wid).map(|frame| {
-                ToplevelInfo::new(wid, "com.example.app", "title")
-                    .with_pid(test_pid(wid))
-                    .with_initial_frame(frame)
-            })
+            let mut state = self.state.lock().unwrap();
+            state.info_reads += 1;
+            let frame = state.frames.get(&wid).copied()?;
+            Some(state.toplevel(wid, frame))
         }
         fn windows(&self) -> Vec<ToplevelInfo> {
+            // Unfiltered: the core must apply the level/minimized/shell rules
+            // itself.
+            self.state.lock().unwrap().toplevels()
+        }
+        fn shell_windows(&self) -> Vec<ToplevelInfo> {
             let state = self.state.lock().unwrap();
             state
-                .order
-                .iter()
-                .filter_map(|wid| state.frames.get(wid).copied().map(|frame| (*wid, frame)))
-                .map(|(wid, frame)| {
-                    ToplevelInfo::new(wid, "com.example.app", "title")
-                        .with_pid(test_pid(wid))
-                        .with_initial_frame(frame)
-                })
+                .toplevels()
+                .into_iter()
+                .filter(rules::is_shell_window)
                 .collect()
         }
         fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()> {
@@ -1523,6 +2165,170 @@ mod tests {
     }
 
     #[test]
+    fn grid_snapping_terminals_are_never_pinned_or_centred() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        // Two Terminals side by side: 7×14px character cells (a 900×500 tile
+        // comes back as 896×504) and a 20×5 cell minimum.
+        for wid in [1, 2] {
+            backend.simulate_grid(wid, Size::new(7.0, 14.0));
+            backend.set_min_size(wid, Size::new(140.0, 70.0));
+        }
+
+        // The 900×500 tiles come back between other layouts, and once with
+        // requests that round to the same cells.
+        for (width, height) in [
+            (1800.0, 500.0),
+            (1900.0, 520.0),
+            (1800.0, 500.0),
+            (2000.0, 560.0),
+            (1804.0, 497.0),
+            (1800.0, 500.0),
+        ] {
+            core.set_work_area(Rect::new(0.0, 0.0, width, height));
+            // Flush tiles: each Terminal keeps half the width and the full
+            // height, so nothing is centred with gaps.
+            for wid in [1, 2] {
+                let tile = core.layout().frame_of(wid).expect("tile");
+                assert_eq!(
+                    (tile.width, tile.height),
+                    (width / 2.0, height),
+                    "window {wid} in a {width}x{height} work area"
+                );
+            }
+        }
+
+        assert_eq!(
+            backend.frame(1).map(|frame| (frame.width, frame.height)),
+            Some((896.0, 504.0))
+        );
+        assert_eq!(core.constraint_stats().probes, 2, "one probe per window");
+        for wid in [1, 2] {
+            let constraints = core.constraints(wid).expect("constraints");
+            assert!(constraints.confirmed);
+            assert_eq!(
+                constraints.max, None,
+                "window {wid}: a snap pinned a maximum"
+            );
+            assert_eq!(
+                constraints.min,
+                Some(Size::new(140.0, 70.0)),
+                "window {wid}: a snap raised the minimum"
+            );
+            let info = core.layout().window_info(wid).expect("window info");
+            assert_eq!(info.max_size, None);
+            assert_eq!(info.min_size, Some(Size::new(140.0, 70.0)));
+        }
+    }
+
+    #[test]
+    fn title_bar_drag_of_a_grid_snapped_window_keeps_its_constraints() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        for wid in [1, 2] {
+            backend.simulate_grid(wid, Size::new(7.0, 14.0));
+            backend.set_min_size(wid, Size::new(140.0, 70.0));
+        }
+        core.set_work_area(Rect::new(0.0, 0.0, 1800.0, 500.0));
+        let learned = core.constraints(1).expect("constraints after the clamp");
+        let probes = core.constraint_stats().probes;
+        let snapped = backend.frame(1).expect("frame");
+        assert_ne!(
+            (snapped.width, snapped.height),
+            (900.0, 500.0),
+            "the grid must leave the window off its tile"
+        );
+        core.applier.set_debounce(Duration::ZERO);
+
+        // A title-bar drag: same (snapped) size, new position.
+        let dragged = Rect::new(
+            snapped.x + 40.0,
+            snapped.y + 30.0,
+            snapped.width,
+            snapped.height,
+        );
+        backend.state.lock().unwrap().frames.insert(1, dragged);
+        core.platform_event_at(
+            PlatformEvent::WindowMoved {
+                wid: 1,
+                frame: PlatformRect::new(dragged.x, dragged.y, dragged.width, dragged.height),
+            },
+            Instant::now(),
+        );
+
+        // A resize would drop the learned bounds, and the snap-back would then
+        // clamp and probe the window again.
+        assert_eq!(
+            core.constraint_stats().probes,
+            probes,
+            "a pure move must not count as a user resize"
+        );
+        assert_eq!(core.constraints(1), Some(learned));
+    }
+
+    #[test]
+    fn a_real_maximum_the_probe_missed_is_learned_when_it_repeats() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        // The app caps its width at 800px, but the window is already wider
+        // than the grow probe's display cap, so the probe cannot see it.
+        backend.set_max_size(1, Size::new(800.0, f64::MAX), false);
+
+        core.set_work_area(Rect::new(0.0, 0.0, 1800.0, 800.0));
+        assert_eq!(core.constraint_stats().probes, 1);
+        assert_eq!(
+            core.constraints(1).and_then(|constraints| constraints.max),
+            None,
+            "one clamp is not a bound"
+        );
+
+        // A different request stops at the same 800px: that is a bound.
+        core.set_work_area(Rect::new(0.0, 0.0, 2000.0, 800.0));
+        assert_eq!(core.constraint_stats().probes, 1, "no re-probe");
+        assert_eq!(
+            core.constraints(1).and_then(|constraints| constraints.max),
+            Some(Size::new(800.0, f64::MAX))
+        );
+        assert_eq!(
+            core.layout().window_info(1).and_then(|info| info.max_size),
+            Some(Size::new(800.0, f64::MAX))
+        );
+        // The sibling absorbs the rest: flush, no gap.
+        assert_eq!(backend.frame(1).map(|frame| frame.width), Some(800.0));
+        assert_eq!(backend.frame(2).map(|frame| frame.width), Some(1200.0));
+    }
+
+    #[test]
+    fn a_maximum_confirmed_by_the_probe_is_learned_from_the_first_clamp() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        backend.set_max_size(1, Size::new(800.0, f64::MAX), true);
+
+        core.set_work_area(Rect::new(0.0, 0.0, 1800.0, 800.0));
+
+        assert_eq!(core.constraint_stats().probes, 1);
+        assert_eq!(
+            core.constraints(1).and_then(|constraints| constraints.max),
+            Some(Size::new(800.0, f64::MAX))
+        );
+        assert_eq!(core.constraint_stats().warnings, 0, "the re-tile is flush");
+        assert_eq!(backend.frame(1).map(|frame| frame.width), Some(800.0));
+        assert_eq!(backend.frame(2).map(|frame| frame.width), Some(1000.0));
+    }
+
+    #[test]
     fn list_windows_reports_the_actual_frame_next_to_the_layout_frame() {
         let (mut core, backend, _dir) = core(&[
             (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
@@ -1595,8 +2401,8 @@ mod tests {
             constraints.max, None,
             "a Min candidate must not invent a max"
         );
-        assert_eq!(constraints.candidate_min.width, Some(715.0));
-        assert!(constraints.candidate_max.width.is_none());
+        assert_eq!(constraints.candidate_min.width(), Some(715.0));
+        assert!(constraints.candidate_max.width().is_none());
 
         // Further layout passes retry the probe up to the cap, then stop; the
         // stuck warning is not repeated.
@@ -1624,7 +2430,7 @@ mod tests {
         assert!(!constraints.confirmed);
         assert_eq!(constraints.min, None);
         assert_eq!(constraints.max, None);
-        assert_eq!(constraints.candidate_min.width, Some(715.0));
+        assert_eq!(constraints.candidate_min.width(), Some(715.0));
     }
 
     #[test]
@@ -1672,7 +2478,7 @@ mod tests {
         assert!(!constraints.confirmed);
         assert_eq!(constraints.min, None);
         assert_eq!(constraints.max, None);
-        assert_eq!(constraints.candidate_min.width, Some(700.0));
+        assert_eq!(constraints.candidate_min.width(), Some(700.0));
     }
 
     #[test]
@@ -1934,6 +2740,33 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_journal_entry_survives_startup_and_is_restored_at_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("frame-journal.ron");
+        let original = Rect::new(10.0, 20.0, 400.0, 300.0);
+        // The crashed run's replay failed for window 1, which is still where
+        // parking left it on the 1920×1080 display.
+        Journal::new(&journal_path).record(1, original, Some(test_pid(1)));
+        let parked = Rect::new(1919.0, 1079.0, 400.0, 300.0);
+        let backend = Arc::new(TestBackend::new(&[(1, parked)], WORK_AREA));
+        let mut core = Core::new(
+            Config::default(),
+            WORK_AREA,
+            backend.clone(),
+            journal_path.clone(),
+            dir.path().join("wm-session.ron"),
+        );
+
+        core.startup(backend.windows());
+        assert_ne!(backend.frame(1), Some(parked), "the layout tiles it");
+        assert_eq!(core.applier().journal().get(1), Some(original));
+
+        core.shutdown();
+        assert_eq!(backend.frame(1), Some(original));
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
     fn work_area_change_reframes_every_window() {
         let (mut core, backend, _dir) = core(&[
             (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
@@ -2048,5 +2881,919 @@ mod tests {
             .expect("session");
         assert_eq!(recorded.work_area, Some(WORK_AREA));
         assert_eq!(recorded.tiled_order, vec![1]);
+    }
+
+    /// The panel's window id in the shell-window tests.
+    const PANEL: WindowId = 10;
+    /// The panel at the top edge of [`WORK_AREA`], full width.
+    const PANEL_STRIP: Rect = Rect::new(0.0, 0.0, 1000.0, 32.0);
+    /// [`WORK_AREA`] minus [`PANEL_STRIP`].
+    const RESERVED: Rect = Rect::new(0.0, 32.0, 1000.0, 768.0);
+
+    fn platform_rect(rect: Rect) -> PlatformRect {
+        PlatformRect::new(rect.x, rect.y, rect.width, rect.height)
+    }
+
+    fn created(wid: WindowId) -> PlatformEvent {
+        PlatformEvent::WindowCreated {
+            wid: wid as u32,
+            pid: test_pid(wid),
+        }
+    }
+
+    fn recorded_work_area(dir: &tempfile::TempDir) -> Option<Rect> {
+        SessionStore::new(dir.path().join("wm-session.ron"))
+            .load()
+            .and_then(|state| state.work_area)
+    }
+
+    /// Every window in `wids` is framed inside `area`, and together they tile
+    /// all of it.
+    fn assert_tiles_cover(backend: &TestBackend, wids: &[WindowId], area: Rect) {
+        let mut covered = 0.0;
+        for &wid in wids {
+            let frame = backend.frame(wid).expect("frame");
+            assert!(
+                frame.x >= area.x - 0.5
+                    && frame.y >= area.y - 0.5
+                    && frame.right() <= area.right() + 0.5
+                    && frame.bottom() <= area.bottom() + 0.5,
+                "window {wid} frame {frame:?} outside {area:?}"
+            );
+            covered += frame.area();
+        }
+        assert!(
+            (covered - area.area()).abs() < 1.0,
+            "tiles cover {covered}, not {} of {area:?}",
+            area.area()
+        );
+    }
+
+    #[test]
+    fn window_created_above_the_normal_level_is_not_managed() {
+        let (mut core, backend, _dir) = core(&[(1, Rect::new(0.0, 0.0, 400.0, 300.0))]);
+        core.startup(backend.windows());
+        // A Spotlight-like overlay at a raised level.
+        backend.add_window(2, Rect::new(200.0, 150.0, 600.0, 60.0));
+        backend.set_level(2, 25);
+        let marker = backend.calls().len();
+
+        core.platform_event(created(2));
+
+        assert!(core.layout().window_info(2).is_none());
+        let calls = backend.calls();
+        assert!(calls[marker..].is_empty(), "{calls:?}");
+        assert_eq!(backend.frame(1), Some(WORK_AREA));
+
+        // A normal window created next is still managed.
+        backend.add_window(3, Rect::new(0.0, 0.0, 400.0, 300.0));
+        core.platform_event(created(3));
+        assert!(core.layout().window_info(3).is_some());
+    }
+
+    #[test]
+    fn minimized_window_created_later_is_not_managed() {
+        let (mut core, backend, _dir) = core(&[(1, Rect::new(0.0, 0.0, 400.0, 300.0))]);
+        core.startup(backend.windows());
+        backend.add_window(2, Rect::new(0.0, 0.0, 400.0, 300.0));
+        backend.set_minimized(2, true);
+        let marker = backend.calls().len();
+
+        core.platform_event(created(2));
+
+        assert!(core.layout().window_info(2).is_none());
+        let calls = backend.calls();
+        assert!(calls[marker..].is_empty(), "{calls:?}");
+        assert_eq!(backend.frame(1), Some(WORK_AREA));
+    }
+
+    #[test]
+    fn startup_skips_raised_and_minimized_windows() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (3, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        backend.set_level(2, 3);
+        backend.set_minimized(3, true);
+
+        let report = core.startup(backend.windows());
+
+        assert_eq!(report.added, 1);
+        assert_eq!(report.order, vec![1]);
+        assert_eq!(backend.frame(1), Some(WORK_AREA));
+    }
+
+    #[test]
+    fn managed_window_leaving_the_normal_level_is_removed_and_the_rest_reflow() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+        assert!(core.applier().journal().contains(2));
+
+        // A level event that leaves the window at level 0 changes nothing.
+        let marker = backend.calls().len();
+        core.platform_event(PlatformEvent::WindowLevelChanged { wid: 2 });
+        assert!(core.layout().window_info(2).is_some());
+        let calls = backend.calls();
+        assert!(calls[marker..].is_empty(), "{calls:?}");
+
+        // The app turns window 2 into a floating ("always on top") panel.
+        backend.set_level(2, 3);
+        core.platform_event(PlatformEvent::WindowLevelChanged { wid: 2 });
+
+        assert!(core.layout().window_info(2).is_none());
+        assert!(!core.applier().journal().contains(2));
+        assert!(!core.applier().is_visible(2));
+        let calls = backend.calls();
+        assert_eq!(set_frames_after(&calls, marker, 2), 0, "{calls:?}");
+        assert_eq!(
+            set_frames_after(&calls, marker, 1),
+            1,
+            "the remaining tile must re-flow: {calls:?}"
+        );
+        assert_tiles_cover(&backend, &[1], WORK_AREA);
+
+        // Back at level 0 it is not picked up again.
+        backend.set_level(2, 0);
+        core.platform_event(PlatformEvent::WindowLevelChanged { wid: 2 });
+        assert!(core.layout().window_info(2).is_none());
+    }
+
+    #[test]
+    fn parked_window_leaving_the_normal_level_is_unparked_first() {
+        let (mut core, backend, _dir) = core(&[(1, Rect::new(0.0, 0.0, 400.0, 300.0))]);
+        core.startup(backend.windows());
+        core.action(Action::Workspace { index: 2 });
+        assert!(!core.applier().is_visible(1));
+        backend.set_level(1, 3);
+        let marker = backend.calls().len();
+
+        core.platform_event(PlatformEvent::WindowLevelChanged { wid: 1 });
+
+        let calls = backend.calls();
+        assert!(calls[marker..].contains(&Call::Unpark(1)), "{calls:?}");
+        assert!(core.layout().window_info(1).is_none());
+    }
+
+    #[test]
+    fn level_change_of_an_unmanaged_window_is_ignored() {
+        let (mut core, backend, _dir) = core(&[(1, Rect::new(0.0, 0.0, 400.0, 300.0))]);
+        core.startup(backend.windows());
+        backend.add_window(2, Rect::new(0.0, 0.0, 400.0, 300.0));
+        backend.set_level(2, 25);
+        let marker = backend.calls().len();
+
+        core.platform_event(PlatformEvent::WindowLevelChanged { wid: 2 });
+
+        let calls = backend.calls();
+        assert!(calls[marker..].is_empty(), "{calls:?}");
+        assert!(core.layout().window_info(1).is_some());
+    }
+
+    #[test]
+    fn panel_window_reserves_its_strip_until_it_closes() {
+        let (mut core, backend, dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        // winit creates the panel at the normal level and a default position;
+        // the panel raises it and moves it to the top edge a moment later.
+        backend.add_window(PANEL, Rect::new(100.0, 384.0, 1000.0, 32.0));
+        backend.set_app_id(PANEL, "cosmic-mac-panel");
+        let marker = backend.calls().len();
+
+        core.platform_event(created(PANEL));
+
+        assert!(
+            core.layout().window_info(PANEL).is_none(),
+            "the panel is never managed"
+        );
+        // Mid-screen, it reserves nothing yet.
+        assert_eq!(core.applier().work_area(), WORK_AREA);
+        let calls = backend.calls();
+        assert!(calls[marker..].is_empty(), "{calls:?}");
+
+        // A failed bounds read (empty frame) is not a move.
+        core.platform_event(PlatformEvent::WindowMoved {
+            wid: PANEL as u32,
+            frame: PlatformRect::default(),
+        });
+        assert_eq!(core.applier().work_area(), WORK_AREA);
+
+        backend.set_level(PANEL, 25);
+        core.platform_event(PlatformEvent::WindowLevelChanged { wid: PANEL as u32 });
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .frames
+            .insert(PANEL, PANEL_STRIP);
+        let marker = backend.calls().len();
+        core.platform_event(PlatformEvent::WindowMoved {
+            wid: PANEL as u32,
+            frame: platform_rect(PANEL_STRIP),
+        });
+
+        assert_eq!(core.applier().work_area(), RESERVED);
+        assert_eq!(core.layout().work_area(), RESERVED);
+        let calls = backend.calls();
+        assert_eq!(set_frames_after(&calls, marker, PANEL), 0, "{calls:?}");
+        for wid in [1, 2] {
+            assert_eq!(
+                set_frames_after(&calls, marker, wid),
+                1,
+                "window {wid} must be re-framed below the panel: {calls:?}"
+            );
+        }
+        assert_tiles_cover(&backend, &[1, 2], RESERVED);
+        assert_eq!(recorded_work_area(&dir), Some(RESERVED));
+
+        // The panel quits: the strip is released.
+        backend.remove_window(PANEL);
+        let marker = backend.calls().len();
+        core.platform_event(PlatformEvent::WindowDestroyed { wid: PANEL as u32 });
+
+        assert_eq!(core.applier().work_area(), WORK_AREA);
+        assert_eq!(core.layout().work_area(), WORK_AREA);
+        let calls = backend.calls();
+        for wid in [1, 2] {
+            assert_eq!(set_frames_after(&calls, marker, wid), 1, "{calls:?}");
+        }
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+        assert_eq!(recorded_work_area(&dir), Some(WORK_AREA));
+        assert_eq!(core.layout().windows().len(), 2);
+    }
+
+    #[test]
+    fn work_area_change_keeps_the_panel_reservation() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+        ]);
+        core.startup(backend.windows());
+        let panel = Rect::new(0.0, 0.0, 1440.0, 32.0);
+        backend.add_window(PANEL, panel);
+        backend.set_app_id(PANEL, "cosmic-mac-panel");
+        core.platform_event(created(PANEL));
+        assert_eq!(core.applier().work_area(), RESERVED);
+
+        // The display changes: 1440×900 with the native menu bar visible.
+        let visible = Rect::new(0.0, 25.0, 1440.0, 875.0);
+        core.set_work_area(visible);
+
+        let reserved = Rect::new(0.0, 32.0, 1440.0, 868.0);
+        assert_eq!(core.applier().work_area(), reserved);
+        assert_eq!(core.layout().work_area(), reserved);
+        assert_tiles_cover(&backend, &[1, 2], reserved);
+
+        // The same display area again is a no-op.
+        let marker = backend.calls().len();
+        core.set_work_area(visible);
+        let calls = backend.calls();
+        assert!(calls[marker..].is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn startup_with_a_running_panel_tiles_below_it() {
+        let (mut core, backend, dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (2, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (PANEL, PANEL_STRIP),
+        ]);
+        backend.set_app_id(PANEL, "cosmic-mac-panel");
+        backend.set_level(PANEL, 25);
+
+        core.track_shell_windows(backend.shell_windows());
+        assert_eq!(core.applier().work_area(), RESERVED);
+        let report = core.startup(backend.windows());
+
+        assert_eq!(report.added, 2);
+        assert!(core.layout().window_info(PANEL).is_none());
+        assert_eq!(set_frames_after(&backend.calls(), 0, PANEL), 0);
+        assert_tiles_cover(&backend, &[1, 2], RESERVED);
+        assert_eq!(recorded_work_area(&dir), Some(RESERVED));
+    }
+
+    #[test]
+    fn startup_never_manages_a_panel_still_at_the_normal_level() {
+        let (mut core, backend, _dir) = core(&[
+            (1, Rect::new(0.0, 0.0, 400.0, 300.0)),
+            (PANEL, Rect::new(100.0, 384.0, 1000.0, 32.0)),
+        ]);
+        backend.set_app_id(PANEL, "cosmic-mac-panel");
+
+        let report = core.startup(backend.windows());
+
+        assert_eq!(report.order, vec![1]);
+        assert!(core.layout().window_info(PANEL).is_none());
+        assert_eq!(set_frames_after(&backend.calls(), 0, PANEL), 0);
+    }
+
+    #[test]
+    fn tracking_a_panel_before_startup_keeps_the_previous_order() {
+        // The previous run recorded the reserved area; tracking the panel
+        // must not overwrite the session before startup reads its order.
+        let session = SessionState {
+            work_area: Some(RESERVED),
+            tiled_order: vec![2, 3, 1],
+        };
+        let frames: Vec<(WindowId, Rect)> = (1..=3)
+            .map(|wid| (wid, Rect::new(0.0, 0.0, 400.0, 300.0)))
+            .collect();
+        let (mut core, backend, _dir) = core_with(&frames, WORK_AREA, Some(session));
+
+        core.track_shell_windows(vec![
+            ToplevelInfo::new(PANEL, "cosmic-mac-panel", "")
+                .with_level(25)
+                .with_initial_frame(PANEL_STRIP),
+        ]);
+        let report = core.startup(backend.windows());
+
+        assert!(!report.tree_rebuilt);
+        assert_eq!(report.order, vec![2, 3, 1]);
+        assert_tiles_cover(&backend, &[1, 2, 3], RESERVED);
+    }
+
+    // ---------------------------------------------------------------------
+    // Suspended windows: minimize, Cmd+H, native full screen
+    // ---------------------------------------------------------------------
+
+    /// Startup frame of the suspension tests' windows.
+    const START: Rect = Rect::new(0.0, 0.0, 400.0, 300.0);
+    /// The test display, which a full-screen window covers.
+    const DISPLAY: Rect = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+    /// Pid of an application that owns more than one test window.
+    const SHARED_APP: i32 = 77;
+
+    fn hidden(wid: WindowId) -> PlatformEvent {
+        PlatformEvent::WindowHidden { wid: wid as u32 }
+    }
+
+    fn shown(wid: WindowId) -> PlatformEvent {
+        PlatformEvent::WindowShown { wid: wid as u32 }
+    }
+
+    fn resized(wid: WindowId, frame: Rect) -> PlatformEvent {
+        PlatformEvent::WindowResized {
+            wid: wid as u32,
+            frame: platform_rect(frame),
+        }
+    }
+
+    /// Calls after `marker` that act on `wid`.
+    fn calls_for(calls: &[Call], marker: usize, wid: WindowId) -> Vec<Call> {
+        calls[marker..]
+            .iter()
+            .filter(|call| match call {
+                Call::SetFrame(w, _)
+                | Call::Probe(w)
+                | Call::ForgetProbe(w)
+                | Call::Focus(w)
+                | Call::Park(w, _)
+                | Call::Unpark(w) => *w == wid,
+                Call::StackBar(_) => false,
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn started(wids: &[WindowId]) -> (Core, Arc<TestBackend>, tempfile::TempDir) {
+        let frames: Vec<(WindowId, Rect)> = wids.iter().map(|&wid| (wid, START)).collect();
+        let (mut core, backend, dir) = core(&frames);
+        core.startup(backend.windows());
+        (core, backend, dir)
+    }
+
+    /// Teach the core a 600 px minimum width for window 1 through a clamp and
+    /// a probe (the work area shrinks to 900 px wide).
+    fn learn_min_width_of_window_1(core: &mut Core, backend: &TestBackend) -> Rect {
+        backend.set_min_size(1, Size::new(600.0, 100.0));
+        let area = Rect::new(0.0, 0.0, 900.0, 800.0);
+        core.set_work_area(area);
+        assert_eq!(
+            core.constraints(1).and_then(|learned| learned.min),
+            Some(Size::new(600.0, 100.0))
+        );
+        assert_eq!(backend.probes(), 1);
+        area
+    }
+
+    #[test]
+    fn minimized_window_is_suspended_and_the_rest_reflow() {
+        let (mut core, backend, _dir) = started(&[1, 2, 3]);
+        assert_eq!(core.layout().focused(), Some(1));
+        let marker = backend.calls().len();
+
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+
+        assert!(core.is_suspended(1));
+        assert!(core.layout().window_info(1).is_none());
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [], "{calls:?}");
+        assert_tiles_cover(&backend, &[2, 3], WORK_AREA);
+        // Focus moves on to a window that is still on screen.
+        let focused = core.layout().focused().expect("focus moves on");
+        assert_ne!(focused, 1);
+        assert!(calls[marker..].contains(&Call::Focus(focused)), "{calls:?}");
+        // The original frame stays journaled for shutdown and crash replay.
+        assert!(core.applier().journal().contains(1));
+        // list-windows reports managed windows only.
+        let Response::Windows(windows) = core.request(Request::ListWindows) else {
+            panic!("expected a window list");
+        };
+        let listed: Vec<WindowId> = windows.iter().map(|state| state.info.wid).collect();
+        assert_eq!(listed, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_hidden_notification_for_a_window_that_is_not_minimized_is_ignored() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        let marker = backend.calls().len();
+
+        // SkyLight's window-hidden notification may fire on a Space change.
+        core.platform_event(hidden(2));
+        core.platform_event(hidden(99));
+
+        assert!(!core.is_suspended(2));
+        assert!(core.layout().window_info(2).is_some());
+        let calls = backend.calls();
+        assert!(calls[marker..].is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn deminimized_window_comes_back_with_its_learned_constraints() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        let area = learn_min_width_of_window_1(&mut core, &backend);
+        let learned = core.constraints(1);
+
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+        assert!(core.is_suspended(1));
+        assert_eq!(core.constraints(1), learned, "suspending keeps them");
+        assert_tiles_cover(&backend, &[2], area);
+
+        let marker = backend.calls().len();
+        backend.set_minimized(1, false);
+        core.platform_event(shown(1));
+
+        assert!(!core.is_suspended(1));
+        assert_eq!(
+            core.layout().window_info(1).and_then(|info| info.min_size),
+            Some(Size::new(600.0, 100.0)),
+            "the layout gets the learned minimum back"
+        );
+        assert_eq!(core.layout().focused(), Some(1));
+        assert_eq!(backend.probes(), 1, "no re-probe");
+        let calls = backend.calls();
+        assert!(set_frames_after(&calls, marker, 1) >= 1, "{calls:?}");
+        assert_tiles_cover(&backend, &[1, 2], area);
+        assert!(backend.frame(1).unwrap().width >= 600.0);
+    }
+
+    fn minimized(wid: WindowId) -> PlatformEvent {
+        PlatformEvent::WindowMinimized { wid: wid as u32 }
+    }
+
+    fn deminimized(wid: WindowId) -> PlatformEvent {
+        PlatformEvent::WindowDeminimized { wid: wid as u32 }
+    }
+
+    #[test]
+    fn the_ax_minimize_notification_suspends_before_the_attribute_flips() {
+        let (mut core, backend, _dir) = started(&[1, 2, 3]);
+        let marker = backend.calls().len();
+
+        // `AXMinimized` still reads false when the notification arrives.
+        core.platform_event(minimized(1));
+
+        assert!(core.is_suspended(1));
+        assert!(core.layout().window_info(1).is_none());
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [], "{calls:?}");
+        assert_tiles_cover(&backend, &[2, 3], WORK_AREA);
+        assert_ne!(core.layout().focused(), Some(1));
+        assert!(core.applier().journal().contains(1));
+        // Unmanaged and unknown windows are ignored.
+        core.platform_event(minimized(99));
+        assert!(!core.is_suspended(99));
+    }
+
+    #[test]
+    fn notifications_during_the_minimize_animation_do_not_resume_the_window() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        let tile = backend.frame(1).unwrap();
+        let at = Instant::now();
+        core.platform_event_at(minimized(1), at);
+        assert!(core.is_suspended(1));
+
+        // The attribute still reads false; the animation moves the window,
+        // SkyLight reports it shown or created, focus passes over it.
+        let during = at + Duration::from_millis(500);
+        core.platform_event_at(shown(1), during);
+        core.platform_event_at(resized(1, Rect::new(10.0, 10.0, 100.0, 80.0)), during);
+        core.platform_event_at(
+            PlatformEvent::FocusChanged {
+                wid: Some(1),
+                pid: Some(test_pid(1)),
+            },
+            during,
+        );
+        assert!(core.is_suspended(1));
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+
+        // Once the attribute has settled a read decides again: still
+        // minimized keeps it away ...
+        let settled = at + MINIMIZE_SETTLE + Duration::from_millis(100);
+        backend.set_minimized(1, true);
+        core.platform_event_at(shown(1), settled);
+        assert!(core.is_suspended(1));
+
+        // ... and a window that is back although its deminimize notification
+        // was missed is resumed by the next trigger.
+        backend.set_minimized(1, false);
+        backend.set_frame_externally(1, tile);
+        core.platform_event_at(shown(1), settled);
+        assert!(!core.is_suspended(1));
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+    }
+
+    #[test]
+    fn the_ax_deminimize_notification_resumes_before_the_attribute_flips() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        let area = learn_min_width_of_window_1(&mut core, &backend);
+        backend.set_minimized(1, true);
+        core.platform_event(minimized(1));
+        assert!(core.is_suspended(1));
+
+        // Restored from the Dock at once: inside the settle time, and
+        // `AXMinimized` still reads true.
+        let marker = backend.calls().len();
+        core.platform_event(deminimized(1));
+
+        assert!(!core.is_suspended(1));
+        assert_eq!(
+            core.layout().window_info(1).and_then(|info| info.min_size),
+            Some(Size::new(600.0, 100.0)),
+            "the learned minimum comes back"
+        );
+        assert_eq!(core.layout().focused(), Some(1));
+        assert_eq!(backend.probes(), 1, "no re-probe");
+        let calls = backend.calls();
+        assert!(set_frames_after(&calls, marker, 1) >= 1, "{calls:?}");
+        assert_tiles_cover(&backend, &[1, 2], area);
+        // A late duplicate (the SkyLight one) changes nothing.
+        core.platform_event(shown(1));
+        core.platform_event(deminimized(1));
+        assert_tiles_cover(&backend, &[1, 2], area);
+    }
+
+    #[test]
+    fn the_ax_deminimize_notification_still_checks_the_rest_of_the_window() {
+        let frames = [(1, START), (2, START)];
+        let (mut core, backend, _dir) = core(&frames);
+        backend.set_pid(1, SHARED_APP);
+        core.startup(backend.windows());
+
+        // Minimized, then its application hidden: deminimizing alone does not
+        // show a hidden application's window.
+        core.platform_event(minimized(1));
+        core.platform_event(PlatformEvent::AppHidden { pid: SHARED_APP });
+        core.platform_event(deminimized(1));
+        assert!(core.is_suspended(1));
+        core.platform_event(PlatformEvent::AppShown { pid: SHARED_APP });
+        assert!(!core.is_suspended(1));
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+
+        // A window that went full screen while minimized stays suspended.
+        core.platform_event(minimized(1));
+        backend.set_fullscreen(1, true);
+        core.platform_event(deminimized(1));
+        assert!(core.is_suspended(1));
+    }
+
+    #[test]
+    fn hiding_an_application_suspends_only_its_windows_until_it_is_shown() {
+        let frames = [(1, START), (2, START), (3, START)];
+        let (mut core, backend, _dir) = core(&frames);
+        // Startup tiles `[[3 / 1] | 2]`: removing 1 first re-flows 3, which
+        // is removed next in the same batch.
+        backend.set_pid(1, SHARED_APP);
+        backend.set_pid(3, SHARED_APP);
+        core.startup(backend.windows());
+        let marker = backend.calls().len();
+
+        core.platform_event(PlatformEvent::AppHidden { pid: SHARED_APP });
+
+        assert!(core.is_suspended(1));
+        assert!(core.is_suspended(3));
+        assert!(!core.is_suspended(2));
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [], "{calls:?}");
+        assert_eq!(
+            calls_for(&calls, marker, 3),
+            [],
+            "the re-flow of a window suspended later in the batch is dropped: {calls:?}"
+        );
+        assert_eq!(
+            set_frames_after(&calls, marker, 2),
+            1,
+            "the whole application is removed in one re-flow: {calls:?}"
+        );
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+        assert_eq!(core.layout().focused(), Some(2));
+
+        // A window notification alone does not bring a hidden app's window
+        // back, and another application being shown changes nothing.
+        core.platform_event(shown(1));
+        core.platform_event(PlatformEvent::AppShown { pid: test_pid(2) });
+        assert!(core.is_suspended(1));
+        assert!(core.is_suspended(3));
+
+        core.platform_event(PlatformEvent::AppShown { pid: SHARED_APP });
+
+        assert!(!core.is_suspended(1));
+        assert!(!core.is_suspended(3));
+        assert_tiles_cover(&backend, &[1, 2, 3], WORK_AREA);
+    }
+
+    #[test]
+    fn hiding_an_application_leaves_its_parked_windows_where_they_are() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.action(Action::Workspace { index: 2 });
+        assert!(!core.applier().is_visible(1));
+        assert!(backend.saved_frame(1).is_some());
+        let marker = backend.calls().len();
+
+        core.platform_event(PlatformEvent::AppHidden { pid: test_pid(1) });
+
+        assert!(core.is_suspended(1));
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [], "not unparked: {calls:?}");
+        // The park record is dropped without moving the window; the journal
+        // still restores it from the corner.
+        assert_eq!(backend.saved_frame(1), None);
+        assert!(core.applier().journal().contains(1));
+
+        // Back on workspace 1 it is not unparked or framed either.
+        core.action(Action::Workspace { index: 1 });
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [], "{calls:?}");
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+
+        // Shown again, it joins the active workspace.
+        core.action(Action::Workspace { index: 2 });
+        core.platform_event(PlatformEvent::AppShown { pid: test_pid(1) });
+        let state = core
+            .layout()
+            .windows()
+            .into_iter()
+            .find(|state| state.info.wid == 1)
+            .expect("managed again");
+        assert_eq!(state.workspace, 2);
+        assert_eq!(backend.frame(1), Some(WORK_AREA));
+    }
+
+    #[test]
+    fn a_minimized_window_of_a_hidden_application_needs_both_back() {
+        let frames = [(1, START), (2, START), (3, START)];
+        let (mut core, backend, _dir) = core(&frames);
+        backend.set_pid(1, SHARED_APP);
+        backend.set_pid(2, SHARED_APP);
+        core.startup(backend.windows());
+
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+        core.platform_event(PlatformEvent::AppHidden { pid: SHARED_APP });
+        assert!(core.is_suspended(1));
+        assert!(core.is_suspended(2));
+
+        // Shown again with window 1 still in the Dock.
+        core.platform_event(PlatformEvent::AppShown { pid: SHARED_APP });
+        assert!(core.is_suspended(1));
+        assert!(!core.is_suspended(2));
+
+        backend.set_minimized(1, false);
+        core.platform_event(shown(1));
+        assert!(!core.is_suspended(1));
+        assert_tiles_cover(&backend, &[1, 2, 3], WORK_AREA);
+
+        // Minimized and hidden again, then restored from the Dock, which
+        // un-hides the application: the window's notification may arrive
+        // before the application's, and the window waits for it.
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+        core.platform_event(PlatformEvent::AppHidden { pid: SHARED_APP });
+        backend.set_minimized(1, false);
+        core.platform_event(shown(1));
+        assert!(core.is_suspended(1));
+
+        core.platform_event(PlatformEvent::AppShown { pid: SHARED_APP });
+        assert!(!core.is_suspended(1));
+        assert!(!core.is_suspended(2));
+        assert_tiles_cover(&backend, &[1, 2, 3], WORK_AREA);
+    }
+
+    #[test]
+    fn native_full_screen_suspends_the_window_and_leaving_it_resumes() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        let tile = backend.frame(1).unwrap();
+        let marker = backend.calls().len();
+
+        backend.set_fullscreen(1, true);
+        backend.set_frame_externally(1, DISPLAY);
+        core.platform_event(resized(1, DISPLAY));
+
+        assert!(core.is_suspended(1));
+        let calls = backend.calls();
+        assert_eq!(
+            calls_for(&calls, marker, 1),
+            [],
+            "no snap-back or invalidation against the transition: {calls:?}"
+        );
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+
+        // Further resizes while in full screen keep it suspended.
+        core.platform_event(resized(1, DISPLAY));
+        assert!(core.is_suspended(1));
+        assert_eq!(calls_for(&backend.calls(), marker, 1), []);
+
+        // Leaving full screen resizes it back.
+        backend.set_fullscreen(1, false);
+        backend.set_frame_externally(1, tile);
+        core.platform_event(resized(1, tile));
+
+        assert!(!core.is_suspended(1));
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+    }
+
+    #[test]
+    fn full_screen_is_only_checked_for_frames_containing_the_work_area() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        let tile = core.layout().frame_of(1).unwrap();
+
+        // An ordinary drag does not re-read the window.
+        let reads = backend.info_reads();
+        let dragged = Rect::new(tile.x + 30.0, tile.y + 20.0, tile.width, tile.height);
+        backend.set_frame_externally(1, dragged);
+        core.platform_event(PlatformEvent::WindowMoved {
+            wid: 1,
+            frame: platform_rect(dragged),
+        });
+        assert_eq!(backend.info_reads(), reads);
+        assert_eq!(backend.frame(1), Some(tile), "snapped back");
+
+        // A display-sized frame that is not full screen (a zoom) is re-read,
+        // then snapped back like any other user resize.
+        let marker = backend.calls().len();
+        backend.set_frame_externally(1, DISPLAY);
+        core.platform_event(resized(1, DISPLAY));
+        assert!(backend.info_reads() > reads);
+        assert!(!core.is_suspended(1));
+        let calls = backend.calls();
+        assert!(
+            calls[marker..].contains(&Call::SetFrame(1, tile)),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_suspended_window_that_takes_focus_is_re_checked() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        let tile = backend.frame(1).unwrap();
+        backend.set_fullscreen(1, true);
+        backend.set_frame_externally(1, DISPLAY);
+        core.platform_event(resized(1, DISPLAY));
+        assert!(core.is_suspended(1));
+
+        // The exit resize is read while AX still reports full screen.
+        backend.set_frame_externally(1, tile);
+        core.platform_event(resized(1, tile));
+        assert!(core.is_suspended(1));
+
+        // Focus arriving afterwards re-checks it.
+        backend.set_fullscreen(1, false);
+        core.platform_event(PlatformEvent::FocusChanged {
+            wid: Some(1),
+            pid: Some(test_pid(1)),
+        });
+        assert!(!core.is_suspended(1));
+        assert_eq!(core.layout().focused(), Some(1));
+    }
+
+    #[test]
+    fn a_window_unreadable_through_ax_stays_suspended() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+
+        // Without AX the minimized flag reads false; that proves nothing.
+        backend.set_ax_unreadable(1, true);
+        core.platform_event(shown(1));
+        assert!(core.is_suspended(1));
+
+        backend.set_ax_unreadable(1, false);
+        backend.set_minimized(1, false);
+        core.platform_event(shown(1));
+        assert!(!core.is_suspended(1));
+    }
+
+    #[test]
+    fn a_suspended_window_reported_as_created_is_resumed_once() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+
+        // Still minimized: a creation report does not add it.
+        core.platform_event(created(1));
+        assert!(core.is_suspended(1));
+        assert!(core.layout().window_info(1).is_none());
+
+        backend.set_minimized(1, false);
+        core.platform_event(created(1));
+        core.platform_event(created(1));
+        assert!(!core.is_suspended(1));
+        assert_eq!(core.layout().windows().len(), 2);
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+    }
+
+    #[test]
+    fn a_suspended_window_that_closes_is_forgotten() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        learn_min_width_of_window_1(&mut core, &backend);
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+        assert!(core.applier().journal().contains(1));
+
+        backend.remove_window(1);
+        core.platform_event(PlatformEvent::WindowDestroyed { wid: 1 });
+
+        assert!(!core.is_suspended(1));
+        assert_eq!(core.constraints(1), None);
+        assert!(!core.applier().journal().contains(1));
+        let marker = backend.calls().len();
+        core.platform_event(shown(1));
+        assert!(backend.calls()[marker..].is_empty());
+        assert!(core.layout().window_info(1).is_none());
+    }
+
+    #[test]
+    fn a_suspended_window_is_never_framed_parked_or_probed() {
+        let (mut core, backend, _dir) = started(&[1, 2, 3]);
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+        // Framed, it would clamp to this minimum and be probed.
+        backend.set_min_size(1, Size::new(600.0, 100.0));
+        let marker = backend.calls().len();
+
+        core.set_work_area(Rect::new(0.0, 0.0, 900.0, 800.0));
+        core.action(Action::Workspace { index: 2 });
+        core.action(Action::Workspace { index: 1 });
+        core.action(Action::Focus {
+            direction: cosmic_mac_protocol::Direction::Left,
+        });
+
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [], "{calls:?}");
+        assert_eq!(backend.probes(), 0);
+    }
+
+    #[test]
+    fn a_clamp_on_a_window_minimized_before_its_notification_suspends_it_unprobed() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        // Minimized, but the notification has not been processed yet.
+        backend.set_min_size(1, Size::new(600.0, 100.0));
+        backend.set_minimized(1, true);
+        let area = Rect::new(0.0, 0.0, 900.0, 800.0);
+
+        core.set_work_area(area);
+
+        assert!(core.is_suspended(1));
+        assert_eq!(backend.probes(), 0, "a minimized window is never probed");
+        assert_eq!(core.constraints(1), None, "nothing learned from it");
+        assert_tiles_cover(&backend, &[2], area);
+    }
+
+    #[test]
+    fn restore_stops_managing_suspended_windows_too() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        backend.set_minimized(1, true);
+        core.platform_event(hidden(1));
+
+        assert_eq!(core.request(Request::Restore), Response::Ok);
+
+        assert!(!core.is_suspended(1));
+        backend.set_minimized(1, false);
+        core.platform_event(shown(1));
+        assert!(core.layout().window_info(1).is_none());
     }
 }

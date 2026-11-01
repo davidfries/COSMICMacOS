@@ -74,6 +74,11 @@ pub async fn run(
         let _ = signal_tx.send(Message::Shutdown);
     });
 
+    // A panel that is already running sits above the normal level, so it is
+    // not in `windows()`.  Reserve its strip first so the initial layout tiles
+    // below it and the session records the effective work area.
+    let shell_windows = core.applier().backend().shell_windows();
+    core.track_shell_windows(shell_windows);
     let windows = core.applier().backend().windows();
     let count = windows.len();
     let report = core.startup(windows);
@@ -85,7 +90,10 @@ pub async fn run(
 
     while let Some(message) = rx.recv().await {
         match message {
-            Message::Platform(event, captured) => core.platform_event_at(event, captured),
+            Message::Platform(event, captured) => {
+                log::trace!("platform event: {event:?}");
+                core.platform_event_at(event, captured);
+            }
             Message::Key(action) => core.action(action),
             Message::WorkArea(rect) => core.set_work_area(rect),
             Message::Ipc(request, response) => {

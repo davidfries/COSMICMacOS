@@ -96,7 +96,9 @@ fn toggle_stacking_into_existing_stack() {
 }
 
 #[test]
-fn toggle_stacking_with_group_sibling_is_a_noop() {
+fn toggle_stacking_with_group_sibling_stacks_with_its_nearest_window() {
+    // A no-op here made Super+S depend on the tree's shape; the focused window now stacks with
+    // the nearest window inside the neighbouring group.
     let mut harness = Harness::with(
         cosmic_mac_protocol::Config::default(),
         cosmic_mac_protocol::Rect::new(0.0, 0.0, 1000.0, 1000.0),
@@ -105,11 +107,13 @@ fn toggle_stacking_with_group_sibling_is_a_noop() {
     harness.add();
     harness.add();
     harness.act(Action::FocusWindow { wid: 1 });
-    let before = harness.layout.visible_frames();
-    let commands = harness.act(Action::ToggleStacking);
-    assert!(commands.is_empty());
-    assert_eq!(harness.layout.visible_frames(), before);
-    assert!(harness.layout.active_stack().is_none());
+    harness.act(Action::ToggleStacking);
+    let stack = harness.layout.active_stack().expect("a stack formed");
+    let mut members: Vec<_> = stack.tabs.iter().map(|tab| tab.wid).collect();
+    members.sort_unstable();
+    assert_eq!(members, vec![1, 2]);
+    assert_eq!(harness.layout.focused(), Some(1));
+    harness.assert_synced();
 }
 
 #[test]
