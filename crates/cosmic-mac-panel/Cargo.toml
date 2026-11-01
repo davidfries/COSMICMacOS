@@ -1,0 +1,31 @@
+[package]
+name = "cosmic-mac-panel"
+description = "cosmicMac panel: libcosmic top panel (Spike A: minimal libcosmic window on macOS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cosmic-mac-panel"
+path = "src/main.rs"
+
+[dependencies]
+log.workspace = true
+env_logger.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+# Local wall-clock time for the clock; libcosmic already depends on jiff 0.2.
+jiff = "0.2"
+
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSScreen",
+    "objc2-core-foundation",
+] }
+
+# Pinned rev and feature set live in the workspace manifest.
+libcosmic.workspace = true
