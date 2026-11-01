@@ -14,9 +14,15 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2_app_kit::{NSWorkspace, NSWorkspaceActiveSpaceDidChangeNotification};
 use objc2_core_foundation::CFString;
+use objc2_foundation::NSNotification;
 
 use crate::ax::{ATTR_FOCUSED_WINDOW, ATTR_WINDOWS, AxElement, AxObserver, AxObserverRef};
 use crate::error::Result;
@@ -128,6 +134,16 @@ pub enum PlatformEvent {
         /// New frontmost PID, when the payload could be decoded.
         pid: Option<libc::pid_t>,
     },
+    /// The active Space changed (`NSWorkspaceActiveSpaceDidChangeNotification`): the user
+    /// switched desktops, or a window entered or left native full screen, which moves it to
+    /// a Space of its own.
+    ActiveSpaceChanged {
+        /// The newly active Space (`SLSGetActiveSpace`), when it could be read.
+        space: Option<u64>,
+        /// Whether that is a native full-screen Space.  While one is active the desktop's
+        /// windows are on an inactive Space, where Accessibility cannot find them.
+        fullscreen: bool,
+    },
     /// A display was added, removed or reconfigured.
     DisplayChanged,
     /// An event we do not decode yet, kept for diagnostics.
@@ -225,6 +241,12 @@ unsafe extern "C" fn sls_callback(
         // the callback.
         unsafe { std::slice::from_raw_parts(data as *const u8, len) }
     };
+    log::trace!(
+        "SLS event {event} len {len} words {:?} {:?} {:?}",
+        read_u32(bytes, 0),
+        read_u32(bytes, 4),
+        read_u32(bytes, 8)
+    );
 
     let event = match event {
         sls_events::WINDOW_CLOSED => {
@@ -359,6 +381,7 @@ unsafe extern "C" fn ax_callback(
         return;
     };
     let wid = element.window_id();
+    log::trace!("AX {name} wid {wid:?} pid {}", context.pid);
 
     let event = match name.as_str() {
         "AXWindowCreated" => {
@@ -535,6 +558,8 @@ pub struct PlatformObserver {
     handler: EventHandler,
     apps: HashMap<libc::pid_t, AxEntry>,
     sls_started: bool,
+    /// The `NSWorkspace` notification-center registration for Space changes.
+    space_observer: Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
 }
 
 impl PlatformObserver {
@@ -549,7 +574,40 @@ impl PlatformObserver {
             handler,
             apps: HashMap::new(),
             sls_started: false,
+            space_observer: None,
         }
+    }
+
+    /// Report active-Space changes as [`PlatformEvent::ActiveSpaceChanged`].  Safe to call
+    /// more than once.
+    ///
+    /// Observes `NSWorkspaceActiveSpaceDidChangeNotification`, which `NSWorkspace` posts on
+    /// the main thread's run loop: create the observer on the main thread and keep that run
+    /// loop running.  In the macOS 15.6 VM the notification arrives within a millisecond of
+    /// the change for desktop switches and for entering and leaving native full screen.
+    pub fn start_space_observer(&mut self) {
+        if self.space_observer.is_some() {
+            return;
+        }
+        let handler = self.handler.clone();
+        let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+            let space = skylight::active_space().ok();
+            let fullscreen = space.and_then(|sid| skylight::space_type(sid).ok())
+                == Some(skylight::SPACE_TYPE_FULLSCREEN);
+            handler(PlatformEvent::ActiveSpaceChanged { space, fullscreen });
+        });
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        // SAFETY: a valid static notification name, no sender filter, no queue (the block
+        // runs on the posting thread); the block owns everything it uses.
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceActiveSpaceDidChangeNotification),
+                None,
+                None,
+                &block,
+            )
+        };
+        self.space_observer = Some(token);
     }
 
     /// The handler installed by this observer.
@@ -718,6 +776,11 @@ impl Drop for PlatformObserver {
         }
         if let Some(slot) = AX_HANDLER.get() {
             *slot.lock().expect("ax handler poisoned") = None;
+        }
+        if let Some(token) = self.space_observer.take() {
+            let center = NSWorkspace::sharedWorkspace().notificationCenter();
+            // SAFETY: the token was returned by this notification center.
+            unsafe { center.removeObserver(ProtocolObject::as_ref(&token)) };
         }
         // Release each AXObserver before reclaiming its callback context so no
         // callback can observe a dangling pointer.

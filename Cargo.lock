@@ -1081,6 +1081,7 @@ dependencies = [
 name = "cosmic-mac-launcher"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "cosmic-mac-ctl",
  "cosmic-mac-protocol",
  "env_logger",
@@ -1117,6 +1118,7 @@ dependencies = [
 name = "cosmic-mac-platform"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "env_logger",
  "libc",
  "log",
@@ -1135,6 +1137,7 @@ dependencies = [
  "ron 0.10.1",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1142,6 +1145,22 @@ name = "cosmic-mac-session"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tempfile",
+]
+
+[[package]]
+name = "cosmic-mac-status"
+version = "0.1.0"
+dependencies = [
+ "cosmic-mac-ctl",
+ "cosmic-mac-protocol",
+ "dispatch2",
+ "env_logger",
+ "log",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "serde_json",
  "tempfile",
 ]
 

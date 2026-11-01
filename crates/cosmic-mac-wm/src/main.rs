@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Entry point for the cosmicMac window-manager daemon.
 
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cosmic_mac_platform::eventtap::TapHandler;
-use cosmic_mac_platform::{EventTap, PlatformObserver, ax, display, tcc};
+use cosmic_mac_platform::eventtap::{self, TapHandler};
+use cosmic_mac_platform::{EventTap, KeyEvent, MouseTap, PlatformObserver, ax, display, tcc};
 use cosmic_mac_protocol::{Config, Rect};
 use objc2_app_kit::NSWorkspace;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
@@ -15,7 +17,9 @@ use tokio::sync::mpsc;
 
 use cosmic_mac_wm::daemon::Message;
 use cosmic_mac_wm::keybindings::{self, KeyMap};
+use cosmic_mac_wm::launcher::{LauncherClient, SocketPort};
 use cosmic_mac_wm::macos::{self, DisplayUpdate, MacPlatform};
+use cosmic_mac_wm::super_tap::{self, SuperTap, TapEvent};
 use cosmic_mac_wm::{daemon, ipc, journal, paths};
 
 fn main() {
@@ -70,12 +74,14 @@ fn main() {
         log::info!("restored {restored} windows from a crashed run");
     }
 
+    let launcher = start_launcher_client(config.super_tap_launcher);
     let (tx, rx) = mpsc::unbounded_channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let (observer, tap_thread) = match start_observers(
         tx.clone(),
         Arc::new(keymap),
         Arc::new(config.passthrough.clone()),
+        launcher,
         backend.clone(),
         shutdown.clone(),
     ) {
@@ -129,6 +135,45 @@ fn main() {
     // The tap thread polls the same shutdown flag and releases the tap.
     let _ = tap_thread.join();
     log::info!("cosmic-mac-wm exited");
+}
+
+/// The Super-tap launcher client, unless `super_tap_launcher` is off in the
+/// WM config. The launcher is started on demand from the directory of this
+/// executable (`cosmic-mac-launcher.app`, else `cosmic-mac-launcher`).
+fn start_launcher_client(enabled: bool) -> Option<LauncherClient> {
+    if !enabled {
+        log::info!("Super tap: off (super_tap_launcher: false)");
+        return None;
+    }
+    let bin_dir = executable_dir().unwrap_or_else(|error| {
+        log::warn!(
+            "cannot locate the running executable ({error}); the launcher cannot be \
+             started on demand"
+        );
+        PathBuf::new()
+    });
+    let port = SocketPort {
+        socket: paths::launcher_socket_path(),
+        bin_dir,
+        log: Some(paths::launcher_log_path()),
+    };
+    log::info!(
+        "Super tap toggles the launcher ({}; on demand from {})",
+        port.socket.display(),
+        port.bin_dir.display()
+    );
+    match LauncherClient::spawn(port) {
+        Ok(client) => Some(client),
+        Err(error) => {
+            log::warn!("Super tap: off (cannot start the launcher-client thread: {error})");
+            None
+        }
+    }
+}
+
+fn executable_dir() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(exe.parent().map(Path::to_path_buf).unwrap_or_default())
 }
 
 fn exit_if_already_running() {
@@ -265,6 +310,7 @@ fn start_observers(
     tx: mpsc::UnboundedSender<Message>,
     keymap: Arc<KeyMap>,
     passthrough: Arc<Vec<String>>,
+    launcher: Option<LauncherClient>,
     backend: Arc<MacPlatform>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(ObserverRuntime, JoinHandle<()>), String> {
@@ -282,8 +328,11 @@ fn start_observers(
     observer
         .refresh_apps()
         .map_err(|error| format!("AX observers: {error}"))?;
+    // Native full screen and desktop switches: the core re-checks windows
+    // away in full screen and re-asserts the tiles on every change.
+    observer.start_space_observer();
 
-    let tap_thread = spawn_event_tap(tx.clone(), keymap, passthrough, shutdown)?;
+    let tap_thread = spawn_event_tap(tx.clone(), keymap, passthrough, launcher, shutdown)?;
 
     let display_tx = tx.clone();
     display::set_display_change_handler(Arc::new(move || {
@@ -316,10 +365,14 @@ fn start_observers(
 /// loop, one beach-balling app stalled keyboard input system-wide until macOS
 /// disabled the tap.  Creation errors are sent back so they still fail daemon
 /// startup.
+///
+/// The listen-only mouse tap for drag to stack shares the thread.  Without it
+/// the daemon still runs; tiled windows then always snap back.
 fn spawn_event_tap(
     tx: mpsc::UnboundedSender<Message>,
     keymap: Arc<KeyMap>,
     passthrough: Arc<Vec<String>>,
+    launcher: Option<LauncherClient>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -328,13 +381,20 @@ fn spawn_event_tap(
         .spawn(move || {
             // `EventTap::new` adds its source to the *current* run loop, which
             // is this thread's.
-            let tap = match EventTap::new(Vec::new(), key_handler(tx, keymap, passthrough)) {
+            let mouse_tx = tx.clone();
+            let handler = key_handler(tx, keymap, passthrough, launcher);
+            let tap = match EventTap::new(Vec::new(), handler) {
                 Ok(tap) => tap,
                 Err(error) => {
                     let _ = ready_tx.send(Err(format!("global event tap: {error}")));
                     return;
                 }
             };
+            let mouse = MouseTap::new(Box::new(move |event| {
+                let _ = mouse_tx.send(Message::Mouse(event, Instant::now()));
+            }))
+            .map_err(|error| log::warn!("mouse tap: {error}; drag to stack is off"))
+            .ok();
             let _ = ready_tx.send(Ok(()));
             while !shutdown.load(Ordering::SeqCst) {
                 let mode = unsafe { kCFRunLoopDefaultMode };
@@ -344,6 +404,7 @@ fn spawn_event_tap(
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
+            drop(mouse);
             drop(tap);
         })
         .map_err(|error| format!("cannot spawn the event-tap thread: {error}"))?;
@@ -360,15 +421,26 @@ fn spawn_event_tap(
     }
 }
 
-/// The tap callback: dispatch bound chords to the daemon and swallow them.
+/// The tap callback: dispatch bound chords to the daemon and swallow them,
+/// and watch every key and modifier event for a Super tap.
 fn key_handler(
     tap_tx: mpsc::UnboundedSender<Message>,
     tap_keymap: Arc<KeyMap>,
     tap_passthrough: Arc<Vec<String>>,
+    launcher: Option<LauncherClient>,
 ) -> TapHandler {
+    // Only the tap thread calls the handler.
+    let detector = RefCell::new(SuperTap::default());
     // The static swallow list is empty: the handler decides per event, which
     // is what makes the per-application `passthrough` list possible.
     Box::new(move |key| {
+        if let Some(launcher) = &launcher {
+            watch_super_tap(&detector, launcher, &tap_passthrough, key);
+        }
+        if key.is_flags_changed {
+            // Modifier changes always pass (the tap ignores the result too).
+            return false;
+        }
         let Some(action) = tap_keymap.lookup(key.keycode, key.modifiers()).cloned() else {
             return false;
         };
@@ -390,6 +462,41 @@ fn key_handler(
         // Swallow both down and up so the app never sees a stuck key.
         true
     })
+}
+
+/// Feeds `key` to the Super-tap detector; on a confirmed tap outside the
+/// `passthrough` apps, queues a launcher toggle (never blocks the tap).
+fn watch_super_tap(
+    detector: &RefCell<SuperTap>,
+    launcher: &LauncherClient,
+    passthrough: &[String],
+    key: KeyEvent,
+) {
+    let event = if key.is_flags_changed {
+        TapEvent::Flags {
+            keycode: key.keycode,
+            flags: key.flags,
+        }
+    } else {
+        TapEvent::Key
+    };
+    let Some(held) = detector.borrow_mut().observe(event, Instant::now()) else {
+        return;
+    };
+    let since_input =
+        super_tap::duration_from_seconds(eventtap::seconds_since_click_scroll_or_key());
+    if !super_tap::no_input_during(held, since_input) {
+        log::debug!("Super tap ignored: click, scroll or key {since_input:?} ago, held {held:?}");
+        return;
+    }
+    if is_passthrough(passthrough) {
+        log::debug!("Super tap ignored: the frontmost app is in `passthrough`");
+        return;
+    }
+    log::debug!("Super tap (held {held:?})");
+    if !launcher.toggle() {
+        log::warn!("Super tap: the launcher-client thread is gone");
+    }
 }
 
 fn is_passthrough(patterns: &[String]) -> bool {

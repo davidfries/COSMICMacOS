@@ -173,6 +173,12 @@ A stack is a first-class leaf, not a group of hidden windows:
 * `Layout::active_stack()` / `Layout::stacks()` expose tab titles, the active index and the
   frame so the daemon can draw the tab bar. `Command::StackChanged` is emitted when the
   focused stack changes; `None` hides the bar.
+* Drag to stack: `Layout::drop_zone(wid, x, y)` names the tile whose middle third (both
+  axes, cosmic-comp's stack region) holds the point; `wid`'s own tile is never a target and
+  a stack is one target. `Layout::stack_onto(wid, target)` takes `wid` out of its tile or
+  stack (a stack left with one member becomes a plain window) and adds it to `target`, which
+  becomes a stack if it was a plain window; `wid` is the active, focused tab. Drops outside
+  the middle third (cosmic-comp's split zones) are not implemented.
 
 ### 3.4 Floating layer
 
@@ -318,11 +324,19 @@ line:
 {"request":"tree"}
 {"request":"config"}
 {"request":"restore"}
+{"request":"subscribe"}
 ```
 
-Responses are `windows`, `workspaces`, `tree`, `ok`, `config` or `error` (adjacently tagged
-with `response`/`data`). `Response::Tree` carries the `TreeNode` snapshot with per-node
-frames. `cosmic-mac-ctl` is a thin client over these payloads.
+Responses are `windows`, `workspaces`, `tree`, `ok`, `config`, `error` or `state`
+(adjacently tagged with `response`/`data`). `Response::Tree` carries the `TreeNode` snapshot
+with per-node frames. `cosmic-mac-ctl` is a thin client over these payloads.
+
+Every request gets one reply line, except `subscribe`: it turns the connection into a stream
+of `state` lines (`ShellState`: the workspace pool, the active workspace's tiling flag and
+whether its focused window floats), the current state at once and then one line per change,
+until either side closes it. The daemon publishes the state after every message it handles
+and only sends it when it changed; input on a subscribed connection is ignored. The
+menu-bar status item (`crates/cosmic-mac-status`) and `cosmic-mac-ctl watch` use it.
 
 ## 5. Platform boundary (consumed, not implemented here)
 
@@ -350,6 +364,12 @@ parked windows are not user-visible. It does not assume anything about z-order b
   the active workspace, which is exactly the park operation.
 * **Crash safety**: the daemon journals original frames before touching a window and replays
   the journal on the next start if it is dirty. `Request::Restore` triggers the same path.
+* **Drag to stack**: a listen-only mouse tap reports left-button down, dragged and up. While
+  the button is held the daemon leaves alone a user move (or edge resize) of the tiled window
+  whose tile the button went down on; on release a pure move whose release point is in a
+  `Layout::drop_zone` stacks it with `Layout::stack_onto`, anything else snaps back. Moves
+  that arrive just after a release (`DROP_GRACE`, 250 ms) end that drag. While the pointer
+  is over a stack zone the tab-bar thread highlights the target tile.
 * **Keybindings**: the daemon loads COSMIC's `keybindings.ron` format (defaults embedded with
   `include_str!`) and maps actions onto `cosmic_mac_protocol::Action`. The intended mapping
   for the default set is:
@@ -390,6 +410,7 @@ Test files:
 | `tests/focus.rs` | directional focus, nesting, wrap, floating fallback, MRU cycling |
 | `tests/move_resize.rs` | move/swap/orientation, resize growth and minimum clamping |
 | `tests/stacks.rs` | stacking, unstacking, tab visibility, member removal |
+| `tests/drag_stack.rs` | drop zones and `stack_onto`: onto windows, stacks, nested groups, no-ops |
 | `tests/floating.rs` | float rules, placement, cascade, layer toggles |
 | `tests/workspaces.rs` | switching, moving, wrap, last workspace, trailing removal |
 | `tests/gaps.rs` | outer/inner gap arithmetic and clamping |

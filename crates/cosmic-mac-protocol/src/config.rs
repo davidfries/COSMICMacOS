@@ -106,6 +106,10 @@ pub struct Config {
     /// Application ids whose keybindings must be passed through to the application
     /// (daemon-side; carried here so config-changed is one payload).
     pub passthrough: Vec<String>,
+    /// Tapping Super (Command) on its own toggles the launcher, like COSMIC's
+    /// `(modifiers: [Super]): System(Launcher)` default binding (daemon-side, like
+    /// `passthrough`, which it also honours).  Default on.
+    pub super_tap_launcher: bool,
 }
 
 impl Default for Config {
@@ -116,6 +120,7 @@ impl Default for Config {
             autotile: true,
             tiling_exceptions: Vec::new(),
             passthrough: Vec::new(),
+            super_tap_launcher: true,
         }
     }
 }
@@ -160,6 +165,7 @@ mod tests {
         assert!(config.autotile);
         assert!(config.tiling_exceptions.is_empty());
         assert!(config.passthrough.is_empty());
+        assert!(config.super_tap_launcher);
     }
 
     #[test]
@@ -168,6 +174,17 @@ mod tests {
         assert_eq!(config.gaps.outer, 8);
         assert_eq!(config.gaps.inner, 0);
         assert!(config.autotile);
+        assert!(config.super_tap_launcher);
+    }
+
+    #[test]
+    fn super_tap_launcher_can_be_switched_off_in_ron() {
+        // The daemon reads `com.system76.CosmicComp/config.ron` as RON.
+        let config: Config = ron::from_str("(super_tap_launcher: false)").unwrap();
+        assert!(!config.super_tap_launcher);
+        assert!(config.autotile);
+        let config: Config = ron::from_str("(gaps: (outer: 4))").unwrap();
+        assert!(config.super_tap_launcher);
     }
 
     #[test]
@@ -178,6 +195,7 @@ mod tests {
             autotile: false,
             tiling_exceptions: vec![TilingException::new("com.apple.finder")],
             passthrough: vec!["com.apple.Terminal".into()],
+            super_tap_launcher: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), config);

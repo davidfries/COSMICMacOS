@@ -38,6 +38,7 @@ Commands:
   config [--json]                     Show the layout configuration
   restore                             Unpark windows and restore original frames
   ping                                Check that the daemon is responding
+  watch [--json]                      Print the shell state now and on every change
 
 Actions (see `cosmic-mac-ctl action --help`):
   focus <left|right|up|down>          Focus the nearest window in a direction
@@ -173,7 +174,8 @@ Usage:
 Options:
   --json        Print the exact Response::Config payload as JSON
 
-Human output covers gaps, active_hint, autotile, tiling_exceptions and passthrough.
+Human output covers gaps, active_hint, autotile, tiling_exceptions, passthrough and
+super_tap_launcher.
 ";
 
 pub const RESTORE_HELP: &str = "\
@@ -195,10 +197,32 @@ The protocol has no dedicated ping request, so this sends `list_windows` and rep
 number of windows.  Exit code 3 means the daemon is not reachable.
 ";
 
+pub const WATCH_HELP: &str = "\
+cosmic-mac-ctl watch — print the shell state now and on every change
+
+Usage:
+  cosmic-mac-ctl watch [--json]
+
+Options:
+  --json        Print each Response::State payload as one compact JSON line
+
+Sends Request::Subscribe and prints one line per state the daemon streams: the
+current state at once, then one whenever the workspace pool, the active
+workspace, its tiling flag or the focused window's floating state changes.
+Human lines read like
+
+  workspace=2 workspaces=3 tiling=on focused=tiled windows=1:2,2*:1,3:0
+
+where `focused` is none, tiled or floating and `windows` lists INDEX:COUNT per
+workspace (`*` marks the active one).  Runs until interrupted; exits 3 when the
+daemon closes the stream or cannot be reached.  --timeout-ms applies to the
+first state only.
+";
+
 pub const USAGE_SHORT: &str = "Usage: cosmic-mac-ctl [OPTIONS] <COMMAND> [ARGS]\n\
      Try `cosmic-mac-ctl --help` for more information.";
 
-const COMMANDS: [&str; 8] = [
+const COMMANDS: [&str; 9] = [
     "list-windows",
     "list-workspaces",
     "tree",
@@ -207,6 +231,7 @@ const COMMANDS: [&str; 8] = [
     "config",
     "restore",
     "ping",
+    "watch",
 ];
 
 /// A parsed command.
@@ -220,6 +245,7 @@ pub enum Command {
     Config,
     Restore,
     Ping,
+    Watch,
 }
 
 /// A fully parsed invocation.
@@ -333,6 +359,7 @@ where
         "config" => parse_unit_command(rest, Command::Config, CONFIG_HELP)?,
         "restore" => parse_unit_command(rest, Command::Restore, RESTORE_HELP)?,
         "ping" => parse_unit_command(rest, Command::Ping, PING_HELP)?,
+        "watch" => parse_unit_command(rest, Command::Watch, WATCH_HELP)?,
         other => {
             return Err(UsageError(format!(
                 "unknown command `{other}`\n{USAGE_SHORT}"
@@ -818,6 +845,7 @@ fn help_for(topic: Option<&str>) -> &'static str {
         Some("config") => CONFIG_HELP,
         Some("restore") => RESTORE_HELP,
         Some("ping") => PING_HELP,
+        Some("watch") => WATCH_HELP,
         _ => GLOBAL_HELP,
     }
 }
@@ -1016,6 +1044,33 @@ mod tests {
             invocation(&["tree", "--workspace", "3"]).command,
             Command::Tree { workspace: Some(3) }
         );
+    }
+
+    #[test]
+    fn watch_parses_with_and_without_json() {
+        let plain = invocation(&["watch"]);
+        assert_eq!(plain.command, Command::Watch);
+        assert!(!plain.json);
+        assert!(invocation(&["watch", "--json"]).json);
+        assert!(invocation(&["--json", "watch"]).json);
+        assert_eq!(
+            parse(args(&["watch", "--help"])).unwrap(),
+            Parsed::Help(super::WATCH_HELP)
+        );
+        assert_eq!(
+            parse(args(&["help", "watch"])).unwrap(),
+            Parsed::Help(super::WATCH_HELP)
+        );
+        for input in [
+            vec!["watch", "extra"],
+            vec!["watch", "--limit", "1"],
+            vec!["watch", "--workspace", "1"],
+        ] {
+            assert!(
+                matches!(parse(args(&input)), Err(UsageError(_))),
+                "expected usage error for {input:?}"
+            );
+        }
     }
 
     #[test]

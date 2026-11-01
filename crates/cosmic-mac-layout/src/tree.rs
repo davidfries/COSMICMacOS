@@ -351,6 +351,82 @@ impl Tree {
         new_id
     }
 
+    /// Insert a new window leaf beside `reference`, before or after it, splitting along
+    /// `orientation`, and give it `weight`.
+    ///
+    /// When the reference's parent group already has that orientation the window joins it
+    /// next to the reference and the other weights are kept.  Otherwise the reference is
+    /// wrapped in a new two-child group in its slot, weighted `[reference_weight, weight]`
+    /// (in the order the two end up in).  Used to put a window back where it was: the
+    /// weights are the ones it and its neighbour had, so the old frames come back.
+    pub fn insert_window_beside(
+        &mut self,
+        wid: WindowId,
+        reference: NodeId,
+        orientation: Orientation,
+        after: bool,
+        weight: f64,
+        reference_weight: f64,
+    ) -> NodeId {
+        let new_id = self.alloc(NodeKind::Window(wid));
+        let parent = self.parent(reference);
+        let parent_index = self.index_in_parent(reference);
+        let matching_parent = parent.filter(|parent| {
+            self.group(*parent)
+                .is_some_and(|group| group.orientation == orientation)
+        });
+        if let Some(parent) = matching_parent {
+            let index = parent_index.expect("reference in parent") + usize::from(after);
+            let group = self.group_mut(parent).expect("checked group");
+            group.children.insert(index, new_id);
+            group.sizes.insert(index, weight);
+            self.get_mut(new_id).parent = Some(parent);
+            return new_id;
+        }
+        let (children, sizes) = if after {
+            (vec![reference, new_id], vec![reference_weight, weight])
+        } else {
+            (vec![new_id, reference], vec![weight, reference_weight])
+        };
+        let group_id = self.alloc(NodeKind::Group(Group {
+            orientation,
+            children,
+            sizes,
+        }));
+        self.get_mut(reference).parent = Some(group_id);
+        self.get_mut(new_id).parent = Some(group_id);
+        match (parent, parent_index) {
+            (Some(parent), Some(index)) => {
+                self.group_mut(parent).expect("parent group").children[index] = group_id;
+                self.get_mut(group_id).parent = Some(parent);
+            }
+            (None, _) => self.root = Some(group_id),
+            _ => unreachable!("reference node must be in its parent"),
+        }
+        new_id
+    }
+
+    /// The smallest subtree holding every window in `wids` (all of which must be in the
+    /// tree), or `None` for an empty list.
+    pub fn common_ancestor(&self, wids: &[WindowId]) -> Option<NodeId> {
+        let mut paths = wids.iter().map(|wid| {
+            let mut path = Vec::new();
+            let mut node = self.node_for_window(*wid);
+            while let Some(id) = node {
+                path.push(id);
+                node = self.parent(id);
+            }
+            path.reverse();
+            path
+        });
+        let mut common = paths.next()?;
+        for path in paths {
+            let shared = common.iter().zip(&path).take_while(|(a, b)| a == b).count();
+            common.truncate(shared);
+        }
+        common.last().copied()
+    }
+
     /// Remove `id` from its parent (the node itself is freed) and normalise the tree.
     pub fn detach(&mut self, id: NodeId) {
         let parent = self.parent(id);
@@ -765,6 +841,20 @@ impl Tree {
         };
         stack.windows.push(wid);
         stack.active = stack.windows.len() - 1;
+        true
+    }
+
+    /// Insert a window into a stack at `index` (clamped to the end) without changing which
+    /// member is active.
+    pub fn insert_stack_member(&mut self, stack_id: NodeId, index: usize, wid: WindowId) -> bool {
+        let Some(stack) = self.stack_mut(stack_id) else {
+            return false;
+        };
+        let index = index.min(stack.windows.len());
+        stack.windows.insert(index, wid);
+        if stack.windows.len() > 1 && stack.active >= index {
+            stack.active += 1;
+        }
         true
     }
 

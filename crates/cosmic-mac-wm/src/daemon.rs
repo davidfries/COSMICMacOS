@@ -5,13 +5,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use cosmic_mac_platform::PlatformEvent;
-use cosmic_mac_protocol::{Action, Config, Rect, Request, Response};
+use cosmic_mac_platform::{MouseEvent, PlatformEvent};
+use cosmic_mac_protocol::{Action, Config, Rect, Request, Response, WindowId};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::SharedBackend;
 use crate::core::Core;
 use crate::ipc;
+use crate::shell_state;
 /// A message for the layout owner.
 pub enum Message {
     /// A window/application/display event from the platform observers, with
@@ -21,10 +22,17 @@ pub enum Message {
     Platform(PlatformEvent, Instant),
     /// A bound key combination.
     Key(Action),
+    /// A left-button event from the listen-only mouse tap, with the time the
+    /// tap saw it (drag to stack).
+    Mouse(MouseEvent, Instant),
     /// The main display's work area changed.
     WorkArea(Rect),
     /// An IPC request and the channel for its reply.
     Ipc(Request, oneshot::Sender<Response>),
+    /// A re-check the core asked for ([`Core::take_rechecks`]) is due: look
+    /// at a window whose state could not be read (a native full-screen
+    /// transition) again.
+    Recheck(WindowId),
     /// SIGTERM/SIGINT or an unrecoverable startup failure.
     Shutdown,
 }
@@ -63,8 +71,12 @@ pub async fn run(
 
     let listener = ipc::bind(&socket_path)?;
     let ipc_tx = tx.clone();
+    // Shell-state stream for `Request::Subscribe` (the menu-bar status item):
+    // updated after startup and after every message; subscribers hear changes.
+    let shell_state = shell_state::Publisher::new(core.layout());
+    let ipc_shell_state = shell_state.subscribe();
     tokio::spawn(async move {
-        ipc::serve(listener, ipc_tx).await;
+        ipc::serve(listener, ipc_tx, ipc_shell_state).await;
     });
 
     let signal_tx = tx.clone();
@@ -87,6 +99,8 @@ pub async fn run(
         report.added,
         report.order
     );
+    schedule_rechecks(&mut core, &tx);
+    shell_state.update(core.layout());
 
     while let Some(message) = rx.recv().await {
         match message {
@@ -95,18 +109,35 @@ pub async fn run(
                 core.platform_event_at(event, captured);
             }
             Message::Key(action) => core.action(action),
+            Message::Mouse(event, captured) => core.mouse_event_at(event, captured),
             Message::WorkArea(rect) => core.set_work_area(rect),
             Message::Ipc(request, response) => {
                 let reply = core.request(request);
                 let _ = response.send(reply);
             }
+            Message::Recheck(wid) => core.recheck(wid),
             Message::Shutdown => break,
         }
+        schedule_rechecks(&mut core, &tx);
+        shell_state.update(core.layout());
     }
 
     core.shutdown();
     remove_socket(&socket_path);
     Ok(())
+}
+
+/// Start a timer for every re-check the core requested; each sends
+/// [`Message::Recheck`] when it is due.  The core never sleeps, so it stays
+/// single-threaded and testable.
+fn schedule_rechecks(core: &mut Core, tx: &mpsc::UnboundedSender<Message>) {
+    for (wid, delay) in core.take_rechecks() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(Message::Recheck(wid));
+        });
+    }
 }
 
 fn remove_socket(path: &Path) {

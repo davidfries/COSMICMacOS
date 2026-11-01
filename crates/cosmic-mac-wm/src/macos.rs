@@ -5,10 +5,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use cosmic_mac_platform::window::{self, ParkStore, WindowInfo};
-use cosmic_mac_platform::{Rect as PlatformRect, display};
+use cosmic_mac_platform::{Rect as PlatformRect, display, skylight};
 use cosmic_mac_protocol::{Rect, StackInfo, ToplevelInfo, WindowId};
 
-use crate::backend::{AppliedFrame, PlatformBackend, PlatformResult, SizeConstraints};
+use crate::backend::{
+    AppliedFrame, DropHint, PlatformBackend, PlatformResult, SizeConstraints, WindowPresence,
+};
 use crate::rules;
 use crate::tabbar::TabBarHandle;
 
@@ -164,6 +166,27 @@ impl PlatformBackend for MacPlatform {
         self.info(wid)
     }
 
+    fn window_presence(&self, wid: WindowId) -> WindowPresence {
+        let wid = wid as u32;
+        // A closed window has no owner any more (CGError 1000), while one moving to a
+        // full-screen Space keeps it even though nothing else can read it.
+        if skylight::window_owner_pid(wid).is_err() {
+            return WindowPresence::Gone;
+        }
+        match skylight::window_spaces(wid) {
+            Ok(spaces) if !spaces.is_empty() => WindowPresence::OnSpace {
+                fullscreen: spaces.iter().any(|space| {
+                    skylight::space_type(*space).ok() == Some(skylight::SPACE_TYPE_FULLSCREEN)
+                }),
+            },
+            Ok(_) => WindowPresence::Detached,
+            Err(error) => {
+                log::debug!("window {wid}: cannot read its Spaces: {error}");
+                WindowPresence::Detached
+            }
+        }
+    }
+
     fn windows(&self) -> Vec<ToplevelInfo> {
         window::list_windows()
             .map(|windows| {
@@ -199,6 +222,13 @@ impl PlatformBackend for MacPlatform {
     fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()> {
         match &self.tab_bar {
             Some(tab_bar) => tab_bar.update(stack),
+            None => Ok(()),
+        }
+    }
+
+    fn set_drop_hint(&self, hint: Option<DropHint>) -> PlatformResult<()> {
+        match &self.tab_bar {
+            Some(tab_bar) => tab_bar.drop_hint(hint),
             None => Ok(()),
         }
     }

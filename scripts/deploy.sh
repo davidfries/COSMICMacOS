@@ -9,11 +9,15 @@
 #   scripts/deploy.sh                       # platform examples (ax-status, spikes)
 #   scripts/deploy.sh -p cosmic-mac-wm      # extra release crates
 #   scripts/deploy.sh -p cosmic-mac-wm -p cosmic-mac-session   # WM + installer
+#   scripts/deploy.sh -p cosmic-mac-wm -p cosmic-mac-session -p cosmic-mac-launcher
 #   scripts/deploy.sh --no-build            # just sign + copy what exists
 #   VM_HOST=dj@192.168.64.14 scripts/deploy.sh
 #
 # Every target/release/cosmic-mac-* binary that exists is deployed; Cargo's
-# `.d` dep-info files next to them are not.
+# `.d` dep-info files next to them are not. When target/release/
+# cosmic-mac-launcher exists, scripts/bundle.sh also assembles and signs
+# cosmic-mac-launcher.app (what the launchd agent runs), which is copied
+# next to the binaries.
 #
 # No launchd agents are installed or restarted by this script; run
 # `~/cosmicMac/bin/cosmic-mac-session install` in the VM for that.
@@ -82,9 +86,21 @@ fi
 echo "== signing ${#BINARIES[@]} binaries"
 "$ROOT/scripts/sign.sh" --verify "${BINARIES[@]}"
 
+# The launcher runs from its app bundle (bundle id, LSUIElement).
+BUNDLES=()
+if [[ -f "$ROOT/target/release/cosmic-mac-launcher" ]]; then
+    "$ROOT/scripts/bundle.sh"
+    BUNDLES+=("$ROOT/target/release/bundles/cosmic-mac-launcher.app")
+fi
+
 echo "== copying to $VM_HOST:~/$REMOTE_DIR"
 ssh -o BatchMode=yes "$VM_HOST" "mkdir -p \"\$HOME/$REMOTE_DIR\""
 rsync -az "${BINARIES[@]}" "$VM_HOST:$REMOTE_DIR/"
+for bundle in ${BUNDLES[@]+"${BUNDLES[@]}"}; do
+    # No trailing slash: copies the .app directory itself; --delete drops
+    # files a previous build left inside it.
+    rsync -az --delete "$bundle" "$VM_HOST:$REMOTE_DIR/"
+done
 ssh -o BatchMode=yes "$VM_HOST" "chmod +x \"\$HOME/$REMOTE_DIR\"/*"
 
 echo "== remote ax-status"

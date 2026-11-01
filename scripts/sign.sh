@@ -14,10 +14,11 @@
 # the user search list and its key partition list is set for codesign.
 #
 # Usage:
-#   scripts/sign.sh [--create-identity] [--trust] [--verify] [binary ...]
+#   scripts/sign.sh [--create-identity] [--trust] [--verify] [binary|app ...]
 #
 # Default binaries: target/release/examples/{ax-status,spike-b,spike-c} and
-# target/release/cosmic-mac-* when present.
+# target/release/cosmic-mac-* when present. An `<name>.app` bundle is signed
+# as a whole with identifier "com.cosmicmac.<name>" (scripts/bundle.sh).
 #
 # --create-identity creates the key/cert and imports it into the dedicated
 #   keychain (no sudo, no GUI). Safe to re-run.
@@ -47,7 +48,8 @@ for arg in "$@"; do
         --trust) TRUST=1 ;;
         --verify) VERIFY=1 ;;
         -h|--help)
-            sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+            # The leading comment block, without the shebang.
+            awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
             exit 0
             ;;
         -*)
@@ -200,11 +202,13 @@ if [[ ${#BINARIES[@]} -eq 0 ]]; then
 fi
 
 for binary in "${BINARIES[@]}"; do
-    if [[ ! -f "$binary" ]]; then
+    if [[ ! -f "$binary" && ! -d "$binary" ]]; then
         echo "!! missing $binary" >&2
         exit 1
     fi
+    # `cosmic-mac-launcher.app` is signed as com.cosmicmac.cosmic-mac-launcher.
     name="$(basename "$binary")"
+    name="${name%.app}"
     echo "== signing $name"
     codesign --force \
         --keychain "$KEYCHAIN" \

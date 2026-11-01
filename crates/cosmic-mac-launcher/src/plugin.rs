@@ -34,8 +34,10 @@ pub type Indice = u32;
 pub enum IconSource {
     /// A named icon from libcosmic's bundled icon set.
     Name(&'static str),
-    /// The icon of the application bundle at this path.
+    /// The icon of the application bundle at this path (cached on disk).
     Bundle(PathBuf),
+    /// The Finder icon of any file or folder (kept in memory only).
+    File(PathBuf),
 }
 
 /// One row in the launcher (pop-launcher's `PluginSearchResult`).
@@ -57,11 +59,17 @@ pub struct SearchResult {
 }
 
 /// Side effect requested by activating a result. Performed by the frontend
-/// ([`crate::appkit::perform`]), after which the launcher closes.
+/// ([`crate::appkit::perform`]), after which the launcher hides.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Launch (or activate) the application bundle at this path.
     LaunchApp(PathBuf),
+    /// Open a file or folder in its default application.
+    OpenFile(PathBuf),
+    /// Run a shell command in a new Terminal.app window.
+    RunInTerminal(String),
+    /// Run a shell command detached, without a terminal.
+    RunInBackground(String),
     /// Open a URL in the default handler.
     OpenUrl(String),
     /// Put text on the general pasteboard.
@@ -86,7 +94,7 @@ pub trait Plugin {
     fn search(&mut self, query: &str) -> Vec<SearchResult>;
 
     /// What activating result `id` (from the latest `search`) should do.
-    /// `None` means nothing to do; the launcher then stays open.
+    /// `None` means nothing to do; the launcher then stays visible.
     fn activate(&mut self, id: Indice) -> Option<Action>;
 }
 

@@ -5,6 +5,7 @@
 //! daemon not running.
 
 use std::env;
+use std::io::Write;
 use std::process::ExitCode;
 
 use cosmic_mac_protocol::{Action, Request, Response, WindowId};
@@ -64,6 +65,53 @@ fn execute(invocation: Invocation) -> i32 {
         Command::Config => run_config(&client, json),
         Command::Restore => run_restore(&client, json),
         Command::Ping => run_ping(&client, json),
+        Command::Watch => run_watch(&client, json),
+    }
+}
+
+fn run_watch(client: &Client, json: bool) -> i32 {
+    let mut subscription = match client.subscribe() {
+        Ok(subscription) => subscription,
+        Err(error) => return ipc_error(error),
+    };
+    let stdout = std::io::stdout();
+    loop {
+        let reply = match subscription.next_reply() {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                eprintln!("cosmic-mac-ctl: the daemon closed the subscription");
+                return EXIT_IPC;
+            }
+            Err(error) => return ipc_error(error),
+        };
+        let Reply { response, data } = reply;
+        let line = match response {
+            Response::State(state) => {
+                if json {
+                    // One compact document per line, so the stream pipes into `jq`.
+                    let encoded = match &data {
+                        Some(value) => serde_json::to_string(value),
+                        None => serde_json::to_string(&state),
+                    };
+                    match encoded {
+                        Ok(text) => text,
+                        Err(error) => {
+                            eprintln!("cosmic-mac-ctl: failed to encode JSON output: {error}");
+                            return EXIT_IPC;
+                        }
+                    }
+                } else {
+                    output::render_state(&state)
+                }
+            }
+            Response::Error(message) => return daemon_error(&message),
+            other => return unexpected("state", &other),
+        };
+        let mut out = stdout.lock();
+        if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+            // The reader went away (e.g. `watch | head -1`).
+            return EXIT_OK;
+        }
     }
 }
 
@@ -316,5 +364,6 @@ fn response_name(response: &Response) -> &'static str {
         Response::Ok => "ok",
         Response::Config(_) => "config",
         Response::Error(_) => "error",
+        Response::State(_) => "state",
     }
 }

@@ -220,6 +220,7 @@ sl! {
         sid: SpaceId,
     ) -> ();
     fn SLSSpaceGetType(cid: ConnectionId, sid: SpaceId) -> c_int;
+    fn SLSGetActiveSpace(cid: ConnectionId) -> SpaceId;
 
     fn _SLPSSetFrontProcessWithOptions(
         psn: *const ProcessSerialNumber,
@@ -469,6 +470,58 @@ pub fn window_is_ordered_in(wid: WindowId) -> Result<bool> {
         SLSWindowIsOrderedIn(cid, wid, &mut ordered)?
     })?;
     Ok(ordered != 0)
+}
+
+/// `SLSSpaceGetType` value of a native full-screen Space.
+pub const SPACE_TYPE_FULLSCREEN: i32 = 4;
+
+/// The Space currently shown on the active display.
+pub fn active_space() -> Result<SpaceId> {
+    let cid = main_connection()?;
+    // SAFETY: valid connection.
+    let sid = unsafe { SLSGetActiveSpace(cid)? };
+    if sid == 0 {
+        return Err(PlatformError::Other("SLSGetActiveSpace returned 0".into()));
+    }
+    Ok(sid)
+}
+
+/// The type of a managed Space (`0` a user desktop, [`SPACE_TYPE_FULLSCREEN`]
+/// a native full-screen Space).
+pub fn space_type(sid: SpaceId) -> Result<i32> {
+    let cid = main_connection()?;
+    // SAFETY: valid connection; unknown ids yield a type, not a crash.
+    Ok(unsafe { SLSSpaceGetType(cid, sid)? })
+}
+
+/// The managed Spaces `wid` is on (`SLSCopySpacesForWindows`, selector `0x7`:
+/// every Space, not only the visible ones).
+///
+/// Empty for a window the window server no longer knows, and for a window
+/// that is not on any managed Space.
+pub fn window_spaces(wid: WindowId) -> Result<Vec<SpaceId>> {
+    use objc2_core_foundation::{CFArray, CFNumber, CFRetained, CFType};
+
+    let cid = main_connection()?;
+    let wid_number = CFNumber::new_i64(i64::from(wid));
+    let windows: CFRetained<CFArray<CFType>> = CFArray::from_objects(&[&*wid_number]);
+    // SAFETY: valid connection and a CFArray of CFNumbers.
+    let spaces =
+        unsafe { SLSCopySpacesForWindows(cid, 0x7, CFRetained::as_ptr(&windows).as_ptr().cast())? };
+    if spaces.is_null() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: a +1 CFArray of CFNumbers; released after reading.
+    let array: &CFArray<CFType> = unsafe { (&*(spaces as *const CFArray)).cast_unchecked() };
+    let ids = (0..array.len())
+        .filter_map(|index| array.get(index))
+        .filter_map(|value| value.downcast::<CFNumber>().ok())
+        .filter_map(|value| value.as_i64())
+        .map(|value| value as SpaceId)
+        .collect();
+    // SAFETY: we own the +1 reference.
+    unsafe { cf_release(spaces) };
+    Ok(ids)
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]

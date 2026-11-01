@@ -14,6 +14,8 @@ log.workspace = true
 env_logger.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
+# Blocks for the appearance-change observer (same version as objc2-foundation's).
+block2 = "0.6"
 # Reads `Contents/Info.plist` of app bundles (XML and binary). MIT.
 plist = "1"
 

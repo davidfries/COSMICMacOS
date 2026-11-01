@@ -25,15 +25,39 @@ pub struct Agent {
 }
 
 /// Every agent, in start order.
-pub const AGENTS: &[Agent] = &[Agent {
-    label: "com.cosmicmac.wm",
-    executable: "cosmic-mac-wm",
-    log_file: "wm.log",
-    // cosmic-mac-wm initialises env_logger with `default_filter_or("info")`,
-    // so info is already its default; setting RUST_LOG here keeps it at info
-    // even if `launchctl setenv RUST_LOG ...` changed the domain default.
-    environment: &[("RUST_LOG", "info")],
-}];
+pub const AGENTS: &[Agent] = &[
+    Agent {
+        label: "com.cosmicmac.wm",
+        executable: "cosmic-mac-wm",
+        log_file: "wm.log",
+        // cosmic-mac-wm initialises env_logger with `default_filter_or("info")`,
+        // so info is already its default; setting RUST_LOG here keeps it at info
+        // even if `launchctl setenv RUST_LOG ...` changed the domain default.
+        environment: &[("RUST_LOG", "info")],
+    },
+    // The menu-bar status item. It subscribes to the WM over IPC and retries
+    // until the WM is up, so it does not need the WM to start first. Its
+    // "Quit" item exits 0, which `KeepAlive { SuccessfulExit = false }` leaves
+    // alone until the next login or `install`.
+    Agent {
+        label: "com.cosmicmac.status",
+        executable: "cosmic-mac-status",
+        log_file: "status.log",
+        environment: &[("RUST_LOG", "info")],
+    },
+    // The resident launcher, run from its app bundle (bundle identifier and
+    // `LSUIElement`: no Dock icon). Started without `--show`, so it waits
+    // hidden for `toggle`/`show` on its socket (the WM's Super tap). A second
+    // instance exits 0, which `KeepAlive { SuccessfulExit = false }` does
+    // not restart.
+    Agent {
+        label: "com.cosmicmac.launcher",
+        executable: "cosmic-mac-launcher.app/Contents/MacOS/cosmic-mac-launcher",
+        log_file: "launcher.log",
+        // The launcher's own default filter, pinned like the WM's.
+        environment: &[("RUST_LOG", "warn,cosmic_mac_launcher=info")],
+    },
+];
 
 /// Seconds launchd waits before restarting a crashed agent.
 pub const THROTTLE_INTERVAL_SECS: i64 = 5;
@@ -144,6 +168,45 @@ mod tests {
         }
     }
 
+    fn launcher() -> &'static Agent {
+        AGENTS
+            .iter()
+            .find(|agent| agent.label == "com.cosmicmac.launcher")
+            .expect("launcher agent")
+    }
+
+    #[test]
+    fn launcher_agent_runs_the_bundle_executable_hidden_after_the_wm() {
+        let position = |label: &str| AGENTS.iter().position(|agent| agent.label == label);
+        assert!(position("com.cosmicmac.wm") < position("com.cosmicmac.launcher"));
+
+        let paths = Paths::new("/Users/someone");
+        let dict = launcher().plist(Path::new("/opt/cm/bin"), &paths);
+        // No `--show`: launchd starts it hidden.
+        assert_eq!(
+            dict.get("ProgramArguments"),
+            Some(&Value::Array(vec![
+                "/opt/cm/bin/cosmic-mac-launcher.app/Contents/MacOS/cosmic-mac-launcher".into()
+            ]))
+        );
+        assert_eq!(
+            dict.get("KeepAlive"),
+            Some(&Value::Dict(
+                Dict::new().with("SuccessfulExit", Value::Bool(false))
+            ))
+        );
+        assert_eq!(dict.get("RunAtLoad"), Some(&Value::Bool(true)));
+        assert_eq!(
+            dict.get("EnvironmentVariables"),
+            Some(&Value::Dict(
+                Dict::new().with("RUST_LOG", "warn,cosmic_mac_launcher=info".into())
+            ))
+        );
+        let log: Value = "/Users/someone/Library/Logs/cosmicMac/launcher.log".into();
+        assert_eq!(dict.get("StandardOutPath"), Some(&log));
+        assert_eq!(dict.get("StandardErrorPath"), Some(&log));
+    }
+
     #[test]
     fn paths_derive_from_home() {
         let paths = Paths::new("/Users/someone");
@@ -203,6 +266,38 @@ mod tests {
         let log: Value = "/Users/someone/Library/Logs/cosmicMac/wm.log".into();
         assert_eq!(dict.get("StandardOutPath"), Some(&log));
         assert_eq!(dict.get("StandardErrorPath"), Some(&log));
+    }
+
+    #[test]
+    fn status_item_agent_runs_after_the_window_manager() {
+        let position = |label: &str| AGENTS.iter().position(|agent| agent.label == label);
+        let status = position("com.cosmicmac.status").expect("status agent");
+        assert!(position("com.cosmicmac.wm").unwrap() < status);
+
+        let agent = &AGENTS[status];
+        let paths = Paths::new("/Users/someone");
+        let dict = agent.plist(Path::new("/opt/cm/bin"), &paths);
+        assert_eq!(dict.get("Label"), Some(&"com.cosmicmac.status".into()));
+        assert_eq!(
+            dict.get("ProgramArguments"),
+            Some(&Value::Array(vec!["/opt/cm/bin/cosmic-mac-status".into()]))
+        );
+        // Restarted after a crash, not after the menu's Quit (exit 0).
+        assert_eq!(
+            dict.get("KeepAlive"),
+            Some(&Value::Dict(
+                Dict::new().with("SuccessfulExit", Value::Bool(false))
+            ))
+        );
+        assert_eq!(dict.get("RunAtLoad"), Some(&Value::Bool(true)));
+        assert_eq!(dict.get("LimitLoadToSessionType"), Some(&"Aqua".into()));
+        let log: Value = "/Users/someone/Library/Logs/cosmicMac/status.log".into();
+        assert_eq!(dict.get("StandardOutPath"), Some(&log));
+        assert_eq!(dict.get("StandardErrorPath"), Some(&log));
+        assert_eq!(
+            paths.plist_path(agent),
+            Path::new("/Users/someone/Library/LaunchAgents/com.cosmicmac.status.plist")
+        );
     }
 
     #[test]

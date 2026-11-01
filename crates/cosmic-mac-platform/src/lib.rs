@@ -9,7 +9,8 @@
 //! * [`display`]: display enumeration (work areas from `NSScreen.visibleFrame`)
 //!   and display-change callbacks.
 //! * [`coords`]: AX/SLS top-left global vs AppKit bottom-left conversion.
-//! * [`eventtap`]: the global keyboard tap, including re-enable on timeout.
+//! * [`eventtap`]: the global keyboard tap, including re-enable on timeout, and
+//!   a listen-only left-mouse tap.
 //! * [`overlay`]: raw SkyLight overlay windows ordered above a foreign window.
 //! * [`tcc`]: Accessibility / Screen Recording presence checks.
 //! * [`skylight`]: all private SkyLight FFI, loaded through `dlopen`.
@@ -37,7 +38,7 @@ pub mod window;
 
 pub use display::DisplayInfo;
 pub use error::{PlatformError, Result};
-pub use eventtap::{EventTap, HotkeySpec, KeyEvent};
+pub use eventtap::{EventTap, HotkeySpec, KeyEvent, MouseEvent, MouseEventKind, MouseTap};
 pub use geometry::{Point, Rect, Size};
 pub use observers::{PlatformEvent, PlatformObserver};
 pub use overlay::{Color, OverlayWindow};

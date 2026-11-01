@@ -31,30 +31,78 @@
 //!
 //! A managed window that is minimized, hidden with its application (Cmd+H) or
 //! in native full screen is **suspended**: removed from the layout so its
-//! siblings re-flow and focus moves on, but remembered together with its
-//! learned size constraints.  When it is back it is re-added like a new
-//! window, on the active workspace, with the constraints re-attached.  Most
-//! platform notifications are only triggers: a window is suspended or resumed
+//! siblings re-flow and focus moves on (for full screen only in the layout:
+//! the full-screen window keeps the keyboard), but remembered together with
+//! its learned size constraints.  When it is back it is re-added with the
+//! constraints re-attached.  Most platform notifications are only triggers:
+//! a window is suspended or resumed
 //! on what a fresh [`PlatformBackend::window_info`] read reports, because
 //! SkyLight's window-hidden notification may also fire for Space changes.  The
 //! Accessibility minimize and deminimize notifications are the exception: they
 //! are authoritative, because they fire as the animation starts, while the
 //! `AXMinimized` attribute still reads the old value for about half a second
 //! ([`MINIMIZE_SETTLE`]).  A suspended window is not in the layout, so it is
-//! never framed, parked, focused or probed.
+//! never framed, parked, focused or probed.  Its [`WindowSlot`] is kept, so it
+//! comes back to the tile it left rather than wherever focus happens to be.
+//!
+//! # Native full screen and Space changes
+//!
+//! A window entering or leaving native full screen moves to another Space, and
+//! for about half a second nothing can read it: CoreGraphics does not list it,
+//! Accessibility cannot find it, and SkyLight reports it **destroyed** (and
+//! created again on the other Space).  So a destroy is only believed when the
+//! window server no longer knows the window
+//! ([`PlatformBackend::window_presence`]); a window that still exists is
+//! suspended as away in full screen instead of forgotten.  Reads that fail in
+//! the middle of such a transition are retried with **re-checks**: [`Core`]
+//! never sleeps; it queues `(window, delay)` requests ([`Core::take_rechecks`])
+//! that the daemon turns into timers and feeds back through [`Core::recheck`],
+//! backing off along [`RECHECK_DELAYS`].  After the last one a window that
+//! appeared is given up on; a suspended window that still exists stays
+//! suspended until the next Space change or an event about it (the exit from
+//! full screen detaches it again, so "on no Space" alone never forgets it).
+//!
+//! Windows that appear while a transition is in progress ([`TRANSITION_SETTLE`]
+//! after its last sign), and windows that are on no Space or cannot be read
+//! when they appear (the transition's own helper windows), are not managed
+//! until a re-check finds them still there and manageable.
+//!
+//! While a full-screen Space is active the desktop's windows are on an inactive
+//! Space, where Accessibility cannot move them, and applications move them
+//! anyway (TextEdit resets its other windows' frames).  Such moves are not user
+//! moves and are left alone until then.  When a desktop Space
+//! becomes active again ([`PlatformEvent::ActiveSpaceChanged`]) the core
+//! resumes the windows that left full screen and **re-asserts** the layout:
+//! every managed window that drifted from its tile is framed again and every
+//! window that should be parked is parked again.  A snap-back that fails is
+//! retried by a re-check as well.
+//!
+//! # Drag to stack
+//!
+//! A tiled window the user moves is snapped back to its tile, except while
+//! the left button is held ([`Core::mouse_event_at`], from a listen-only
+//! mouse tap): a move of a tiled window whose tile the button went down on is
+//! a **drag**, left alone until the release (an edge resize as well).  On the
+//! release a pure move whose pointer is in the middle third of another tile
+//! ([`Layout::drop_zone`]) stacks the window onto that tile
+//! ([`Layout::stack_onto`]); anything else snaps back.  While the pointer is
+//! over such a zone the backend shows a highlight
+//! ([`PlatformBackend::set_drop_hint`]).  A fast drag can deliver all of its
+//! moves after the release; a move within [`DROP_GRACE`] after a release
+//! that ended no drag is taken as a drag that ended there.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cosmic_mac_layout::Layout;
-use cosmic_mac_platform::PlatformEvent;
+use cosmic_mac_layout::{DropZone, Layout, WindowSlot};
+use cosmic_mac_platform::{MouseEvent, MouseEventKind, PlatformEvent};
 use cosmic_mac_protocol::{
     Action, Command, Config, Rect, Request, Response, ToplevelInfo, WindowId,
 };
 
-use crate::backend::PlatformBackend;
+use crate::backend::{DropHint, PlatformBackend, WindowPresence, is_parked_frame};
 use crate::commands::{ClampNotice, CommandApplier};
 use crate::constraints::{self, ConstraintStats, LearnedConstraints};
 use crate::journal::Journal;
@@ -96,7 +144,96 @@ pub struct Core {
     /// hidden or in native full screen.  Their learned constraints stay in
     /// [`Core::constraints`].
     suspended: HashMap<WindowId, Suspended>,
+    /// Orders [`Suspended::seq`].
+    suspend_seq: u64,
+    /// Windows that appeared but are not managed yet: they appeared during a
+    /// Space transition, or could not be read.  A re-check decides.
+    pending: HashSet<WindowId>,
+    /// Re-checks per window: how many have run, and whether one is scheduled.
+    rechecks: HashMap<WindowId, RecheckState>,
+    /// Re-checks requested since the daemon last took them
+    /// ([`Core::take_rechecks`]).
+    recheck_requests: Vec<(WindowId, Duration)>,
+    /// Until when a Space transition (native full screen, a desktop switch)
+    /// is taken to be in progress.
+    transition_until: Option<Instant>,
+    /// Whether the active Space is a native full-screen Space, according to
+    /// the last [`PlatformEvent::ActiveSpaceChanged`].
+    on_fullscreen_space: bool,
+    /// The left button and the drag it drives (drag to stack).
+    pointer: Pointer,
 }
+
+/// How long after a release that ended no drag a tiled window's move still
+/// counts as that drag's end.  In the VM a quick drag's first move reached
+/// the daemon 6-21 ms after the release.
+pub const DROP_GRACE: Duration = Duration::from_millis(250);
+
+/// The tile a drag starts on is taken this much larger: the resize edge
+/// reaches a few points outside a window, and a grid-snapping app sits a few
+/// points off its tile.
+const GRAB_MARGIN: f64 = 8.0;
+
+/// Left-button state for drag to stack.
+#[derive(Debug, Default)]
+struct Pointer {
+    /// Where the button went down, while it is held.
+    down: Option<(f64, f64)>,
+    /// The last known pointer location.
+    at: (f64, f64),
+    /// The tiled window being dragged.
+    drag: Option<Drag>,
+    /// The last release that ended no drag, for moves that arrive after it.
+    release: Option<Release>,
+    /// The drop highlight last sent to the backend.
+    hint: Option<DropHint>,
+}
+
+/// A tiled window the user is dragging.
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    wid: WindowId,
+    /// Its frame before the drag: what the app last accepted, else its tile.
+    before: Rect,
+    /// Its size changed: an edge resize, which never stacks.
+    resized: bool,
+    /// The last frame seen.
+    frame: Rect,
+}
+
+/// A release of the button that ended no drag.
+#[derive(Debug, Clone, Copy)]
+struct Release {
+    at: Instant,
+    point: (f64, f64),
+    /// Where the button went down.
+    down: (f64, f64),
+}
+
+/// Re-check bookkeeping for one window.
+#[derive(Debug, Clone, Copy, Default)]
+struct RecheckState {
+    /// Re-checks that have run.
+    attempts: usize,
+    /// A re-check is queued or its timer is running.
+    scheduled: bool,
+}
+
+/// Back-off between the re-checks of a window whose state could not be
+/// read.  Entering or leaving native full screen takes about 0.6 s in the VM;
+/// after the last delay a window that appeared is given up on, and a
+/// suspended one waits for the next Space change.
+pub const RECHECK_DELAYS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_millis(4000),
+];
+
+/// How long after the last sign of a Space transition (a window leaving its
+/// Space, a display-sized resize that cannot be read, an active-Space change)
+/// windows that appear are not managed directly.  The full-screen animation's
+/// helper windows appear and vanish within it.
+pub const TRANSITION_SETTLE: Duration = Duration::from_millis(1000);
 
 /// A managed window that is out of the layout until it is back on screen.
 #[derive(Debug, Clone)]
@@ -112,6 +249,50 @@ struct Suspended {
     /// [`MINIMIZE_SETTLE`] after this, a read that reports the window not
     /// minimized does not resume it: the attribute has not caught up yet.
     minimized_at: Option<Instant>,
+    /// It left the desktop Space: it entered native full screen, or SkyLight
+    /// reported it destroyed while the window server still had it.  Such a
+    /// window is re-checked when the active Space changes.
+    fullscreen: bool,
+    /// Where it sat in the layout, to put it back there.
+    slot: Option<WindowSlot>,
+    /// Suspension order: windows suspended together come back in reverse,
+    /// so each finds the neighbours its slot names.
+    seq: u64,
+}
+
+/// What a fresh read says about a managed window that may be away
+/// ([`Core::check_away`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Away {
+    /// On screen and readable: not away.
+    Here,
+    /// Minimized or in native full screen: it was suspended.
+    Suspended,
+    /// The read failed (mid-transition, or on an inactive Space): nothing is
+    /// known.  A re-check is scheduled.
+    Unknown,
+}
+
+/// Why [`Core::suspend`] takes a window out of the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuspendKind {
+    /// It was minimized.
+    Minimized,
+    /// Its application was hidden (Cmd+H).
+    AppHidden,
+    /// It left the desktop's Space: native full screen.
+    FullScreen,
+}
+
+/// What [`Core::admit`] decided for a window that is not managed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Managed now.
+    Managed,
+    /// Not a window to manage (or gone): forget it.
+    Rejected,
+    /// Not decidable yet; look again later.
+    Later(&'static str),
 }
 
 /// How long after an Accessibility minimize notification a window's
@@ -171,7 +352,27 @@ impl Core {
             base_work_area: work_area,
             shell_strips: HashMap::new(),
             suspended: HashMap::new(),
+            suspend_seq: 0,
+            pending: HashSet::new(),
+            rechecks: HashMap::new(),
+            recheck_requests: Vec::new(),
+            transition_until: None,
+            on_fullscreen_space: false,
+            pointer: Pointer::default(),
         }
+    }
+
+    /// Re-checks requested since the last call: re-run [`Core::recheck`] for
+    /// each window after its delay.  The daemon calls this after every
+    /// message.
+    pub fn take_rechecks(&mut self) -> Vec<(WindowId, Duration)> {
+        std::mem::take(&mut self.recheck_requests)
+    }
+
+    /// Whether `wid` appeared but is not managed yet (it waits for a
+    /// re-check).
+    pub fn is_pending(&self, wid: WindowId) -> bool {
+        self.pending.contains(&wid)
     }
 
     /// Layout access for the IPC snapshot and tests.
@@ -320,8 +521,8 @@ impl Core {
     /// still recognised as consequences of our own changes.
     pub fn platform_event_at(&mut self, event: PlatformEvent, captured: Instant) {
         match event {
-            PlatformEvent::WindowCreated { wid, pid } => self.window_created(wid, pid),
-            PlatformEvent::WindowDestroyed { wid } => self.window_destroyed(wid),
+            PlatformEvent::WindowCreated { wid, pid } => self.window_created(wid, pid, captured),
+            PlatformEvent::WindowDestroyed { wid } => self.window_destroyed(wid, captured),
             PlatformEvent::WindowMoved { wid, frame }
             | PlatformEvent::WindowResized { wid, frame } => {
                 self.window_geometry(wid, frame, captured)
@@ -351,6 +552,9 @@ impl Core {
             PlatformEvent::AppHidden { pid } => self.app_hidden(pid),
             PlatformEvent::AppShown { pid } => self.app_shown(pid),
             PlatformEvent::WindowLevelChanged { wid } => self.window_level_changed(wid),
+            PlatformEvent::ActiveSpaceChanged { space, fullscreen } => {
+                self.active_space_changed(space, fullscreen, captured);
+            }
             PlatformEvent::DisplayChanged => {}
             PlatformEvent::UnhandledSls { event, wid, len } => {
                 log::debug!("unhandled SLS event {event} wid={wid:?} len={len}");
@@ -358,23 +562,47 @@ impl Core {
         }
     }
 
-    fn window_created(&mut self, wid: u32, pid: i32) {
+    fn window_created(&mut self, wid: u32, pid: i32, captured: Instant) {
         let wid = u64::from(wid);
         if self.suspended.contains_key(&wid) {
             // SkyLight reports a window that re-appears on a Space as created;
             // a suspended one may be back.  Never add it a second time.
-            self.try_resume(wid);
+            if !self.try_resume_at(wid, captured, ResumeTrigger::Read) {
+                self.recheck_if_left_space(wid);
+            }
             return;
         }
         if pid == self.self_pid
             || self.layout.window_info(wid).is_some()
             || self.shell_strips.contains_key(&wid)
+            || self.pending.contains(&wid)
         {
             return;
         }
-        let Some(info) = self.applier.backend().window_info(wid) else {
-            log::debug!("window {wid} disappeared before it could be inspected");
+        if self.in_transition(captured) {
+            self.defer(wid, "appeared during a Space transition");
             return;
+        }
+        match self.admit(wid) {
+            Admission::Managed | Admission::Rejected => {}
+            Admission::Later(reason) => self.defer(wid, reason),
+        }
+    }
+
+    /// Read a window that is not managed yet and manage it if it is a real
+    /// window on the desktop's Space.
+    ///
+    /// The full-screen animation creates helper windows that look like
+    /// ordinary level-0 windows covering the display; they are on no Space
+    /// when they appear (verified on macOS 15.6), which is what keeps them out.
+    fn admit(&mut self, wid: WindowId) -> Admission {
+        let backend = self.applier.backend();
+        let Some(info) = backend.window_info(wid) else {
+            if backend.window_presence(wid) == WindowPresence::Gone {
+                log::debug!("window {wid} disappeared before it could be inspected");
+                return Admission::Rejected;
+            }
+            return Admission::Later("could not be read");
         };
         if rules::is_shell_window(&info) {
             // Tracked even without a frame: its move/resize notifications
@@ -386,28 +614,89 @@ impl Core {
             );
             self.shell_strips.insert(wid, frame);
             self.recompute_work_area();
-            return;
+            return Admission::Rejected;
         }
         if !rules::is_manageable(&info) {
             log::debug!("ignoring unmanaged window {wid} ({})", info.app_id);
-            return;
+            return Admission::Rejected;
+        }
+        if info.role.is_none() {
+            return Admission::Later("is not readable through Accessibility");
+        }
+        match backend.window_presence(wid) {
+            WindowPresence::Gone => return Admission::Rejected,
+            WindowPresence::Detached => return Admission::Later("is on no Space"),
+            WindowPresence::OnSpace { fullscreen: true } => {
+                return Admission::Later("is on a full-screen Space");
+            }
+            WindowPresence::OnSpace { fullscreen: false } => {}
         }
         log::info!(
             "managing new window {wid} ({} / {:?})",
             info.app_id,
             info.title
         );
+        self.pending.remove(&wid);
+        self.rechecks.remove(&wid);
         self.add_window(info);
+        Admission::Managed
     }
 
-    fn window_destroyed(&mut self, wid: u32) {
+    /// Leave a window that appeared to a re-check instead of managing it now.
+    fn defer(&mut self, wid: WindowId, reason: &str) {
+        if self.schedule_recheck(wid) {
+            log::debug!("window {wid} {reason}; looking at it again later");
+            self.pending.insert(wid);
+        } else {
+            log::debug!("window {wid} {reason}; giving up on it");
+            self.pending.remove(&wid);
+            self.rechecks.remove(&wid);
+        }
+    }
+
+    /// SkyLight reports a window as destroyed when it closes, and also when it
+    /// leaves its Space for a native full-screen one.  Only a window the
+    /// window server no longer has is forgotten; one that still exists is
+    /// suspended (or stays suspended) with its constraints and journal entry,
+    /// and a re-check follows it.
+    fn window_destroyed(&mut self, wid: u32, captured: Instant) {
         let wid = u64::from(wid);
         if self.shell_strips.remove(&wid).is_some() {
             log::info!("shell window {wid} closed; releasing its strip");
             self.recompute_work_area();
             return;
         }
-        self.stop_managing(wid);
+        let managed = self.layout.window_info(wid).is_some();
+        let tracked = managed || self.suspended.contains_key(&wid) || self.pending.contains(&wid);
+        if !tracked {
+            self.stop_managing(wid);
+            return;
+        }
+        let presence = self.applier.backend().window_presence(wid);
+        if presence == WindowPresence::Gone {
+            self.stop_managing(wid);
+            return;
+        }
+        if self.pending.contains(&wid) {
+            // Its scheduled re-check decides.
+            return;
+        }
+        log::debug!("window {wid}: destroy notification, but it still exists ({presence:?})");
+        self.mark_transition(captured);
+        if managed {
+            self.suspend(
+                wid,
+                "left its Space (native full screen?)",
+                SuspendKind::FullScreen,
+            );
+        } else if let Some(suspended) = self.suspended.get_mut(&wid)
+            && !suspended.app_hidden
+            && suspended.minimized_at.is_none()
+            && !suspended.info.minimized
+        {
+            suspended.fullscreen = true;
+        }
+        self.schedule_recheck(wid);
     }
 
     /// A managed window that leaves the normal level (a window turned into an
@@ -441,6 +730,8 @@ impl Core {
     /// the applier's and the learned-constraint state for it.
     fn stop_managing(&mut self, wid: WindowId) {
         self.suspended.remove(&wid);
+        self.pending.remove(&wid);
+        self.rechecks.remove(&wid);
         let commands = if self.layout.window_info(wid).is_some() {
             self.layout.window_removed(wid)
         } else {
@@ -461,7 +752,7 @@ impl Core {
         if self.layout.window_info(wid).is_none() {
             return;
         }
-        if !self.suspend_if_away(wid) {
+        if self.check_away(wid, Instant::now()) == Away::Here {
             log::debug!("window {wid}: hidden notification, but not minimized; ignoring it");
         }
     }
@@ -473,29 +764,45 @@ impl Core {
         if self.layout.window_info(wid).is_none() {
             return;
         }
-        self.suspend(wid, "was minimized", false);
+        self.suspend(wid, "was minimized", SuspendKind::Minimized);
         if let Some(suspended) = self.suspended.get_mut(&wid) {
             suspended.minimized_at = Some(captured);
         }
     }
 
     /// Re-read a managed window and suspend it when it is minimized or in
-    /// native full screen.  Returns whether it was suspended.
-    fn suspend_if_away(&mut self, wid: WindowId) -> bool {
-        if self.layout.window_info(wid).is_none() {
-            return false;
-        }
-        let Some(reason) = self
+    /// native full screen.
+    ///
+    /// A read that fails, or that Accessibility did not answer although it
+    /// did when the window was added, proves nothing either way: the window
+    /// may be in the middle of a Space transition.  That counts as a sign of
+    /// a transition and schedules a re-check.
+    fn check_away(&mut self, wid: WindowId, captured: Instant) -> Away {
+        let Some(existing) = self.layout.window_info(wid) else {
+            return Away::Here;
+        };
+        let had_ax_data = existing.role.is_some();
+        let info = self
             .applier
             .backend()
             .window_info(wid)
-            .as_ref()
-            .and_then(away_reason)
-        else {
-            return false;
+            .filter(|info| !had_ax_data || info.role.is_some());
+        let Some(info) = info else {
+            log::debug!("window {wid}: cannot be read right now; checking it again later");
+            self.mark_transition(captured);
+            self.schedule_recheck(wid);
+            return Away::Unknown;
         };
-        self.suspend(wid, reason, false);
-        true
+        let Some(reason) = away_reason(&info) else {
+            return Away::Here;
+        };
+        if info.minimized {
+            self.suspend(wid, reason, SuspendKind::Minimized);
+        } else {
+            self.mark_transition(captured);
+            self.suspend(wid, reason, SuspendKind::FullScreen);
+        }
+        Away::Suspended
     }
 
     /// Take a managed window out of the layout until it is back on screen.
@@ -504,7 +811,12 @@ impl Core {
     /// window.  Unlike [`Core::stop_managing`], the learned constraints and
     /// the journal entry are kept ([`CommandApplier::release_window`]); a
     /// window parked on another workspace stays parked and is not moved.
-    fn suspend(&mut self, wid: WindowId, reason: &str, app_hidden: bool) {
+    ///
+    /// A window that left for a full-screen Space keeps the keyboard: the
+    /// layout's focus moves on, but no window is focused or raised, since
+    /// macOS makes a desktop window key even while its Space is inactive
+    /// (seen in the VM: the next Ctrl+Cmd+F then went to that window).
+    fn suspend(&mut self, wid: WindowId, reason: &str, kind: SuspendKind) {
         let Some(info) = self.layout.window_info(wid).cloned() else {
             return;
         };
@@ -512,14 +824,24 @@ impl Core {
             "window {wid} ({}) {reason}; suspending it until it is back",
             info.app_id
         );
-        let commands = self.layout.window_removed(wid);
+        let slot = self.layout.slot_of(wid);
+        let mut commands = self.layout.window_removed(wid);
+        if kind == SuspendKind::FullScreen {
+            commands.retain(|command| {
+                !matches!(command, Command::Focus { .. } | Command::Raise { .. })
+            });
+        }
         self.applier.release_window(wid);
+        self.suspend_seq += 1;
         self.suspended.insert(
             wid,
             Suspended {
                 info,
-                app_hidden,
+                app_hidden: kind == SuspendKind::AppHidden,
                 minimized_at: None,
+                fullscreen: kind == SuspendKind::FullScreen,
+                slot,
+                seq: self.suspend_seq,
             },
         );
         self.apply(commands);
@@ -528,7 +850,7 @@ impl Core {
     /// Re-read a suspended window and put it back into the layout when it is
     /// manageable again (not minimized, not in full screen, normal level).
     ///
-    /// It is added like a new window, on the active workspace, with its
+    /// It goes back into the slot it left ([`Layout::window_restored`]), with its
     /// learned constraints re-attached.  Returns whether it was resumed.
     fn try_resume(&mut self, wid: WindowId) -> bool {
         self.try_resume_at(wid, Instant::now(), ResumeTrigger::Read)
@@ -575,13 +897,21 @@ impl Core {
         if rules::is_shell_window(&info) || !rules::is_manageable(&info) {
             return false;
         }
-        self.suspended.remove(&wid);
+        let Some(suspended) = self.suspended.remove(&wid) else {
+            return false;
+        };
+        self.rechecks.remove(&wid);
         let info = match self.constraints.get(&wid).copied() {
             Some(learned) => constraints::attach(info, learned),
             None => info,
         };
         log::info!("window {wid} ({}) is back; managing it again", info.app_id);
-        self.add_window(info);
+        let info = rules::normalize_for_layout(info);
+        let commands = match &suspended.slot {
+            Some(slot) => self.layout.window_restored(info, slot),
+            None => self.layout.window_added(info),
+        };
+        self.apply(commands);
         true
     }
 
@@ -606,7 +936,11 @@ impl Core {
         }
         self.batched(|core| {
             for wid in wids {
-                core.suspend(wid, "was hidden with its application", true);
+                core.suspend(
+                    wid,
+                    "was hidden with its application",
+                    SuspendKind::AppHidden,
+                );
             }
         });
     }
@@ -614,24 +948,248 @@ impl Core {
     /// A hidden application was shown again: resume its suspended windows
     /// that are back (a minimized one stays suspended).
     fn app_shown(&mut self, pid: i32) {
-        let mut wids: Vec<WindowId> = self
+        let mut wids: Vec<(u64, WindowId)> = self
             .suspended
             .iter_mut()
             .filter(|(_, suspended)| suspended.info.pid == pid)
             .map(|(wid, suspended)| {
                 suspended.app_hidden = false;
-                *wid
+                (suspended.seq, *wid)
             })
             .collect();
         if wids.is_empty() {
             return;
         }
-        wids.sort_unstable();
+        // Last suspended first: each window then finds the neighbours its
+        // slot names already back in place.
+        wids.sort_unstable_by(|a, b| b.cmp(a));
+        let wids: Vec<WindowId> = wids.into_iter().map(|(_, wid)| wid).collect();
         self.batched(|core| {
             for wid in wids {
                 core.try_resume(wid);
             }
         });
+    }
+
+    /// The active Space changed: a desktop switch, or a window entering or
+    /// leaving native full screen.
+    ///
+    /// Windows away in full screen are re-read at once (and re-checked
+    /// later if that fails), last suspended first.  When a desktop Space is
+    /// active again, every managed window is checked against the layout:
+    /// applications move their windows while their Space is inactive, where
+    /// Accessibility cannot move them back.
+    fn active_space_changed(&mut self, space: Option<u64>, fullscreen: bool, captured: Instant) {
+        log::debug!("active Space changed to {space:?} (full screen: {fullscreen})");
+        self.on_fullscreen_space = fullscreen;
+        self.mark_transition(captured);
+        // A new transition: every window gets a fresh re-check budget.
+        for state in self.rechecks.values_mut() {
+            state.attempts = 0;
+        }
+        self.rechecks.retain(|_, state| state.scheduled);
+        let mut away: Vec<(u64, WindowId)> = self
+            .suspended
+            .iter()
+            .filter(|(_, suspended)| suspended.fullscreen)
+            .map(|(wid, suspended)| (suspended.seq, *wid))
+            .collect();
+        away.sort_unstable_by(|a, b| b.cmp(a));
+        if !away.is_empty() {
+            self.batched(|core| {
+                for (_, wid) in away {
+                    if !core.try_resume_at(wid, captured, ResumeTrigger::Read) {
+                        core.schedule_recheck(wid);
+                    }
+                }
+            });
+        }
+        if !fullscreen {
+            self.reassert_layout();
+        }
+    }
+
+    /// Frame every managed window that drifted from its tile again, and park
+    /// every window that should be parked but is not.  The layout's command
+    /// diff cannot do this: it only emits what changed in the layout.
+    /// Windows that cannot be reached are re-checked later.
+    fn reassert_layout(&mut self) {
+        let wids: Vec<WindowId> = self
+            .layout
+            .windows()
+            .iter()
+            .map(|state| state.info.wid)
+            .collect();
+        for wid in wids {
+            if let Err(error) = self.reassert_window(wid) {
+                log::debug!("window {wid}: {error}; re-checking it later");
+                self.schedule_recheck(wid);
+            }
+        }
+    }
+
+    /// [`Core::reassert_layout`] for one window.
+    fn reassert_window(&mut self, wid: WindowId) -> Result<(), String> {
+        let Some(rect) = self.layout.frame_of(wid) else {
+            return Ok(());
+        };
+        let backend = self.applier.backend().clone();
+        let actual = backend
+            .frame(wid)
+            .ok_or_else(|| "its frame cannot be read".to_string())?;
+        if self.layout.is_visible(wid) {
+            // A grid-snapping or clamping app sits where it last accepted
+            // its tile, not exactly in it.
+            let accepted = self.applier.programmed_frame(wid);
+            if actual.approx_eq(rect, 2.0)
+                || accepted.is_some_and(|accepted| actual.approx_eq(accepted, 2.0))
+            {
+                return Ok(());
+            }
+            log::info!("window {wid} is at {actual:?}, not in its tile {rect:?}; framing it again");
+            if let Some(clamp) = self.applier.try_reapply_frame(wid, rect)? {
+                self.handle_clamp(clamp, 0);
+            }
+        } else {
+            if is_parked_frame(actual, backend.display_frame(wid)) {
+                return Ok(());
+            }
+            log::info!("window {wid} should be parked but is at {actual:?}; parking it again");
+            self.applier.repark(wid)?;
+        }
+        Ok(())
+    }
+
+    /// Run a re-check the daemon scheduled ([`Core::take_rechecks`]).
+    pub fn recheck(&mut self, wid: WindowId) {
+        self.recheck_at(wid, Instant::now());
+    }
+
+    /// [`Core::recheck`] as of `now`.
+    ///
+    /// A window that appeared is managed once it is readable, on the
+    /// desktop's Space and no transition is in progress.  A suspended window
+    /// is resumed when it is back and forgotten when it is gone; one still
+    /// away after the last re-check waits for the next event about it or the
+    /// next Space change.  A managed window is suspended if it went
+    /// away, and otherwise framed or parked again where it drifted.
+    pub fn recheck_at(&mut self, wid: WindowId, now: Instant) {
+        let Some(state) = self.rechecks.get_mut(&wid) else {
+            return;
+        };
+        state.scheduled = false;
+        state.attempts += 1;
+        if self.pending.contains(&wid) {
+            let outcome = if self.in_transition(now) {
+                Admission::Later("appeared during a Space transition")
+            } else {
+                self.admit(wid)
+            };
+            match outcome {
+                Admission::Managed => {}
+                Admission::Rejected => {
+                    self.pending.remove(&wid);
+                    self.rechecks.remove(&wid);
+                }
+                Admission::Later(reason) => self.defer(wid, reason),
+            }
+        } else if self.suspended.contains_key(&wid) {
+            self.recheck_suspended(wid, now);
+        } else if self.layout.window_info(wid).is_some() {
+            self.recheck_managed(wid, now);
+        } else {
+            self.rechecks.remove(&wid);
+        }
+    }
+
+    fn recheck_suspended(&mut self, wid: WindowId, now: Instant) {
+        if self.try_resume_at(wid, now, ResumeTrigger::Read) {
+            return;
+        }
+        if !self.suspended.contains_key(&wid) {
+            self.rechecks.remove(&wid);
+            return;
+        }
+        let presence = self.applier.backend().window_presence(wid);
+        if presence == WindowPresence::Gone {
+            log::info!("suspended window {wid} is gone; forgetting it");
+            self.stop_managing(wid);
+            return;
+        }
+        if self.schedule_recheck(wid) {
+            return;
+        }
+        // Out of re-checks.  Even a window on no Space is kept: it still has
+        // its owner, and the last re-check may just have met the transition
+        // out of full screen (seen in the VM).  The next Space change, or a
+        // created or destroyed notification for it, looks at it again.
+        self.rechecks.remove(&wid);
+        log::debug!("window {wid} is still away ({presence:?}); waiting for it");
+    }
+
+    fn recheck_managed(&mut self, wid: WindowId, now: Instant) {
+        if self.on_fullscreen_space {
+            // The desktop is an inactive Space: nothing there can be read or
+            // moved.  Changing back re-asserts every tile.
+            self.rechecks.remove(&wid);
+            return;
+        }
+        let done = match self.check_away(wid, now) {
+            Away::Suspended => !self.suspended.get(&wid).is_some_and(|s| s.fullscreen),
+            // check_away scheduled the next re-check if there is one left.
+            Away::Unknown => !self.rechecks.get(&wid).is_some_and(|state| state.scheduled),
+            Away::Here => match self.reassert_window(wid) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::debug!("window {wid}: {error}");
+                    !self.schedule_recheck(wid)
+                }
+            },
+        };
+        if done {
+            self.rechecks.remove(&wid);
+        }
+    }
+
+    /// Queue a re-check of `wid` after the next delay of its back-off.
+    /// Returns false when it has had all of them; a re-check that is
+    /// already queued counts as scheduled.
+    fn schedule_recheck(&mut self, wid: WindowId) -> bool {
+        let state = self.rechecks.entry(wid).or_default();
+        if state.scheduled {
+            return true;
+        }
+        let Some(&delay) = RECHECK_DELAYS.get(state.attempts) else {
+            return false;
+        };
+        state.scheduled = true;
+        self.recheck_requests.push((wid, delay));
+        true
+    }
+
+    /// A suspended window that left its Space was not resumed by an event
+    /// about it: it may only be unreadable mid-transition, so look again.
+    fn recheck_if_left_space(&mut self, wid: WindowId) {
+        if self
+            .suspended
+            .get(&wid)
+            .is_some_and(|suspended| suspended.fullscreen)
+        {
+            self.schedule_recheck(wid);
+        }
+    }
+
+    /// A Space transition was seen at `at`.
+    fn mark_transition(&mut self, at: Instant) {
+        let until = at + TRANSITION_SETTLE;
+        if self.transition_until.is_none_or(|current| current < until) {
+            self.transition_until = Some(until);
+        }
+    }
+
+    /// Whether a Space transition is taken to be in progress at `at`.
+    fn in_transition(&self, at: Instant) -> bool {
+        self.transition_until.is_some_and(|until| at < until)
     }
 
     /// Whether `frame` contains the display's whole work area (within a
@@ -685,7 +1243,17 @@ impl Core {
         if self.suspended.contains_key(&wid) {
             // Leaving full screen resizes the window back; it may be manageable
             // again.
-            self.try_resume_at(wid, captured, ResumeTrigger::Read);
+            if !self.try_resume_at(wid, captured, ResumeTrigger::Read) {
+                self.recheck_if_left_space(wid);
+            }
+            return;
+        }
+        if self.on_fullscreen_space && self.layout.window_info(wid).is_some() {
+            // Managed windows are on the desktop, an inactive Space now: the
+            // user cannot move them, but applications do (TextEdit cascades
+            // them again), and Accessibility cannot move them back.  Not a
+            // user resize either.  Returning to the desktop re-asserts them.
+            log::debug!("window {wid} moved while its Space is inactive; leaving it for now");
             return;
         }
         // The size the app last accepted; read it before the echo check, which
@@ -705,8 +1273,9 @@ impl Core {
         // Entering native full screen resizes the window over the whole
         // display.  Check for it before the snap-back below would fight the
         // transition; the extra read only happens for frames that contain the
-        // work area.
-        if self.contains_work_area(frame) && self.suspend_if_away(wid) {
+        // work area.  Mid-transition the read fails: leave the window alone
+        // then and let the re-check decide.
+        if self.contains_work_area(frame) && self.check_away(wid, captured) != Away::Here {
             return;
         }
         if !state.visible {
@@ -727,25 +1296,205 @@ impl Core {
         // Compare with the size the app last accepted, not the layout tile: a
         // grid-snapping app (Terminal) always sits a few px off its tile, so a
         // plain drag would otherwise count as a resize.
-        let tolerance = crate::backend::AppliedFrame::TOLERANCE;
         let known = accepted.unwrap_or(state.frame);
-        if (frame.width - known.width).abs() > tolerance
-            || (frame.height - known.height).abs() > tolerance
-        {
+        if size_differs(frame, known) {
             self.invalidate_constraints(wid);
         }
         if state.floating {
             return;
         }
-        // A tiled window moved by the user snaps back to its layout slot.
-        if let Some(rect) = self.layout.frame_of(wid) {
-            if rect.approx_eq(frame, 2.0) {
-                return;
+        if self.track_drag(wid, frame, known, state.frame, captured) {
+            return;
+        }
+        self.snap_back(wid, frame);
+    }
+
+    /// A tiled window the user moved snaps back to its layout slot, unless it
+    /// is already there (`frame` is where it is now).
+    fn snap_back(&mut self, wid: WindowId, frame: Rect) {
+        let Some(rect) = self.layout.frame_of(wid) else {
+            return;
+        };
+        if rect.approx_eq(frame, 2.0) {
+            return;
+        }
+        log::debug!("window {wid} moved by user; snapping back to {rect:?}");
+        match self.applier.try_reapply_frame(wid, rect) {
+            Ok(Some(clamp)) => self.handle_clamp(clamp, 0),
+            Ok(None) => {}
+            Err(error) => {
+                // Typically an application moving its windows while their
+                // Space is inactive, where Accessibility cannot reach
+                // them.  Retry later; a Space change back re-asserts too.
+                log::debug!("snapping window {wid} back failed: {error}; retrying later");
+                self.schedule_recheck(wid);
             }
-            log::debug!("window {wid} moved by user; snapping back to {rect:?}");
-            if let Some(clamp) = self.applier.reapply_frame(wid, rect) {
-                self.handle_clamp(clamp, 0);
+        }
+    }
+
+    /// Feed one left-button event from the mouse tap, captured at `captured`.
+    pub fn mouse_event_at(&mut self, event: MouseEvent, captured: Instant) {
+        let point = (event.location.x, event.location.y);
+        self.pointer.at = point;
+        match event.kind {
+            MouseEventKind::Down => {
+                if let Some(drag) = self.pointer.drag.take() {
+                    // The release was missed (the tap was disabled for a
+                    // moment): end that drag without a drop.
+                    self.end_drag(drag, None);
+                }
+                self.pointer.down = Some(point);
+                self.pointer.release = None;
             }
+            MouseEventKind::Dragged => {
+                if self.pointer.drag.is_some() {
+                    self.update_drop_hint();
+                }
+            }
+            MouseEventKind::Up => {
+                let down = self.pointer.down.take();
+                match self.pointer.drag.take() {
+                    Some(drag) => self.end_drag(drag, Some(point)),
+                    None => {
+                        self.pointer.release = down.map(|down| Release {
+                            at: captured,
+                            point,
+                            down,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// Follow a user move of the visible tiled window `wid` (now at `frame`,
+    /// at `before` until the user moved it, in the tile `tile`).  Returns true
+    /// when the move belongs to a drag, which must not be snapped back now.
+    fn track_drag(
+        &mut self,
+        wid: WindowId,
+        frame: Rect,
+        before: Rect,
+        tile: Rect,
+        captured: Instant,
+    ) -> bool {
+        if let Some(drag) = &mut self.pointer.drag {
+            if drag.wid != wid {
+                return false;
+            }
+            drag.frame = frame;
+            drag.resized |= size_differs(frame, drag.before);
+            self.update_drop_hint();
+            return true;
+        }
+        let grabbed = |(x, y): (f64, f64)| tile.inset(-GRAB_MARGIN).contains_point(x, y);
+        let drag = Drag {
+            wid,
+            before,
+            resized: size_differs(frame, before),
+            frame,
+        };
+        if let Some(down) = self.pointer.down {
+            if !grabbed(down) {
+                // The button is held somewhere else: not this window's drag.
+                return false;
+            }
+            log::debug!("window {wid}: drag started");
+            self.pointer.drag = Some(drag);
+            self.update_drop_hint();
+            return true;
+        }
+        let Some(release) = self.pointer.release else {
+            return false;
+        };
+        if captured.saturating_duration_since(release.at) > DROP_GRACE || !grabbed(release.down) {
+            return false;
+        }
+        self.pointer.release = None;
+        log::debug!("window {wid} moved just after a release; taking it as a drop");
+        self.end_drag(drag, Some(release.point));
+        true
+    }
+
+    /// End a drag: stack the window onto the tile under `drop_at` when that
+    /// is a stack zone and the drag was a pure move, else snap it back.
+    /// `None` (the release was missed) always snaps back.
+    fn end_drag(&mut self, drag: Drag, drop_at: Option<(f64, f64)>) {
+        self.set_drop_hint(None);
+        let wid = drag.wid;
+        if !self.layout.is_visible(wid) {
+            // Closed, suspended or moved away during the drag.
+            return;
+        }
+        let zone = drop_at
+            .filter(|_| !drag.resized)
+            .and_then(|(x, y)| self.layout.drop_zone(wid, x, y));
+        match zone {
+            Some(DropZone::Stack { target, .. }) => self.stack_dropped(wid, target, drag.frame),
+            None => self.snap_back(wid, drag.frame),
+        }
+        // A last move of the drag can land after the frame set above; look
+        // again once it has settled.
+        self.schedule_recheck(wid);
+    }
+
+    /// The user dropped `wid` onto `target`'s stack zone.
+    fn stack_dropped(&mut self, wid: WindowId, target: WindowId, frame: Rect) {
+        let mut commands = self.layout.stack_onto(wid, target);
+        if commands.is_empty() {
+            self.snap_back(wid, frame);
+            return;
+        }
+        log::info!("window {wid} dropped onto window {target}: stacked");
+        // The window sits where it was dropped, not in the tile the layout
+        // last gave it: always frame it.
+        if let Some(rect) = self.layout.frame_of(wid)
+            && !commands
+                .iter()
+                .any(|command| matches!(command, Command::SetFrame { wid: w, .. } if *w == wid))
+        {
+            let at = commands
+                .iter()
+                .position(|command| {
+                    matches!(
+                        command,
+                        Command::Focus { .. }
+                            | Command::Raise { .. }
+                            | Command::StackChanged { .. }
+                    )
+                })
+                .unwrap_or(commands.len());
+            commands.insert(at, Command::SetFrame { wid, rect });
+        }
+        self.apply(commands);
+    }
+
+    /// Show the highlight for the drop zone under the pointer, if the drag
+    /// can stack there.
+    fn update_drop_hint(&mut self) {
+        let (x, y) = self.pointer.at;
+        let hint = self
+            .pointer
+            .drag
+            .filter(|drag| !drag.resized)
+            .and_then(|drag| self.layout.drop_zone(drag.wid, x, y))
+            .map(|zone| match zone {
+                DropZone::Stack { target, tile } => DropHint {
+                    target,
+                    frame: tile,
+                },
+            });
+        self.set_drop_hint(hint);
+    }
+
+    /// Send the drop highlight to the backend when it changed.
+    fn set_drop_hint(&mut self, hint: Option<DropHint>) {
+        if self.pointer.hint == hint {
+            return;
+        }
+        self.pointer.hint = hint;
+        if let Err(error) = self.applier.backend().set_drop_hint(hint) {
+            log::debug!("drop hint update failed: {error}");
         }
     }
 
@@ -782,7 +1531,9 @@ impl Core {
             // A suspended window that takes focus is probably back (a
             // full-screen exit whose resize was read too early, a deminimize
             // whose notification was missed).  Re-check it; resuming focuses it.
-            self.try_resume_at(wid, captured, ResumeTrigger::Read);
+            if !self.try_resume_at(wid, captured, ResumeTrigger::Read) {
+                self.recheck_if_left_space(wid);
+            }
             return;
         }
         if self.layout.window_info(wid).is_none() {
@@ -847,6 +1598,9 @@ impl Core {
             Request::ListWorkspaces => Response::Workspaces(self.layout.workspaces()),
             Request::Tree => Response::Tree(self.layout.tree_snapshot()),
             Request::Config => Response::Config(self.layout.config().clone()),
+            // The IPC server streams subscriptions itself (`ipc.rs`); a
+            // subscribe that reaches the core gets a one-shot snapshot.
+            Request::Subscribe => Response::State(crate::shell_state::snapshot(&self.layout)),
             Request::Action(action) => {
                 self.action(action);
                 Response::Ok
@@ -1024,8 +1778,8 @@ impl Core {
         // A window minimized (or gone full screen) before its notification
         // arrived refuses its tile for that reason, not because of a size
         // limit.  Suspend it instead of probing it, which would pin a bogus
-        // bound.
-        if self.suspend_if_away(clamp.wid) {
+        // bound.  Nor is a window probed that cannot be read right now.
+        if self.check_away(clamp.wid, Instant::now()) != Away::Here {
             return;
         }
         if depth >= MAX_CONSTRAINT_PASSES {
@@ -1298,6 +2052,12 @@ fn command_window(command: &Command) -> Option<WindowId> {
     }
 }
 
+/// Whether the sizes of `a` and `b` differ by more than the frame tolerance.
+fn size_differs(a: Rect, b: Rect) -> bool {
+    let tolerance = crate::backend::AppliedFrame::TOLERANCE;
+    (a.width - b.width).abs() > tolerance || (a.height - b.height).abs() > tolerance
+}
+
 fn rect_from_platform(rect: cosmic_mac_platform::Rect) -> cosmic_mac_protocol::Rect {
     cosmic_mac_protocol::Rect::new(
         rect.origin.x,
@@ -1330,6 +2090,7 @@ mod tests {
         Park(WindowId, Rect),
         Unpark(WindowId),
         StackBar(Option<StackInfo>),
+        DropHint(Option<DropHint>),
     }
 
     struct State {
@@ -1356,6 +2117,16 @@ mod tests {
 
     #[derive(Debug, Clone, Default)]
     struct InfoOverride {
+        /// Moving between Spaces (native full screen): CoreGraphics and
+        /// Accessibility have no record of it, so reads return nothing and
+        /// moves fail, but the window server still has it (on no Space).
+        unlisted: bool,
+        /// On an inactive Space: CoreGraphics lists it (no AX data), but
+        /// Accessibility cannot reach it, so moves fail.
+        off_space: bool,
+        /// What `window_presence` reports instead of the state derived from
+        /// the flags above.
+        presence: Option<WindowPresence>,
         app_id: Option<&'static str>,
         pid: Option<i32>,
         level: i32,
@@ -1376,7 +2147,7 @@ mod tests {
                     .with_pid(info.pid.unwrap_or(test_pid(wid)))
                     .with_initial_frame(frame)
                     .with_level(info.level);
-            if !info.ax_unreadable {
+            if !info.ax_unreadable && !info.off_space {
                 toplevel.role = Some("AXWindow".into());
                 toplevel = toplevel
                     .with_minimized(info.minimized)
@@ -1385,12 +2156,28 @@ mod tests {
             toplevel
         }
 
+        /// The frame a read reports: none while the window is between Spaces.
+        fn listed_frame(&self, wid: WindowId) -> Option<Rect> {
+            let unlisted = self.overrides.get(&wid).is_some_and(|info| info.unlisted);
+            self.frames.get(&wid).copied().filter(|_| !unlisted)
+        }
+
+        /// Whether Accessibility can move `wid`.
+        fn reachable(&self, wid: WindowId) -> PlatformResult<()> {
+            match self.overrides.get(&wid) {
+                Some(info) if info.unlisted || info.off_space => {
+                    Err(format!("window {wid} not found"))
+                }
+                _ => Ok(()),
+            }
+        }
+
         /// Every window, front-to-back.
         fn toplevels(&self) -> Vec<ToplevelInfo> {
             self.order
                 .iter()
                 .filter_map(|wid| {
-                    let frame = self.frames.get(wid).copied()?;
+                    let frame = self.listed_frame(*wid)?;
                     Some(self.toplevel(*wid, frame))
                 })
                 .collect()
@@ -1466,6 +2253,23 @@ mod tests {
             state.overrides.entry(wid).or_default().ax_unreadable = unreadable;
         }
 
+        /// The window is between Spaces ([`InfoOverride::unlisted`]).
+        fn set_unlisted(&self, wid: WindowId, unlisted: bool) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().unlisted = unlisted;
+        }
+
+        /// The window is on an inactive Space ([`InfoOverride::off_space`]).
+        fn set_off_space(&self, wid: WindowId, off_space: bool) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().off_space = off_space;
+        }
+
+        fn set_presence(&self, wid: WindowId, presence: WindowPresence) {
+            let mut state = self.state.lock().unwrap();
+            state.overrides.entry(wid).or_default().presence = Some(presence);
+        }
+
         /// Move or resize a window behind the daemon's back (the user, the
         /// app or the system did it).
         fn set_frame_externally(&self, wid: WindowId, frame: Rect) {
@@ -1531,6 +2335,7 @@ mod tests {
     impl PlatformBackend for TestBackend {
         fn set_frame(&self, wid: WindowId, rect: Rect) -> PlatformResult<AppliedFrame> {
             let mut state = self.state.lock().unwrap();
+            state.reachable(wid)?;
             state.calls.push(Call::SetFrame(wid, rect));
             let mut applied = rect;
             if let Some(frozen) = state.frozen_width.get(&wid) {
@@ -1609,15 +2414,27 @@ mod tests {
         }
         fn park(&self, wid: WindowId, display: Rect) -> PlatformResult<Option<Rect>> {
             let mut state = self.state.lock().unwrap();
+            state.reachable(wid)?;
             state.calls.push(Call::Park(wid, display));
             let frame = state.frames.get(&wid).copied().unwrap_or(Rect::ZERO);
             state.parked.entry(wid).or_insert(frame);
+            // Into the corner, like the platform's parking.
+            let corner = cosmic_mac_platform::window::park_origin(platform_rect(display));
+            state.frames.insert(
+                wid,
+                Rect::new(corner.x, corner.y, frame.width, frame.height),
+            );
             Ok(Some(frame))
         }
         fn unpark(&self, wid: WindowId) -> PlatformResult<Option<Rect>> {
             let mut state = self.state.lock().unwrap();
+            state.reachable(wid)?;
             state.calls.push(Call::Unpark(wid));
-            Ok(state.parked.remove(&wid))
+            let saved = state.parked.remove(&wid);
+            if let Some(saved) = saved {
+                state.frames.insert(wid, saved);
+            }
+            Ok(saved)
         }
         fn saved_frame(&self, wid: WindowId) -> Option<Rect> {
             self.state.lock().unwrap().parked.get(&wid).copied()
@@ -1638,13 +2455,28 @@ mod tests {
             Vec::new()
         }
         fn frame(&self, wid: WindowId) -> Option<Rect> {
-            self.frame(wid)
+            self.state.lock().unwrap().listed_frame(wid)
         }
         fn window_info(&self, wid: WindowId) -> Option<ToplevelInfo> {
             let mut state = self.state.lock().unwrap();
             state.info_reads += 1;
-            let frame = state.frames.get(&wid).copied()?;
+            let frame = state.listed_frame(wid)?;
             Some(state.toplevel(wid, frame))
+        }
+        fn window_presence(&self, wid: WindowId) -> WindowPresence {
+            let state = self.state.lock().unwrap();
+            let info = state.overrides.get(&wid).cloned().unwrap_or_default();
+            if let Some(presence) = info.presence {
+                presence
+            } else if !state.frames.contains_key(&wid) {
+                WindowPresence::Gone
+            } else if info.unlisted {
+                WindowPresence::Detached
+            } else {
+                WindowPresence::OnSpace {
+                    fullscreen: info.fullscreen,
+                }
+            }
         }
         fn windows(&self) -> Vec<ToplevelInfo> {
             // Unfiltered: the core must apply the level/minimized/shell rules
@@ -1661,6 +2493,10 @@ mod tests {
         }
         fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()> {
             self.state.lock().unwrap().calls.push(Call::StackBar(stack));
+            Ok(())
+        }
+        fn set_drop_hint(&self, hint: Option<DropHint>) -> PlatformResult<()> {
+            self.state.lock().unwrap().calls.push(Call::DropHint(hint));
             Ok(())
         }
         fn main_work_area(&self) -> Rect {
@@ -3256,7 +4092,7 @@ mod tests {
                 | Call::Focus(w)
                 | Call::Park(w, _)
                 | Call::Unpark(w) => *w == wid,
-                Call::StackBar(_) => false,
+                Call::StackBar(_) | Call::DropHint(_) => false,
             })
             .cloned()
             .collect()
@@ -3795,5 +4631,671 @@ mod tests {
         backend.set_minimized(1, false);
         core.platform_event(shown(1));
         assert!(core.layout().window_info(1).is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Native full screen: Space transitions, re-checks, re-asserting tiles
+    // ---------------------------------------------------------------------
+
+    /// Where TextEdit puts its other windows while their Space is inactive.
+    const CASCADE: Rect = Rect::new(185.0, 75.0, 646.0, 418.0);
+
+    fn destroyed(wid: WindowId) -> PlatformEvent {
+        PlatformEvent::WindowDestroyed { wid: wid as u32 }
+    }
+
+    fn moved(wid: WindowId, frame: Rect) -> PlatformEvent {
+        PlatformEvent::WindowMoved {
+            wid: wid as u32,
+            frame: platform_rect(frame),
+        }
+    }
+
+    fn space_changed(space: u64, fullscreen: bool) -> PlatformEvent {
+        PlatformEvent::ActiveSpaceChanged {
+            space: Some(space),
+            fullscreen,
+        }
+    }
+
+    fn after(at: Instant, millis: u64) -> Instant {
+        at + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn a_window_destroyed_while_the_window_server_still_has_it_is_suspended() {
+        let (mut core, backend, _dir) = started(&[1, 2, 3]);
+        let area = learn_min_width_of_window_1(&mut core, &backend);
+        core.take_rechecks();
+        let marker = backend.calls().len();
+
+        // Entering native full screen: the window is between Spaces when
+        // SkyLight reports it destroyed.
+        backend.set_unlisted(1, true);
+        core.platform_event(destroyed(1));
+
+        assert!(core.is_suspended(1));
+        assert!(core.layout().window_info(1).is_none());
+        assert_eq!(
+            core.constraints(1).and_then(|learned| learned.min),
+            Some(Size::new(600.0, 100.0)),
+            "learned constraints kept"
+        );
+        assert!(core.applier().journal().contains(1), "journal entry kept");
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [], "{calls:?}");
+        assert_tiles_cover(&backend, &[2, 3], area);
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+        // The full-screen window keeps the keyboard; only the layout's focus
+        // moves on.
+        assert_ne!(core.layout().focused(), Some(1));
+        assert!(
+            !calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Focus(_))),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_destroyed_window_the_window_server_no_longer_has_is_forgotten() {
+        let (mut core, backend, _dir) = started(&[1, 2, 3]);
+        let area = learn_min_width_of_window_1(&mut core, &backend);
+        core.take_rechecks();
+
+        backend.remove_window(1);
+        core.platform_event(destroyed(1));
+
+        assert!(!core.is_suspended(1));
+        assert!(core.layout().window_info(1).is_none());
+        assert_eq!(core.constraints(1), None);
+        assert!(!core.applier().journal().contains(1));
+        assert_tiles_cover(&backend, &[2, 3], area);
+        assert_eq!(core.take_rechecks(), []);
+    }
+
+    #[test]
+    fn leaving_native_full_screen_puts_the_window_back_into_its_old_tile() {
+        let (mut core, backend, _dir) = started(&[1, 2, 3]);
+        core.applier.set_debounce(Duration::ZERO);
+        let before = backend.frames();
+        let t0 = Instant::now();
+
+        // Entering (the order seen on macOS 15.6): the resize to the display
+        // cannot be read, SkyLight reports the window destroyed, the
+        // full-screen Space becomes active and the window appears on it.
+        backend.set_unlisted(3, true);
+        core.platform_event_at(resized(3, DISPLAY), t0);
+        assert!(!core.is_suspended(3), "nothing is known yet");
+        core.platform_event_at(destroyed(3), after(t0, 50));
+        assert!(core.is_suspended(3));
+        core.platform_event_at(space_changed(5, true), after(t0, 550));
+        backend.set_unlisted(3, false);
+        backend.set_fullscreen(3, true);
+        backend.set_frame_externally(3, DISPLAY);
+        core.platform_event_at(created(3), after(t0, 600));
+        assert_eq!(core.take_rechecks(), [(3, RECHECK_DELAYS[0])]);
+        core.recheck_at(3, after(t0, 1100));
+        assert!(core.is_suspended(3), "still in full screen");
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+
+        // Leaving: between Spaces again when the desktop's Space becomes
+        // active; back at its old frame by the time the re-check runs.
+        let t1 = after(t0, 10_000);
+        backend.set_unlisted(3, true);
+        core.platform_event_at(destroyed(3), t1);
+        core.platform_event_at(space_changed(1, false), after(t1, 500));
+        assert!(core.is_suspended(3));
+        backend.set_unlisted(3, false);
+        backend.set_fullscreen(3, false);
+        backend.set_frame_externally(3, before[&3]);
+        core.recheck_at(3, after(t1, 1000));
+
+        assert!(!core.is_suspended(3));
+        assert_eq!(backend.frames(), before, "every window is back in its tile");
+        assert_eq!(core.layout().frame_of(3), Some(before[&3]));
+    }
+
+    #[test]
+    fn returning_to_the_desktop_frames_and_parks_drifted_windows_again() {
+        let (mut core, backend, _dir) = started(&[1, 2, 3]);
+        core.applier.set_debounce(Duration::ZERO);
+        // Window 1 on another workspace, parked in the corner.
+        core.action(Action::MoveToWorkspace { index: 2 });
+        assert!(!core.applier().is_visible(1));
+        let saved = backend.saved_frame(1).expect("parked");
+        let tiles = backend.frames();
+        let t0 = Instant::now();
+
+        // A window of the same app went full screen.  While the desktop is
+        // an inactive Space, the app moves its other windows there, where
+        // Accessibility cannot reach them; the snap-back fails.
+        for wid in [1, 2] {
+            backend.set_off_space(wid, true);
+            backend.set_frame_externally(wid, CASCADE);
+        }
+        let marker = backend.calls().len();
+        core.platform_event_at(space_changed(5, true), t0);
+        core.platform_event_at(moved(2, CASCADE), after(t0, 20));
+        assert_eq!(
+            backend.calls()[marker..],
+            [],
+            "nothing is re-asserted on a full-screen Space"
+        );
+
+        // Back on the desktop: everything is reachable and re-asserted.
+        for wid in [1, 2] {
+            backend.set_off_space(wid, false);
+        }
+        core.platform_event_at(space_changed(1, false), after(t0, 5000));
+
+        let calls = backend.calls();
+        assert!(
+            calls[marker..].contains(&Call::SetFrame(2, tiles[&2])),
+            "{calls:?}"
+        );
+        assert_eq!(backend.frame(2), Some(tiles[&2]));
+        assert!(
+            is_parked_frame(backend.frame(1).unwrap(), DISPLAY),
+            "parked again: {:?}",
+            backend.frame(1)
+        );
+        assert_eq!(backend.saved_frame(1), Some(saved), "its frame is kept");
+        assert_eq!(calls_for(&calls, marker, 3), [], "window 3 did not drift");
+    }
+
+    #[test]
+    fn a_snap_back_that_cannot_reach_the_window_is_retried_later() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        let tile = backend.frame(1).unwrap();
+        core.take_rechecks();
+        let t0 = Instant::now();
+
+        // The app moves a window while its Space is inactive.
+        backend.set_off_space(1, true);
+        backend.set_frame_externally(1, CASCADE);
+        core.platform_event_at(moved(1, CASCADE), t0);
+        assert_eq!(backend.frame(1), Some(CASCADE));
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+
+        // Reachable again when the re-check runs.
+        backend.set_off_space(1, false);
+        core.recheck_at(1, after(t0, 500));
+
+        assert_eq!(backend.frame(1), Some(tile));
+        assert!(core.layout().window_info(1).is_some());
+        assert_eq!(core.take_rechecks(), []);
+    }
+
+    #[test]
+    fn a_display_sized_resize_that_cannot_be_read_is_left_to_a_re_check() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        core.take_rechecks();
+        let marker = backend.calls().len();
+        let t0 = Instant::now();
+
+        backend.set_frame_externally(1, DISPLAY);
+        backend.set_unlisted(1, true);
+        core.platform_event_at(resized(1, DISPLAY), t0);
+
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [], "{calls:?}");
+        assert!(core.layout().window_info(1).is_some(), "nothing known yet");
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+
+        // The re-check finds it in full screen.
+        backend.set_unlisted(1, false);
+        backend.set_fullscreen(1, true);
+        core.recheck_at(1, after(t0, 500));
+
+        assert!(core.is_suspended(1));
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+        let calls = backend.calls();
+        assert!(
+            !calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Focus(_))),
+            "the full-screen window keeps the keyboard: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_that_appears_during_a_space_transition_waits_until_it_settles() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        let t0 = Instant::now();
+        // Window 1 leaves for a full-screen Space.
+        backend.set_unlisted(1, true);
+        core.platform_event_at(destroyed(1), t0);
+        core.take_rechecks();
+
+        // A window appears right after it, readable and on the desktop.
+        backend.add_window(9, START);
+        core.platform_event_at(created(9), after(t0, 100));
+        assert!(core.is_pending(9));
+        assert!(core.layout().window_info(9).is_none());
+        assert_eq!(core.take_rechecks(), [(9, RECHECK_DELAYS[0])]);
+
+        // Still within the transition: not yet.
+        core.recheck_at(9, after(t0, 600));
+        assert!(core.is_pending(9));
+        assert!(core.layout().window_info(9).is_none());
+        assert_eq!(core.take_rechecks(), [(9, RECHECK_DELAYS[1])]);
+
+        // Settled and still there: managed.
+        core.recheck_at(9, after(t0, 2100));
+        assert!(!core.is_pending(9));
+        assert!(core.layout().window_info(9).is_some());
+        assert_eq!(core.take_rechecks(), []);
+    }
+
+    #[test]
+    fn a_window_on_no_space_is_not_managed_and_is_dropped_when_it_closes() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.take_rechecks();
+        let before = backend.frames();
+        let marker = backend.calls().len();
+
+        // The full-screen animation's helper: an ordinary-looking window
+        // over the whole display, on no Space, before any other sign of the
+        // transition.
+        backend.add_window(9, DISPLAY);
+        backend.set_presence(9, WindowPresence::Detached);
+        core.platform_event(created(9));
+
+        assert!(core.is_pending(9));
+        assert!(core.layout().window_info(9).is_none());
+        assert_eq!(core.take_rechecks(), [(9, RECHECK_DELAYS[0])]);
+
+        backend.remove_window(9);
+        backend.set_presence(9, WindowPresence::Gone);
+        core.platform_event(destroyed(9));
+        assert!(!core.is_pending(9));
+        // Its timer still fires.
+        core.recheck(9);
+
+        assert!(core.layout().window_info(9).is_none());
+        assert_eq!(core.take_rechecks(), []);
+        assert_eq!(backend.calls()[marker..], []);
+        let mut after_close = backend.frames();
+        after_close.remove(&9);
+        assert_eq!(after_close, before);
+    }
+
+    #[test]
+    fn re_checks_back_off_and_stop_after_the_last_delay() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.take_rechecks();
+        let before = backend.frames();
+        let t0 = Instant::now();
+        // A helper that never settles on a Space, and a window that left for
+        // a full-screen Space and is between Spaces at every re-check.
+        backend.add_window(9, DISPLAY);
+        backend.set_presence(9, WindowPresence::Detached);
+        backend.set_unlisted(1, true);
+        core.platform_event_at(created(9), t0);
+        core.platform_event_at(destroyed(1), after(t0, 10));
+        assert!(core.is_pending(9));
+        assert!(core.is_suspended(1));
+
+        let mut delays: HashMap<WindowId, Vec<Duration>> = HashMap::new();
+        let mut now = after(t0, 10);
+        for _ in 0..10 {
+            let requested = core.take_rechecks();
+            if requested.is_empty() {
+                break;
+            }
+            for (wid, delay) in requested {
+                delays.entry(wid).or_default().push(delay);
+                core.recheck_at(wid, now + delay);
+            }
+            now += Duration::from_secs(5);
+        }
+
+        assert_eq!(delays[&9], RECHECK_DELAYS);
+        assert_eq!(delays[&1], RECHECK_DELAYS);
+        assert!(!core.is_pending(9), "the helper is given up on");
+        assert!(core.layout().window_info(9).is_none());
+        // The window still has its owner: the last re-check may have met the
+        // transition out of full screen.  It is kept, without more timers.
+        assert!(core.is_suspended(1));
+        assert!(core.applier().journal().contains(1));
+        assert_eq!(core.take_rechecks(), []);
+
+        // The desktop's Space becomes active with the window back.
+        backend.set_unlisted(1, false);
+        core.platform_event_at(space_changed(1, false), now);
+
+        assert!(!core.is_suspended(1));
+        let mut frames = backend.frames();
+        frames.remove(&9);
+        assert_eq!(frames, before, "back in its tile");
+    }
+
+    #[test]
+    fn a_full_screen_window_that_closes_is_forgotten_after_its_re_checks() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        let t0 = Instant::now();
+        backend.set_unlisted(1, true);
+        core.platform_event_at(destroyed(1), t0);
+        assert!(core.is_suspended(1));
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+
+        // Closed while it was between Spaces: no destroy notification, but
+        // the window server no longer knows it when the re-check runs.
+        backend.remove_window(1);
+        core.recheck_at(1, after(t0, 500));
+
+        assert!(!core.is_suspended(1));
+        assert!(core.layout().window_info(1).is_none());
+        assert!(!core.applier().journal().contains(1));
+        assert_eq!(core.take_rechecks(), [], "no further re-checks");
+    }
+
+    // --- drag to stack -----------------------------------------------------------------------
+
+    fn mouse(kind: MouseEventKind, (x, y): (f64, f64)) -> MouseEvent {
+        MouseEvent {
+            kind,
+            location: cosmic_mac_platform::Point::new(x, y),
+        }
+    }
+
+    /// Two tiled windows side by side; returns their tiles.  Moves are judged
+    /// without the echo debounce.
+    fn side_by_side() -> (Core, Arc<TestBackend>, tempfile::TempDir, Rect, Rect) {
+        // Front to back: the back window (1) is tiled first, on the left.
+        let (mut core, backend, dir) = started(&[2, 1]);
+        core.applier.set_debounce(Duration::ZERO);
+        let one = core.layout().frame_of(1).unwrap();
+        let two = core.layout().frame_of(2).unwrap();
+        assert!(one.right() <= two.x + 1.0, "1 left of 2: {one:?} {two:?}");
+        (core, backend, dir, one, two)
+    }
+
+    /// The user moves `wid` to `frame` (the window server did it).
+    fn user_moves(core: &mut Core, backend: &TestBackend, wid: WindowId, frame: Rect, at: Instant) {
+        backend.set_frame_externally(wid, frame);
+        core.platform_event_at(moved(wid, frame), at);
+    }
+
+    /// A point in the title bar of `tile`.
+    fn title_bar(tile: Rect) -> (f64, f64) {
+        (tile.x + tile.width / 2.0, tile.y + 10.0)
+    }
+
+    fn offset(rect: Rect, dx: f64, dy: f64) -> Rect {
+        Rect::new(rect.x + dx, rect.y + dy, rect.width, rect.height)
+    }
+
+    fn hints_after(calls: &[Call], marker: usize) -> Vec<Option<DropHint>> {
+        calls[marker..]
+            .iter()
+            .filter_map(|call| match call {
+                Call::DropHint(hint) => Some(*hint),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stack_of(core: &Core) -> Option<Vec<WindowId>> {
+        core.layout()
+            .active_stack()
+            .map(|stack| stack.tabs.iter().map(|tab| tab.wid).collect())
+    }
+
+    #[test]
+    fn moves_while_the_button_is_held_are_not_snapped_back() {
+        let (mut core, backend, _dir, one, _) = side_by_side();
+        let now = Instant::now();
+        let grab = title_bar(one);
+        core.mouse_event_at(mouse(MouseEventKind::Down, grab), now);
+        let marker = backend.calls().len();
+        for step in 1..=5 {
+            let dx = 60.0 * f64::from(step);
+            core.mouse_event_at(mouse(MouseEventKind::Dragged, (grab.0 + dx, grab.1)), now);
+            user_moves(&mut core, &backend, 1, offset(one, dx, 0.0), now);
+        }
+        assert_eq!(set_frames_after(&backend.calls(), marker, 1), 0);
+        assert_eq!(backend.frame(1), Some(offset(one, 300.0, 0.0)));
+        assert_eq!(
+            core.layout().frame_of(1),
+            Some(one),
+            "the layout is untouched"
+        );
+    }
+
+    #[test]
+    fn a_release_in_the_middle_third_of_another_tile_stacks() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        let now = Instant::now();
+        let grab = title_bar(one);
+        core.mouse_event_at(mouse(MouseEventKind::Down, grab), now);
+        let (cx, cy) = two.center();
+        let dx = cx - grab.0;
+        let dy = cy - grab.1;
+        core.mouse_event_at(mouse(MouseEventKind::Dragged, (cx, cy)), now);
+        user_moves(&mut core, &backend, 1, offset(one, dx, dy), now);
+        let marker = backend.calls().len();
+        core.mouse_event_at(mouse(MouseEventKind::Up, (cx, cy)), now);
+
+        assert_eq!(stack_of(&core), Some(vec![2, 1]));
+        assert_eq!(core.layout().focused(), Some(1));
+        let tile = core.layout().frame_of(1).unwrap();
+        assert_eq!(backend.frame(1), Some(tile), "framed into the stack");
+        let calls = backend.calls();
+        assert!(
+            calls[marker..].contains(&Call::SetFrame(1, tile)),
+            "{calls:?}"
+        );
+        assert!(
+            calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Park(2, _))),
+            "the other tab is parked: {calls:?}"
+        );
+        assert!(calls[marker..].contains(&Call::Focus(1)));
+        assert!(
+            calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::StackBar(Some(_)))),
+            "the tab bar shows: {calls:?}"
+        );
+        // A late move of the drag is checked again once it has settled.
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+    }
+
+    #[test]
+    fn a_release_outside_a_stack_zone_snaps_back() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        let now = Instant::now();
+        let grab = title_bar(one);
+        core.mouse_event_at(mouse(MouseEventKind::Down, grab), now);
+        // Inside 2's tile, but near its corner rather than its middle third.
+        let drop = (two.x + 20.0, two.y + 20.0);
+        let moved_to = offset(one, drop.0 - grab.0, drop.1 - grab.1);
+        user_moves(&mut core, &backend, 1, moved_to, now);
+        let marker = backend.calls().len();
+        core.mouse_event_at(mouse(MouseEventKind::Up, drop), now);
+
+        assert_eq!(stack_of(&core), None);
+        assert!(core.layout().stacks().is_empty());
+        assert_eq!(backend.calls()[marker..], [Call::SetFrame(1, one)]);
+        assert_eq!(backend.frame(1), Some(one));
+    }
+
+    #[test]
+    fn a_resize_drag_snaps_back_on_release_not_while_held() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        let now = Instant::now();
+        // The right edge, dragged into 2's middle third.
+        let edge = (one.right(), one.y + one.height / 2.0);
+        core.mouse_event_at(mouse(MouseEventKind::Down, edge), now);
+        let marker = backend.calls().len();
+        let (cx, cy) = two.center();
+        let wider = Rect::new(one.x, one.y, cx - one.x, one.height);
+        core.mouse_event_at(mouse(MouseEventKind::Dragged, (cx, cy)), now);
+        user_moves(&mut core, &backend, 1, wider, now);
+        assert_eq!(set_frames_after(&backend.calls(), marker, 1), 0, "no fight");
+        core.mouse_event_at(mouse(MouseEventKind::Up, (cx, cy)), now);
+
+        assert_eq!(stack_of(&core), None, "a resize never stacks");
+        assert_eq!(backend.frame(1), Some(one));
+        assert!(backend.calls()[marker..].contains(&Call::SetFrame(1, one)));
+        assert_eq!(hints_after(&backend.calls(), 0), [], "no highlight");
+    }
+
+    #[test]
+    fn moves_with_the_button_up_or_held_elsewhere_snap_back_at_once() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        // Each move is captured after the previous snap-back, which would
+        // otherwise make it an echo.
+        // Button up: an app or keyboard move.
+        let marker = backend.calls().len();
+        user_moves(
+            &mut core,
+            &backend,
+            1,
+            offset(one, 40.0, 0.0),
+            Instant::now(),
+        );
+        assert_eq!(backend.calls()[marker..], [Call::SetFrame(1, one)]);
+
+        // Held on the other window: window 1 moving is not the user's drag.
+        let now = Instant::now();
+        core.mouse_event_at(mouse(MouseEventKind::Down, two.center()), now);
+        let marker = backend.calls().len();
+        user_moves(
+            &mut core,
+            &backend,
+            1,
+            offset(one, 40.0, 0.0),
+            Instant::now(),
+        );
+        assert_eq!(backend.calls()[marker..], [Call::SetFrame(1, one)]);
+
+        // A click long ago on window 1 does not make a later move a drop.
+        let now = Instant::now();
+        core.mouse_event_at(mouse(MouseEventKind::Up, two.center()), now);
+        let click = title_bar(one);
+        core.mouse_event_at(mouse(MouseEventKind::Down, click), now);
+        core.mouse_event_at(mouse(MouseEventKind::Up, two.center()), now);
+        let marker = backend.calls().len();
+        let later = now + DROP_GRACE + Duration::from_millis(50);
+        user_moves(&mut core, &backend, 1, offset(two, 0.0, 0.0), later);
+        assert_eq!(backend.calls()[marker..], [Call::SetFrame(1, one)]);
+        assert_eq!(stack_of(&core), None);
+    }
+
+    #[test]
+    fn a_move_just_after_the_release_is_taken_as_the_drop() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        let t0 = Instant::now();
+        let grab = title_bar(one);
+        let (cx, cy) = two.center();
+        // A quick drag: the tap reports the release before any move arrives.
+        core.mouse_event_at(mouse(MouseEventKind::Down, grab), t0);
+        core.mouse_event_at(mouse(MouseEventKind::Up, (cx, cy)), t0);
+        assert_eq!(stack_of(&core), None);
+        user_moves(
+            &mut core,
+            &backend,
+            1,
+            offset(one, cx - grab.0, cy - grab.1),
+            after(t0, 35),
+        );
+        assert_eq!(stack_of(&core), Some(vec![2, 1]));
+        assert_eq!(backend.frame(1), core.layout().frame_of(1));
+    }
+
+    #[test]
+    fn a_move_after_the_grace_is_not_a_drop() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        let t0 = Instant::now();
+        let grab = title_bar(one);
+        let (cx, cy) = two.center();
+        core.mouse_event_at(mouse(MouseEventKind::Down, grab), t0);
+        core.mouse_event_at(mouse(MouseEventKind::Up, (cx, cy)), t0);
+        let late = t0 + DROP_GRACE + Duration::from_millis(1);
+        user_moves(
+            &mut core,
+            &backend,
+            1,
+            offset(one, cx - grab.0, cy - grab.1),
+            late,
+        );
+        assert_eq!(stack_of(&core), None);
+        assert_eq!(backend.frame(1), Some(one));
+    }
+
+    #[test]
+    fn a_resize_just_after_the_release_snaps_back() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        let t0 = Instant::now();
+        let (cx, cy) = two.center();
+        core.mouse_event_at(mouse(MouseEventKind::Down, (one.right(), cy)), t0);
+        core.mouse_event_at(mouse(MouseEventKind::Up, (cx, cy)), t0);
+        let wider = Rect::new(one.x, one.y, cx - one.x, one.height);
+        user_moves(&mut core, &backend, 1, wider, after(t0, 20));
+        assert_eq!(stack_of(&core), None);
+        assert_eq!(backend.frame(1), Some(one));
+    }
+
+    #[test]
+    fn the_drop_hint_follows_the_pointer_and_hides_on_release() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        let now = Instant::now();
+        let grab = title_bar(one);
+        let marker = backend.calls().len();
+        core.mouse_event_at(mouse(MouseEventKind::Down, grab), now);
+        core.mouse_event_at(mouse(MouseEventKind::Dragged, (grab.0 + 30.0, grab.1)), now);
+        user_moves(&mut core, &backend, 1, offset(one, 30.0, 0.0), now);
+        let (cx, cy) = two.center();
+        // Into 2's middle third, around inside it, out, and back in.
+        for point in [
+            (cx, cy),
+            (cx + 10.0, cy - 10.0),
+            (two.x + 5.0, cy),
+            (cx, cy),
+        ] {
+            core.mouse_event_at(mouse(MouseEventKind::Dragged, point), now);
+        }
+        let shown = Some(DropHint {
+            target: 2,
+            frame: two,
+        });
+        assert_eq!(hints_after(&backend.calls(), marker), [shown, None, shown]);
+        core.mouse_event_at(mouse(MouseEventKind::Up, (cx, cy)), now);
+        assert_eq!(
+            hints_after(&backend.calls(), marker),
+            [shown, None, shown, None]
+        );
+        assert_eq!(stack_of(&core), Some(vec![2, 1]));
+    }
+
+    #[test]
+    fn a_missed_release_ends_the_drag_at_the_next_press() {
+        let (mut core, backend, _dir, one, two) = side_by_side();
+        let now = Instant::now();
+        let grab = title_bar(one);
+        core.mouse_event_at(mouse(MouseEventKind::Down, grab), now);
+        let (cx, cy) = two.center();
+        core.mouse_event_at(mouse(MouseEventKind::Dragged, (cx, cy)), now);
+        user_moves(
+            &mut core,
+            &backend,
+            1,
+            offset(one, cx - grab.0, cy - grab.1),
+            now,
+        );
+        let marker = backend.calls().len();
+        // No release came; the next press ends the drag without a drop.
+        core.mouse_event_at(mouse(MouseEventKind::Down, (cx, cy)), now);
+        assert_eq!(stack_of(&core), None);
+        assert_eq!(
+            backend.calls()[marker..],
+            [Call::DropHint(None), Call::SetFrame(1, one)]
+        );
     }
 }

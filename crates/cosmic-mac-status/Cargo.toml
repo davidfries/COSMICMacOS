@@ -1,0 +1,43 @@
+[package]
+name = "cosmic-mac-status"
+description = "cosmicMac menu-bar status item: active workspace, workspace switching and the tiling toggle"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "cosmic-mac-status"
+path = "src/main.rs"
+
+[dependencies]
+# IPC payloads and the Unix-socket client of the window manager.
+cosmic-mac-protocol = { path = "../cosmic-mac-protocol" }
+cosmic-mac-ctl = { path = "../cosmic-mac-ctl" }
+
+log.workspace = true
+env_logger.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+# Marshals subscription updates onto the main thread (the main dispatch queue).
+dispatch2 = "0.3"
+
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSButton",
+    "NSCell",
+    "NSControl",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+    "objc2-core-foundation",
+] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"

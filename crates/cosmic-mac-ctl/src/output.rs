@@ -4,7 +4,9 @@
 //! Every renderer returns a string without a trailing newline; `main` prints it.  The
 //! `--json` path bypasses this module and prints the protocol payload itself.
 
-use cosmic_mac_protocol::{Config, Orientation, Rect, TreeNode, WindowState, WorkspaceInfo};
+use cosmic_mac_protocol::{
+    Config, Orientation, Rect, ShellState, TreeNode, WindowState, WorkspaceInfo,
+};
 
 /// Truncate to `max` characters, appending `…` when something was cut off.
 pub fn truncate(text: &str, max: usize) -> String {
@@ -181,6 +183,35 @@ pub fn render_workspaces(workspaces: &[WorkspaceInfo]) -> String {
     render_table(&columns, &rows)
 }
 
+/// Render one `Response::State` as a single `key=value` line for `watch`, e.g.
+/// `workspace=2 workspaces=3 tiling=on focused=tiled windows=1:2,2*:1,3:0`.
+pub fn render_state(state: &ShellState) -> String {
+    let active = state
+        .active_workspace()
+        .map(|workspace| workspace.index.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let focused = match state.focused_floating {
+        None => "none",
+        Some(false) => "tiled",
+        Some(true) => "floating",
+    };
+    let windows = state
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let marker = if workspace.active { "*" } else { "" };
+            format!("{}{marker}:{}", workspace.index, workspace.window_count)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "workspace={active} workspaces={} tiling={} focused={focused} windows={}",
+        state.workspaces.len(),
+        if state.tiling { "on" } else { "off" },
+        if windows.is_empty() { "-" } else { &windows },
+    )
+}
+
 /// Render `Response::Config`.
 pub fn render_config(config: &Config) -> String {
     let mut lines = vec![
@@ -216,6 +247,7 @@ pub fn render_config(config: &Config) -> String {
             lines.push(format!("  - {app}"));
         }
     }
+    lines.push(format!("super_tap_launcher: {}", config.super_tap_launcher));
 
     lines.join("\n")
 }
@@ -300,12 +332,56 @@ fn render_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool, out:
 #[cfg(test)]
 mod tests {
     use super::{
-        format_rect, render_config, render_tree, render_windows, render_workspaces, truncate,
+        format_rect, render_config, render_state, render_tree, render_windows, render_workspaces,
+        truncate,
     };
     use cosmic_mac_protocol::{
-        Config, Gaps, Orientation, Rect, TabInfo, TilingException, ToplevelInfo, TreeNode,
-        WindowState, WorkspaceInfo,
+        Config, Gaps, Orientation, Rect, ShellState, TabInfo, TilingException, ToplevelInfo,
+        TreeNode, WindowState, WorkspaceInfo,
     };
+
+    #[test]
+    fn state_line_lists_the_active_workspace_tiling_focus_and_counts() {
+        let state = ShellState {
+            workspaces: vec![
+                WorkspaceInfo::new(1, "1", false, 2),
+                WorkspaceInfo::new(2, "2", true, 1),
+                WorkspaceInfo::new(3, "3", false, 0),
+            ],
+            tiling: true,
+            focused_floating: Some(false),
+            max_workspaces: 9,
+        };
+        assert_eq!(
+            render_state(&state),
+            "workspace=2 workspaces=3 tiling=on focused=tiled windows=1:2,2*:1,3:0"
+        );
+        let floating = ShellState {
+            tiling: false,
+            focused_floating: Some(true),
+            ..state.clone()
+        };
+        assert!(render_state(&floating).contains("tiling=off focused=floating"));
+        let unfocused = ShellState {
+            focused_floating: None,
+            ..state
+        };
+        assert!(render_state(&unfocused).contains("focused=none"));
+    }
+
+    #[test]
+    fn state_line_without_workspaces() {
+        let state = ShellState {
+            workspaces: Vec::new(),
+            tiling: true,
+            focused_floating: None,
+            max_workspaces: 9,
+        };
+        assert_eq!(
+            render_state(&state),
+            "workspace=? workspaces=0 tiling=on focused=none windows=-"
+        );
+    }
 
     fn window(wid: u64, title: &str) -> WindowState {
         WindowState {
@@ -446,6 +522,7 @@ mod tests {
                 TilingException::new("com.apple.finder").with_title("Get Info"),
             ],
             passthrough: vec!["com.apple.Terminal".into()],
+            super_tap_launcher: false,
         };
         let text = render_config(&config);
         assert!(text.contains("gaps: outer=8 inner=4"));
@@ -453,6 +530,7 @@ mod tests {
         assert!(text.contains("autotile: false"));
         assert!(text.contains("app_id=com.apple.finder title=Get Info"));
         assert!(text.contains("com.apple.Terminal"));
+        assert!(text.contains("super_tap_launcher: false"));
     }
 
     #[test]
@@ -461,6 +539,7 @@ mod tests {
         assert!(text.contains("tiling_exceptions: (none)"));
         assert!(text.contains("passthrough: (none)"));
         assert!(text.contains("autotile: true"));
+        assert!(text.contains("super_tap_launcher: true"));
     }
 
     #[test]

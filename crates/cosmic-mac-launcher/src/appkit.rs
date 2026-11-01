@@ -9,15 +9,22 @@
 //! the main thread on macOS.
 //!
 //! Unlike the panel, the launcher must take keyboard focus:
-//! - The binary embeds an `Info.plist` (`build.rs`) with a bundle
-//!   identifier and `LSUIElement`, so winit treats it as bundled and leaves
-//!   the activation policy alone instead of forcing `Regular` (Dock icon) at
-//!   launch. [`configure_window`] still sets `Accessory` if the policy is
-//!   anything else, then activates the app with
-//!   `activateIgnoringOtherApps:` (the WM spawns the launcher from the
-//!   background, so cooperative `activate` may be declined) and makes the
-//!   window key. winit's window class overrides `canBecomeKeyWindow`, so a
-//!   borderless window can be key.
+//! - The launcher runs from `cosmic-mac-launcher.app` (`Info.plist` with a
+//!   bundle identifier and `LSUIElement`, assembled by
+//!   `scripts/bundle.sh`), so winit sees a bundle identifier and leaves the
+//!   activation policy to `LSUIElement` (Accessory from the start, no Dock
+//!   icon) instead of forcing `Regular` at launch. The plain binary embeds
+//!   the same `Info.plist` (`build.rs`), which macOS does not honour for
+//!   unbundled executables; for it [`show_window`] switches the policy to
+//!   `Accessory` (a Dock icon may flash at launch).
+//! - [`show_window`] activates the app with `activateIgnoringOtherApps:`
+//!   (the launcher is told to show by a background process, so cooperative
+//!   `activate` may be declined) and makes the window key. winit's window
+//!   class overrides `canBecomeKeyWindow`, so a borderless window can be
+//!   key.
+//! - [`hide_window`] orders the window out and hides the app, so AppKit
+//!   gives focus back to the app that had it. winit activates every app at
+//!   launch, so a hidden start calls [`yield_activation`] for the same.
 //! - Level: `NSModalPanelWindowLevel` (8). The window manager ignores every
 //!   non-zero level, and its stack tab bars copy their (level 0) target's
 //!   level, so any non-zero level works for the WM; 8 additionally sits
@@ -41,9 +48,9 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
 
 use crate::geometry::{self, Frame};
 use crate::plugin::Action;
-use crate::plugins::windows;
+use crate::plugins::{terminal, windows};
 
-/// The launcher `NSWindow` after [`configure_window`], for the startup log.
+/// The launcher `NSWindow` after [`show_window`], for the log.
 #[derive(Clone, Debug)]
 pub struct WindowInfo {
     pub window_number: isize,
@@ -52,11 +59,11 @@ pub struct WindowInfo {
     /// The main screen's `visibleFrame` the window was centred in.
     pub visible_frame: Frame,
     pub level: isize,
-    /// Activation policy before and after configuration.
+    /// Activation policy before and after showing.
     pub initial_policy: &'static str,
     pub policy: &'static str,
-    /// Bundle identifier AppKit sees for the process (from the embedded
-    /// `Info.plist`); `None` means winit treated the binary as unbundled.
+    /// Bundle identifier AppKit sees for the process; `None` means the
+    /// launcher runs unbundled (winit then forces `Regular` at launch).
     pub bundle_id: Option<String>,
     pub is_key: bool,
     pub is_active: bool,
@@ -92,10 +99,22 @@ fn to_frame(rect: NSRect) -> Frame {
     )
 }
 
-/// Makes the launcher window a borderless, shadowless, modal-panel-level
-/// window on every Space, centred on the main screen, and gives it keyboard
-/// focus. Signature matches iced's `window::run_with_handle` callback.
-pub fn configure_window(handle: WindowHandle<'_>) -> Result<WindowInfo, String> {
+/// Borderless, shadowless, modal-panel level, on every Space. Idempotent.
+fn prepare_window(window: &NSWindow) {
+    window.setStyleMask(NSWindowStyleMask::Borderless);
+    window.setHasShadow(false);
+    window.setLevel(NSModalPanelWindowLevel);
+    window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary
+            | NSWindowCollectionBehavior::IgnoresCycle,
+    );
+}
+
+/// Prepares the launcher window ([`prepare_window`]), centres it on the
+/// main screen, shows it and gives it keyboard focus. Signature matches
+/// iced's `window::run_with_handle` callback.
+pub fn show_window(handle: WindowHandle<'_>) -> Result<WindowInfo, String> {
     let (mtm, window) = window_from_handle(handle)?;
     let screen = NSScreen::mainScreen(mtm)
         .ok_or_else(|| "no main screen (is the display asleep?)".to_owned())?;
@@ -108,14 +127,11 @@ pub fn configure_window(handle: WindowHandle<'_>) -> Result<WindowInfo, String> 
         log::warn!("setActivationPolicy(Accessory) was refused");
     }
 
-    window.setStyleMask(NSWindowStyleMask::Borderless);
-    window.setHasShadow(false);
-    window.setLevel(NSModalPanelWindowLevel);
-    window.setCollectionBehavior(
-        NSWindowCollectionBehavior::CanJoinAllSpaces
-            | NSWindowCollectionBehavior::FullScreenAuxiliary
-            | NSWindowCollectionBehavior::IgnoresCycle,
-    );
+    prepare_window(&window);
+    // `hide_window` hid the app; a hidden app's windows stay off screen.
+    if app.isHidden() {
+        app.unhideWithoutActivation();
+    }
 
     // `visibleFrame` excludes the menu bar and the Dock; both frames are in
     // the bottom-left-origin global space, whatever the screen's size.
@@ -170,12 +186,32 @@ pub fn check_key(handle: WindowHandle<'_>, retry: bool) -> Result<bool, String> 
     Ok(is_key)
 }
 
-/// Hides the window immediately (before the process finishes exiting), so
-/// focus moves to the launched app or window without the overlay on top.
+/// Orders the window out right away (the caller closes it afterwards) and,
+/// while the launcher is the active app, hides the app so AppKit activates
+/// the app that was active before (an app launched or a window focused by
+/// the activated result takes over when it comes up).
 pub fn hide_window(handle: WindowHandle<'_>) -> Result<(), String> {
-    let (_, window) = window_from_handle(handle)?;
+    let (mtm, window) = window_from_handle(handle)?;
     window.orderOut(None);
+    let app = NSApplication::sharedApplication(mtm);
+    if app.isActive() {
+        app.hide(None);
+    }
     Ok(())
+}
+
+/// Gives up activation while no launcher window is shown: winit activates
+/// the app when it finishes launching, which would take focus from the
+/// user's app at a hidden (launchd) start. Returns whether the app was
+/// active. Must run on the main thread (iced's `update` does).
+pub fn yield_activation() -> Result<bool, String> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| "not on the main thread".to_owned())?;
+    let app = NSApplication::sharedApplication(mtm);
+    let active = app.isActive();
+    if active {
+        app.hide(None);
+    }
+    Ok(active)
 }
 
 fn policy_name(policy: NSApplicationActivationPolicy) -> &'static str {
@@ -190,7 +226,15 @@ fn policy_name(policy: NSApplicationActivationPolicy) -> &'static str {
 /// Performs a result's action.
 pub fn perform(action: &Action) -> Result<(), String> {
     match action {
-        Action::LaunchApp(path) => open_path(path),
+        Action::LaunchApp(path) | Action::OpenFile(path) => open_path(path),
+        Action::RunInTerminal(command) => {
+            let script = terminal::terminal_script(command, &user_shell());
+            let path = terminal::write_script(&std::env::temp_dir(), &script)
+                .map_err(|error| format!("cannot write the terminal script: {error}"))?;
+            open_path(&path)
+        }
+        Action::RunInBackground(command) => terminal::spawn_background(command, &user_shell())
+            .map_err(|error| format!("cannot start {command:?}: {error}")),
         Action::OpenUrl(url) => open_url(url),
         Action::CopyText(text) => copy_text(text),
         Action::FocusWindow(wid) => {
@@ -200,8 +244,13 @@ pub fn perform(action: &Action) -> Result<(), String> {
     }
 }
 
-/// Opens a file URL; for an `.app` bundle this launches the app, or
-/// activates it when it is already running.
+fn user_shell() -> String {
+    terminal::user_shell(std::env::var("SHELL").ok().as_deref())
+}
+
+/// Opens a file URL with its default app; for an `.app` bundle this
+/// launches the app, or activates it when it is already running, and a
+/// `.command` file runs in a new Terminal window.
 fn open_path(path: &Path) -> Result<(), String> {
     let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
     if NSWorkspace::sharedWorkspace().openURL(&url) {

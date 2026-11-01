@@ -195,24 +195,50 @@ impl CommandApplier {
     /// Returns the clamp when the app refused this frame too, so the layout
     /// owner can learn from it.
     pub fn reapply_frame(&mut self, wid: WindowId, rect: Rect) -> Option<ClampNotice> {
-        // In flight before the first AX call, as in `apply_one`.
-        self.mark_programmed(wid, rect);
-        match self.backend.set_frame(wid, rect) {
-            Ok(outcome) => {
-                self.mark_programmed(wid, outcome.applied);
-                (outcome.clamped && outcome.size_differs(AppliedFrame::TOLERANCE)).then_some(
-                    ClampNotice {
-                        wid,
-                        requested: rect,
-                        applied: outcome.applied,
-                    },
-                )
-            }
+        match self.try_reapply_frame(wid, rect) {
+            Ok(clamp) => clamp,
             Err(error) => {
                 log::warn!("snapping window {wid} back failed: {error}");
                 None
             }
         }
+    }
+
+    /// [`CommandApplier::reapply_frame`], reporting a failed call to the caller, which
+    /// may retry it later (a window on an inactive Space cannot be moved through
+    /// Accessibility).  This always sends the frame: the layout's command diff only
+    /// emits frames that changed in the layout, not frames the window drifted away from.
+    pub fn try_reapply_frame(
+        &mut self,
+        wid: WindowId,
+        rect: Rect,
+    ) -> PlatformResult<Option<ClampNotice>> {
+        // In flight before the first AX call, as in `apply_one`.
+        self.mark_programmed(wid, rect);
+        let outcome = self.backend.set_frame(wid, rect)?;
+        self.mark_programmed(wid, outcome.applied);
+        Ok(
+            (outcome.clamped && outcome.size_differs(AppliedFrame::TOLERANCE)).then_some(
+                ClampNotice {
+                    wid,
+                    requested: rect,
+                    applied: outcome.applied,
+                },
+            ),
+        )
+    }
+
+    /// Park a window that should be parked again, after something moved it out of the
+    /// corner (an application that re-positions its windows across a Space change).
+    ///
+    /// Unlike [`Command::Hide`] this moves the window even when the backend already holds
+    /// its saved frame; the saved frame is kept, so the window still comes back to it.
+    pub fn repark(&mut self, wid: WindowId) -> PlatformResult<()> {
+        self.record_original(wid, None);
+        self.visible.remove(&wid);
+        let display = self.backend.display_frame(wid);
+        self.backend.park(wid, display)?;
+        Ok(())
     }
 
     /// Record the window's original frame in the journal unless it already

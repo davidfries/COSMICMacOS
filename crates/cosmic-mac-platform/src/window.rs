@@ -888,6 +888,27 @@ pub fn list_ax_windows(pid: libc::pid_t) -> Result<Vec<WindowInfo>> {
     Ok(windows)
 }
 
+/// The CoreGraphics bounds of `wid`, from its `CGWindowList` record
+/// (`kCGWindowListOptionIncludingWindow`: any Space, on screen or not), or
+/// `None` when CoreGraphics does not list the window.  No Accessibility.
+pub fn cg_window_frame(wid: u32) -> Option<Rect> {
+    let options =
+        CGWindowListOption::OptionIncludingWindow | CGWindowListOption::ExcludeDesktopElements;
+    let array = CGWindowListCopyWindowInfo(options, wid)?;
+    // SAFETY: CGWindowListCopyWindowInfo returns an array of CFDictionary.
+    let array: &CFArray<CFType> = unsafe { array.cast_unchecked() };
+    (0..array.len())
+        .filter_map(|index| array.get(index))
+        .filter_map(|value| value.downcast::<CFDictionary>().ok())
+        .map(|dict| {
+            // SAFETY: CG window dictionaries are string-keyed.
+            let dict: &CFDictionary<CFString, CFType> = unsafe { dict.cast_unchecked() };
+            cg_dict_basics(dict)
+        })
+        .find(|basics| basics.wid == wid)
+        .map(|basics| basics.frame)
+}
+
 /// Refresh one window's record (including off-screen windows).
 pub fn window_info(wid: u32) -> Result<Option<WindowInfo>> {
     let options =

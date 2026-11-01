@@ -90,6 +90,45 @@ struct WorkspaceFrames {
     nodes: BTreeMap<NodeId, Rect>,
 }
 
+/// Where a window sat in its workspace, captured by [`Layout::slot_of`] before the window
+/// leaves the layout for a while (minimized, hidden, in native full screen), so that
+/// [`Layout::window_restored`] can put it back there.
+///
+/// The slot names neighbouring *windows*, not tree nodes: the tree is normalised when the
+/// window leaves, so its old group may have collapsed into the neighbour.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowSlot {
+    /// Index of the workspace it was on.
+    workspace: usize,
+    place: SlotPlace,
+    /// The maximized state it had (with the floating frame to return to, if any).
+    maximized: Option<Option<Rect>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SlotPlace {
+    /// The only tiled window of its workspace.
+    Root,
+    /// One side of a split: next to the windows of an adjacent sibling subtree.
+    Split {
+        /// Windows of the sibling right before it (or right after it, when it was first).
+        neighbour: Vec<WindowId>,
+        /// Whether the window came after that sibling.
+        after: bool,
+        orientation: Orientation,
+        /// Its weight and the sibling's weight in their group.
+        weight: f64,
+        neighbour_weight: f64,
+    },
+    /// A member of a stack, with the stack's other members.
+    Stack {
+        members: Vec<WindowId>,
+        index: usize,
+    },
+    /// Floating at this frame.
+    Floating { frame: Rect },
+}
+
 /// The layout state machine.
 #[derive(Debug)]
 pub struct Layout {
@@ -164,6 +203,14 @@ impl Layout {
 
     pub fn focused(&self) -> Option<WindowId> {
         self.workspaces[self.active].focus
+    }
+
+    /// Whether `wid` is in its workspace's floating layer.  On a workspace with tiling
+    /// disabled every window floats.
+    pub fn is_floating(&self, wid: WindowId) -> bool {
+        self.workspaces
+            .iter()
+            .any(|workspace| workspace.floating(wid).is_some())
     }
 
     pub fn window_info(&self, wid: WindowId) -> Option<&ToplevelInfo> {
@@ -315,6 +362,176 @@ impl Layout {
         }
         self.workspaces[self.active].set_focus(wid);
         self.sync()
+    }
+
+    /// Where `wid` sits now, for [`Layout::window_restored`] after it was removed.
+    pub fn slot_of(&self, wid: WindowId) -> Option<WindowSlot> {
+        let index = self.window_workspace(wid)?;
+        let workspace = &self.workspaces[index];
+        let maximized = workspace
+            .maximized
+            .filter(|maximized| maximized.wid == wid)
+            .map(|maximized| maximized.restore);
+        let slot = |place| {
+            Some(WindowSlot {
+                workspace: index,
+                place,
+                maximized,
+            })
+        };
+        if let Some(floating) = workspace.floating(wid) {
+            return slot(SlotPlace::Floating {
+                frame: floating.frame,
+            });
+        }
+        let tree = &workspace.tree;
+        if let Some((stack_id, member)) = tree.stack_containing(wid) {
+            let stack = tree.stack(stack_id)?;
+            let members = stack
+                .windows
+                .iter()
+                .copied()
+                .filter(|w| *w != wid)
+                .collect();
+            return slot(SlotPlace::Stack {
+                members,
+                index: member,
+            });
+        }
+        let node = tree.window_node(wid)?;
+        let Some(parent) = tree.parent(node) else {
+            return slot(SlotPlace::Root);
+        };
+        let group = tree.group(parent)?;
+        let position = group.children.iter().position(|child| *child == node)?;
+        let (neighbour, after) = if position > 0 {
+            (position - 1, true)
+        } else {
+            (position + 1, false)
+        };
+        let neighbour_node = *group.children.get(neighbour)?;
+        slot(SlotPlace::Split {
+            neighbour: tree.windows_in(neighbour_node),
+            after,
+            orientation: group.orientation,
+            weight: group.sizes[position],
+            neighbour_weight: group.sizes[neighbour],
+        })
+    }
+
+    /// A window that was removed comes back: put it where [`Layout::slot_of`] found it, and
+    /// focus it.
+    ///
+    /// When the slot can no longer be honoured (it was on another workspace than the active
+    /// one, its neighbours are gone, tiling was turned off) the window is added like a new
+    /// one ([`Layout::window_added`]).  When the neighbours survive but the tree around them
+    /// changed shape, it goes next to the nearest of them.  A window already in the layout is
+    /// left alone.
+    pub fn window_restored(&mut self, info: ToplevelInfo, slot: &WindowSlot) -> Vec<Command> {
+        let wid = info.wid;
+        if self.infos.contains_key(&wid) {
+            return self.sync();
+        }
+        if slot.workspace != self.active || !self.place_restored(&info, slot) {
+            return self.window_added(info);
+        }
+        self.infos.insert(wid, info);
+        let workspace = &mut self.workspaces[self.active];
+        if let Some(restore) = slot.maximized
+            && workspace.maximized.is_none()
+        {
+            workspace.maximized = Some(Maximized { wid, restore });
+        }
+        workspace.set_focus(wid);
+        self.sync()
+    }
+
+    /// Insert `info` into the active workspace at `slot`.  Returns false (and changes
+    /// nothing) when the slot cannot be used.
+    fn place_restored(&mut self, info: &ToplevelInfo, slot: &WindowSlot) -> bool {
+        let wid = info.wid;
+        let work_area = self.work_area;
+        let tiles = self.workspaces[self.active].tiling_enabled && !self.config.should_float(info);
+        let workspace = &mut self.workspaces[self.active];
+        match &slot.place {
+            SlotPlace::Floating { frame } => {
+                workspace.floating.push(FloatingWindow {
+                    wid,
+                    frame: frame.clamp_within(work_area),
+                });
+                true
+            }
+            _ if !tiles => false,
+            SlotPlace::Root => {
+                if !workspace.tree.is_empty() {
+                    return false;
+                }
+                workspace
+                    .tree
+                    .insert_window(wid, None, Orientation::Horizontal);
+                true
+            }
+            SlotPlace::Stack { members, index } => {
+                let tree = &mut workspace.tree;
+                let stack =
+                    members
+                        .iter()
+                        .find_map(|member| match tree.stack_containing(*member) {
+                            Some((stack_id, _)) => Some(stack_id),
+                            // A stack of two collapses into a window when one member leaves.
+                            None => tree.window_node(*member).inspect(|node| {
+                                tree.window_to_stack(*node);
+                            }),
+                        });
+                match stack {
+                    Some(stack_id) => tree.insert_stack_member(stack_id, *index, wid),
+                    None => false,
+                }
+            }
+            SlotPlace::Split {
+                neighbour,
+                after,
+                orientation,
+                weight,
+                neighbour_weight,
+            } => {
+                let tree = &mut workspace.tree;
+                let present: Vec<WindowId> = neighbour
+                    .iter()
+                    .copied()
+                    .filter(|w| tree.node_for_window(*w).is_some())
+                    .collect();
+                let Some(mut reference) = tree.common_ancestor(&present) else {
+                    return false;
+                };
+                if tree
+                    .windows_in(reference)
+                    .iter()
+                    .any(|w| !neighbour.contains(w))
+                {
+                    // The neighbours were rearranged among other windows: go next to the
+                    // nearest one instead of wrapping a subtree that is not theirs.
+                    let nearest = if *after {
+                        present.last()
+                    } else {
+                        present.first()
+                    };
+                    match nearest.and_then(|w| tree.node_for_window(*w)) {
+                        Some(node) => reference = node,
+                        None => return false,
+                    }
+                }
+                tree.insert_window_beside(
+                    wid,
+                    reference,
+                    *orientation,
+                    *after,
+                    *weight,
+                    *neighbour_weight,
+                );
+                true
+            }
+        }
     }
 
     /// A window disappeared.  The tree is collapsed, focus moves to the next window and empty
@@ -874,38 +1091,12 @@ impl Layout {
         };
         // Detaching the focused window can lift the sibling into the parent's node id, so
         // identify the sibling by content and re-resolve it afterwards.
-        let neighbour = if workspace.tree.is_window(sibling) {
-            workspace.tree.target_window(sibling).map(Neighbour::Window)
-        } else if let Some(stack) = workspace.tree.stack(sibling) {
-            stack
-                .active_window()
-                .or_else(|| stack.windows.first().copied())
-                .map(Neighbour::Stack)
-        } else {
-            None
-        };
-        let Some(neighbour) = neighbour else {
+        let Some(neighbour) = neighbour_of(&workspace.tree, sibling) else {
             return;
         };
 
         workspace.tree.detach(node);
-        match neighbour {
-            Neighbour::Window(other) => {
-                if let Some(target) = workspace.tree.node_for_window(other)
-                    && workspace.tree.is_window(target)
-                {
-                    workspace.tree.window_to_stack(target);
-                    workspace.tree.push_stack_member(target, wid);
-                }
-            }
-            Neighbour::Stack(anchor) => {
-                if let Some(target) = workspace.tree.node_for_window(anchor)
-                    && workspace.tree.is_stack(target)
-                {
-                    workspace.tree.push_stack_member(target, wid);
-                }
-            }
-        }
+        join_neighbour(&mut workspace.tree, wid, neighbour);
         workspace.set_focus(wid);
     }
 
@@ -954,6 +1145,74 @@ impl Layout {
             .tree
             .insert_window(wid, Some(stack_id), orientation);
         workspace.set_focus(wid);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Drag and drop
+    // -------------------------------------------------------------------------------------
+
+    /// Where the tiled window `wid`, dragged by the user, would go if dropped at `(x, y)`
+    /// (global coordinates) on the active workspace.
+    ///
+    /// Only the tiles count, not what is on screen: the pointer is over the dragged window
+    /// itself.  `wid`'s own tile (its stack, if it is in one) is never a target.  Nothing is
+    /// a target while a window is maximized or when `wid` is not tiled here.
+    pub fn drop_zone(&self, wid: WindowId, x: f64, y: f64) -> Option<DropZone> {
+        let workspace = &self.workspaces[self.active];
+        if workspace.maximized.is_some() {
+            return None;
+        }
+        let own = workspace.tree.node_for_window(wid)?;
+        let frames = self.workspace_frames(self.active);
+        let tiles = workspace
+            .tree
+            .visible_windows()
+            .into_iter()
+            .filter(|tile| workspace.tree.node_for_window(*tile) != Some(own))
+            .filter_map(|tile| Some((tile, *frames.visible.get(&tile)?)));
+        drop_zone_at(tiles, x, y)
+    }
+
+    /// Stack the tiled window `wid` onto `target` on the active workspace (a drop in
+    /// `target`'s [`DropZone::Stack`]).
+    ///
+    /// `wid` leaves its tile or its stack (a stack left with one member becomes a plain
+    /// window again).  A plain `target` becomes a stack; a `target` in a stack gets `wid` as
+    /// its last tab.  `wid` becomes the active tab and is focused.  Returns no commands when
+    /// `wid == target`, when both are in the same stack, or when either is not tiled on the
+    /// active workspace.
+    pub fn stack_onto(&mut self, wid: WindowId, target: WindowId) -> Vec<Command> {
+        if wid == target {
+            return Vec::new();
+        }
+        let workspace = &mut self.workspaces[self.active];
+        let (Some(source), Some(dest)) = (
+            workspace.tree.node_for_window(wid),
+            workspace.tree.node_for_window(target),
+        ) else {
+            return Vec::new();
+        };
+        if source == dest {
+            return Vec::new();
+        }
+        // Detaching can lift the target into its parent's node id; resolve it by content.
+        let Some(neighbour) = neighbour_of(&workspace.tree, dest) else {
+            return Vec::new();
+        };
+        detach_tiled(&mut workspace.tree, wid);
+        if !join_neighbour(&mut workspace.tree, wid, neighbour) {
+            // Not expected; never lose the window.
+            self.insert_tiled(self.active, wid, None);
+        }
+        let workspace = &mut self.workspaces[self.active];
+        if workspace
+            .maximized
+            .is_some_and(|max| max.wid == wid || max.wid == target)
+        {
+            workspace.maximized = None;
+        }
+        workspace.set_focus(wid);
+        self.sync()
     }
 
     // -------------------------------------------------------------------------------------
@@ -1378,6 +1637,89 @@ impl Layout {
 enum Neighbour {
     Window(WindowId),
     Stack(WindowId),
+}
+
+/// The window or stack at `node`, named by a window it holds so that it can be found again
+/// after a detach has normalised the tree.
+fn neighbour_of(tree: &Tree, node: NodeId) -> Option<Neighbour> {
+    if tree.is_window(node) {
+        tree.target_window(node).map(Neighbour::Window)
+    } else if let Some(stack) = tree.stack(node) {
+        stack
+            .active_window()
+            .or_else(|| stack.windows.first().copied())
+            .map(Neighbour::Stack)
+    } else {
+        None
+    }
+}
+
+/// Add `wid`, which is not in the tree, to `neighbour`: a plain window becomes a stack of
+/// two, a stack gets a new last tab.  `wid` becomes the active tab.  Returns whether
+/// `neighbour` was found.
+fn join_neighbour(tree: &mut Tree, wid: WindowId, neighbour: Neighbour) -> bool {
+    match neighbour {
+        Neighbour::Window(other) => match tree.node_for_window(other) {
+            Some(target) if tree.is_window(target) => {
+                tree.window_to_stack(target);
+                tree.push_stack_member(target, wid)
+            }
+            _ => false,
+        },
+        Neighbour::Stack(anchor) => match tree.node_for_window(anchor) {
+            Some(target) if tree.is_stack(target) => tree.push_stack_member(target, wid),
+            _ => false,
+        },
+    }
+}
+
+/// Take `wid` out of the tree: its leaf is removed, or it leaves its stack (a stack left with
+/// one member becomes a plain window).
+fn detach_tiled(tree: &mut Tree, wid: WindowId) {
+    if let Some((stack_id, member)) = tree.stack_containing(wid) {
+        tree.remove_stack_member(stack_id, member);
+        if tree
+            .stack(stack_id)
+            .is_some_and(|stack| stack.windows.is_empty())
+        {
+            tree.detach(stack_id);
+        }
+    } else if let Some(node) = tree.window_node(wid) {
+        tree.detach(node);
+    }
+}
+
+/// Where a dragged tiled window would go if it were dropped now.
+///
+/// Only stacking exists so far; cosmic-comp also splits next to the target when the pointer
+/// is outside the middle third (`TargetZone::WindowSplit`), which would be another variant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DropZone {
+    /// Join `target` (a plain window, or the visible member of a stack) as a new tab.
+    /// `tile` is `target`'s frame.
+    Stack { target: WindowId, tile: Rect },
+}
+
+/// The middle third of `tile` in both axes: cosmic-comp's stack region.
+pub fn stack_region(tile: Rect) -> Rect {
+    Rect::new(
+        tile.x + tile.width / 3.0,
+        tile.y + tile.height / 3.0,
+        tile.width / 3.0,
+        tile.height / 3.0,
+    )
+}
+
+/// The drop zone at `(x, y)` among `tiles` (the visible window of each tile and its frame).
+fn drop_zone_at(
+    tiles: impl IntoIterator<Item = (WindowId, Rect)>,
+    x: f64,
+    y: f64,
+) -> Option<DropZone> {
+    tiles
+        .into_iter()
+        .find(|(_, tile)| stack_region(*tile).contains_point(x, y))
+        .map(|(target, tile)| DropZone::Stack { target, tile })
 }
 
 #[derive(Debug, Clone, Copy)]

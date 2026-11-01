@@ -15,28 +15,62 @@
 //! Milestone 1 is display-only: tab hit-testing and the close button's click
 //! handling need a cursor tap, which is milestone-2 work.  The close glyph is
 //! drawn for affordance only.
+//!
+//! Colours come from [`TabBarPalette`]: COSMIC's default dark or light theme,
+//! with the user's COSMIC accent when configured, for the mode resolved by
+//! [`cosmic_mac_protocol::theme`] (COSMIC's `com.system76.CosmicTheme.Mode`,
+//! else the macOS appearance).  The thread resolves it when it shows the bar
+//! and, while the bar is visible, every [`THEME_RECHECK`]; a change redraws
+//! the visible bar.  Polling covers both sources (a file and a global
+//! default) without a run-loop observer or a file watcher in the daemon.
+//!
+//! The same thread draws the drag-to-stack highlight ([`DropHint`]): a
+//! translucent accent-coloured rounded rectangle over the tile a dragged
+//! window would be stacked onto, in an overlay window of its own that is
+//! ordered just above the target window.
 
 use std::ffi::c_int;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use cosmic_mac_protocol::{Rect, StackInfo};
+use cosmic_mac_protocol::theme::{self, Mode, Rgba, TabBarPalette};
+use cosmic_mac_protocol::{Rect, STACK_BAR_HEIGHT, StackInfo};
+
+use crate::backend::DropHint;
 use objc2_core_foundation::{
-    CFAttributedString, CFDictionary, CFRetained, CFString, CFType, CGAffineTransform, CGPoint,
-    CGRect, CGSize,
+    CFAttributedString, CFDictionary, CFPreferencesAppSynchronize, CFPreferencesCopyAppValue,
+    CFRetained, CFString, CFType, CGAffineTransform, CGPoint, CGRect, CGSize,
+    kCFPreferencesAnyApplication,
 };
 use objc2_core_graphics::CGContext;
 use objc2_core_text::{CTFont, CTLine, kCTFontAttributeName, kCTForegroundColorAttributeName};
 
 const SKYLIGHT_PATH: &str = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight";
-const BAR_HEIGHT: f64 = 26.0;
 const TAB_MAX_WIDTH: f64 = 220.0;
 const TAB_MIN_WIDTH: f64 = 56.0;
 const OVERLAY_TAGS: u64 = (1u64 << 1) | (1u64 << 9);
 const ORDER_ABOVE: c_int = 1;
+/// How long a resolved theme is trusted: a visible bar re-resolves it this
+/// often, and a show re-resolves it when it is older.
+const THEME_RECHECK: Duration = Duration::from_secs(2);
+/// The drop highlight sits this far inside the target's tile.
+const HINT_INSET: f64 = 6.0;
+const HINT_RADIUS: f64 = 10.0;
+const HINT_LINE_WIDTH: f64 = 3.0;
+const HINT_FILL_ALPHA: f64 = 0.3;
+const HINT_STROKE_ALPHA: f64 = 0.9;
+
+/// What the daemon sends the tab-bar thread.
+enum Update {
+    /// The focused stack; `None` hides the bar.
+    Stack(Option<StackInfo>),
+    /// The drag-to-stack highlight; `None` hides it.
+    Hint(Option<DropHint>),
+}
 
 /// Handle to the tab-bar thread.
 pub struct TabBarHandle {
-    tx: mpsc::Sender<Option<StackInfo>>,
+    tx: mpsc::Sender<Update>,
 }
 
 impl TabBarHandle {
@@ -68,41 +102,127 @@ impl TabBarHandle {
     /// Update the bar.  `None` hides it.
     pub fn update(&self, stack: Option<StackInfo>) -> Result<(), String> {
         self.tx
-            .send(stack)
+            .send(Update::Stack(stack))
+            .map_err(|_| "tab-bar thread stopped".to_string())
+    }
+
+    /// Show, move or hide the drop highlight.
+    pub fn drop_hint(&self, hint: Option<DropHint>) -> Result<(), String> {
+        self.tx
+            .send(Update::Hint(hint))
             .map_err(|_| "tab-bar thread stopped".to_string())
     }
 }
 
 struct TabBar {
     overlay: Option<Overlay>,
+    /// The stack the visible bar shows, for a redraw after a theme change.
+    shown: Option<StackInfo>,
+    theme: ThemeWatch,
+    /// The drop highlight's window, kept (ordered out) between drags.
+    hint: Option<Overlay>,
+    /// Whether the highlight is on screen.
+    hint_visible: bool,
 }
 
 impl TabBar {
     fn new() -> Result<Self, String> {
-        Ok(TabBar { overlay: None })
+        Ok(TabBar {
+            overlay: None,
+            shown: None,
+            theme: ThemeWatch::new(),
+            hint: None,
+            hint_visible: false,
+        })
     }
 
-    fn run(&mut self, rx: mpsc::Receiver<Option<StackInfo>>) {
-        while let Ok(stack) = rx.recv() {
-            let result = match stack {
-                None => self.hide(),
-                Some(stack) => self.show(&stack),
+    fn run(&mut self, rx: mpsc::Receiver<Update>) {
+        loop {
+            // Only a visible bar wakes up to re-check the theme.
+            let update = if self.overlay.is_some() {
+                match rx.recv_timeout(self.theme.until_next(Instant::now())) {
+                    Ok(update) => update,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Err(error) = self.recheck_theme() {
+                            log::warn!("tab bar redraw failed: {error}");
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(update) => update,
+                    Err(_) => break,
+                }
+            };
+            let result = match update {
+                Update::Stack(None) => self.hide(),
+                Update::Stack(Some(stack)) => self.show(stack),
+                Update::Hint(None) => self.hide_hint(),
+                Update::Hint(Some(hint)) => self.show_hint(hint),
             };
             if let Err(error) = result {
                 log::warn!("tab bar update failed: {error}");
             }
         }
         let _ = self.hide();
+        let _ = self.hide_hint();
+    }
+
+    fn show_hint(&mut self, hint: DropHint) -> Result<(), String> {
+        self.theme.refresh(Instant::now(), resolve_palette);
+        let frame = hint.frame.inset(HINT_INSET);
+        log::debug!("drop hint over window {} at {frame:?}", hint.target);
+        if self.hint.is_none() {
+            self.hint = Some(Overlay::new(frame)?);
+        }
+        let overlay = self.hint.as_mut().expect("hint overlay just created");
+        overlay.set_frame(frame)?;
+        // Just above the target: under the dragged window, like cosmic-comp.
+        overlay.order_above(hint.target as u32)?;
+        self.hint_visible = true;
+        overlay.draw_hint(&self.theme.palette)
+    }
+
+    fn hide_hint(&mut self) -> Result<(), String> {
+        if !std::mem::replace(&mut self.hint_visible, false) {
+            return Ok(());
+        }
+        log::debug!("drop hint hidden");
+        match &self.hint {
+            Some(overlay) => overlay.hide(),
+            None => Ok(()),
+        }
+    }
+
+    /// Re-resolves the theme and redraws the visible bar if it changed.
+    fn recheck_theme(&mut self) -> Result<(), String> {
+        if !self.theme.refresh(Instant::now(), resolve_palette) {
+            return Ok(());
+        }
+        match (&self.overlay, &self.shown) {
+            (Some(overlay), Some(stack)) => overlay.draw(stack, &self.theme.palette),
+            _ => Ok(()),
+        }
     }
 
     fn hide(&mut self) -> Result<(), String> {
+        self.shown = None;
         if let Some(overlay) = self.overlay.take() {
             overlay.hide()?;
         }
         Ok(())
     }
 
-    fn show(&mut self, stack: &StackInfo) -> Result<(), String> {
+    fn show(&mut self, stack: StackInfo) -> Result<(), String> {
+        self.theme.refresh(Instant::now(), resolve_palette);
+        let result = self.show_stack(&stack);
+        self.shown = Some(stack);
+        result
+    }
+
+    fn show_stack(&mut self, stack: &StackInfo) -> Result<(), String> {
         let frame = bar_frame(stack.frame);
         log::debug!(
             "tab bar: stack frame {:?} -> bar {:?}, {} tabs, active {}",
@@ -118,19 +238,137 @@ impl TabBar {
         overlay.set_frame(frame)?;
         let active = stack.active_tab().map(|tab| tab.wid).unwrap_or(0);
         overlay.order_above(active as u32)?;
-        overlay.draw(stack)?;
+        overlay.draw(stack, &self.theme.palette)?;
         Ok(())
     }
 }
 
+/// The resolved tab-bar palette and when it was resolved.
+struct ThemeWatch {
+    palette: TabBarPalette,
+    mode: Option<Mode>,
+    checked: Option<Instant>,
+}
+
+impl ThemeWatch {
+    fn new() -> Self {
+        ThemeWatch {
+            palette: TabBarPalette::DARK,
+            mode: None,
+            checked: None,
+        }
+    }
+
+    /// Time until the palette is due for a re-check (zero when due).
+    fn until_next(&self, now: Instant) -> Duration {
+        match self.checked {
+            Some(checked) => THEME_RECHECK.saturating_sub(now.saturating_duration_since(checked)),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Re-resolves the palette when it is due; returns whether it changed.
+    fn refresh(&mut self, now: Instant, resolve: impl FnOnce() -> (Mode, TabBarPalette)) -> bool {
+        if !self.until_next(now).is_zero() {
+            return false;
+        }
+        self.checked = Some(now);
+        let (mode, palette) = resolve();
+        let changed = palette != self.palette;
+        if self.mode != Some(mode) || changed {
+            log::info!("tab bar theme: {mode}, accent {:?}", palette.tab_active);
+        }
+        self.mode = Some(mode);
+        self.palette = palette;
+        changed
+    }
+}
+
+/// The palette for the current mode and accent.
+fn resolve_palette() -> (Mode, TabBarPalette) {
+    TabBarPalette::current(&crate::paths::cosmic_dir(), macos_prefers_dark)
+}
+
+/// The macOS appearance from the global default `AppleInterfaceStyle`.  The
+/// daemon has no `NSApplication`, so it cannot ask for the effective
+/// appearance.
+fn macos_prefers_dark() -> bool {
+    // SAFETY: an immutable CF constant.
+    let any_application = unsafe { kCFPreferencesAnyApplication };
+    // Re-reads the global domain, so a change another process (System
+    // Settings) made is seen.
+    CFPreferencesAppSynchronize(any_application);
+    let key = CFString::from_static_str(theme::MACOS_STYLE_KEY);
+    let style = CFPreferencesCopyAppValue(&key, any_application)
+        .and_then(|value| value.downcast::<CFString>().ok())
+        .map(|value| value.to_string());
+    theme::macos_style_is_dark(style.as_deref())
+}
+
+/// Fill, title and close-glyph colours of one tab.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TabColors {
+    fill: Rgba,
+    text: Rgba,
+    close: Rgba,
+}
+
+fn tab_colors(palette: &TabBarPalette, active: bool) -> TabColors {
+    if active {
+        TabColors {
+            fill: palette.tab_active,
+            text: palette.text_active,
+            close: palette.text_active,
+        }
+    } else {
+        TabColors {
+            fill: palette.tab_inactive,
+            text: palette.text,
+            close: palette.close,
+        }
+    }
+}
+
+/// Fill and outline of the drop highlight: the accent, translucent.
+fn hint_colors(palette: &TabBarPalette) -> (Rgba, Rgba) {
+    let accent = palette.tab_active;
+    (
+        Rgba::new(accent.red, accent.green, accent.blue, HINT_FILL_ALPHA),
+        Rgba::new(accent.red, accent.green, accent.blue, HINT_STROKE_ALPHA),
+    )
+}
+
+/// Add a rounded rectangle to the context's path.
+fn add_rounded_rect(context: &CGContext, rect: CGRect, radius: f64) {
+    let (x, y) = (rect.origin.x, rect.origin.y);
+    let (width, height) = (rect.size.width, rect.size.height);
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(0.0);
+    CGContext::begin_path(Some(context));
+    CGContext::move_to_point(Some(context), x + radius, y);
+    CGContext::add_arc_to_point(Some(context), x + width, y, x + width, y + height, radius);
+    CGContext::add_arc_to_point(Some(context), x + width, y + height, x, y + height, radius);
+    CGContext::add_arc_to_point(Some(context), x, y + height, x, y, radius);
+    CGContext::add_arc_to_point(Some(context), x, y, x + width, y, radius);
+    CGContext::close_path(Some(context));
+}
+
+fn set_fill(context: &CGContext, color: Rgba) {
+    CGContext::set_rgb_fill_color(
+        Some(context),
+        color.red,
+        color.green,
+        color.blue,
+        color.alpha,
+    );
+}
+
 fn bar_frame(frame: Rect) -> Rect {
     let width = frame.width.max(TAB_MIN_WIDTH);
-    let height = BAR_HEIGHT;
-    // Draw the bar over the top edge of the active member.  Placing it *above*
-    // the frame would put it in the neighbouring tile's area, where any window
-    // stacked above the active member (focus-without-raise keeps z-order) would
-    // hide it.  Inside the frame it is always visible relative to its anchor.
-    Rect::new(frame.x, frame.y, width, height)
+    let height = STACK_BAR_HEIGHT;
+    // The bar sits directly above the active member's frame.  Layout reserves
+    // that strip inside the stack's tile, so no neighbouring window can occupy
+    // it and the member's own title bar stays visible below the tabs.
+    Rect::new(frame.x, frame.y - height, width, height)
 }
 
 struct Overlay {
@@ -205,7 +443,7 @@ impl Overlay {
         result
     }
 
-    fn draw(&self, stack: &StackInfo) -> Result<(), String> {
+    fn draw(&self, stack: &StackInfo, palette: &TabBarPalette) -> Result<(), String> {
         let Some(context) = std::ptr::NonNull::new(self.context).map(|ptr| unsafe { ptr.as_ref() })
         else {
             return Err("null CGContext".into());
@@ -216,7 +454,7 @@ impl Overlay {
         );
         let _ = ffi::freeze(self.cid, self.wid);
         CGContext::clear_rect(Some(context), bounds);
-        CGContext::set_rgb_fill_color(Some(context), 0.10, 0.10, 0.12, 0.94);
+        set_fill(context, palette.background);
         CGContext::fill_rect(Some(context), bounds);
 
         let count = stack.tabs.len().max(1);
@@ -230,17 +468,65 @@ impl Overlay {
                     (self.frame.height - 2.0).max(1.0),
                 ),
             );
-            let active = index == stack.active;
-            if active {
-                CGContext::set_rgb_fill_color(Some(context), 0.25, 0.55, 1.0, 1.0);
-            } else {
-                CGContext::set_rgb_fill_color(Some(context), 0.18, 0.18, 0.21, 1.0);
-            }
+            let colors = tab_colors(palette, index == stack.active);
+            set_fill(context, colors.fill);
             CGContext::fill_rect(Some(context), tab_rect);
-            draw_close_glyph(context, x + tab_width - 12.0, self.frame.height / 2.0);
+            draw_close_glyph(
+                context,
+                x + tab_width - 12.0,
+                self.frame.height / 2.0,
+                colors.close,
+            );
             let title = shorten(&tab.title, tab_width);
-            draw_text(context, &title, x + 8.0, self.frame.height - 8.0, 11.0);
+            draw_text(
+                context,
+                &title,
+                x + 8.0,
+                self.frame.height / 2.0,
+                11.0,
+                colors.text,
+            );
         }
+        CGContext::flush(Some(context));
+        let _ = ffi::flush(self.cid, self.wid);
+        let _ = ffi::thaw(self.cid, self.wid);
+        Ok(())
+    }
+
+    /// Draw the drop highlight over the whole window.
+    fn draw_hint(&self, palette: &TabBarPalette) -> Result<(), String> {
+        let Some(context) = std::ptr::NonNull::new(self.context).map(|ptr| unsafe { ptr.as_ref() })
+        else {
+            return Err("null CGContext".into());
+        };
+        let bounds = CGRect::new(
+            CGPoint::new(0.0, 0.0),
+            CGSize::new(self.frame.width, self.frame.height),
+        );
+        let half = HINT_LINE_WIDTH / 2.0;
+        let shape = CGRect::new(
+            CGPoint::new(half, half),
+            CGSize::new(
+                (self.frame.width - HINT_LINE_WIDTH).max(1.0),
+                (self.frame.height - HINT_LINE_WIDTH).max(1.0),
+            ),
+        );
+        let (fill, stroke) = hint_colors(palette);
+        let _ = ffi::freeze(self.cid, self.wid);
+        CGContext::clear_rect(Some(context), bounds);
+        set_fill(context, fill);
+        add_rounded_rect(context, shape, HINT_RADIUS);
+        CGContext::fill_path(Some(context));
+        CGContext::set_rgb_stroke_color(
+            Some(context),
+            stroke.red,
+            stroke.green,
+            stroke.blue,
+            stroke.alpha,
+        );
+        CGContext::set_line_width(Some(context), HINT_LINE_WIDTH);
+        add_rounded_rect(context, shape, HINT_RADIUS);
+        CGContext::stroke_path(Some(context));
         CGContext::flush(Some(context));
         let _ = ffi::flush(self.cid, self.wid);
         let _ = ffi::thaw(self.cid, self.wid);
@@ -273,8 +559,14 @@ fn shorten(title: &str, width: f64) -> String {
     out
 }
 
-fn draw_close_glyph(context: &CGContext, cx: f64, cy: f64) {
-    CGContext::set_rgb_stroke_color(Some(context), 0.78, 0.78, 0.82, 1.0);
+fn draw_close_glyph(context: &CGContext, cx: f64, cy: f64, color: Rgba) {
+    CGContext::set_rgb_stroke_color(
+        Some(context),
+        color.red,
+        color.green,
+        color.blue,
+        color.alpha,
+    );
     CGContext::set_line_width(Some(context), 1.3);
     CGContext::move_to_point(Some(context), cx - 3.5, cy - 3.5);
     CGContext::add_line_to_point(Some(context), cx + 3.5, cy + 3.5);
@@ -283,7 +575,8 @@ fn draw_close_glyph(context: &CGContext, cx: f64, cy: f64) {
     CGContext::stroke_path(Some(context));
 }
 
-fn draw_text(context: &CGContext, text: &str, x: f64, baseline: f64, size: f64) {
+/// Draw `text` starting at `x`, its capitals centred on `middle`.
+fn draw_text(context: &CGContext, text: &str, x: f64, middle: f64, size: f64, color: Rgba) {
     if text.is_empty() {
         return;
     }
@@ -292,7 +585,12 @@ fn draw_text(context: &CGContext, text: &str, x: f64, baseline: f64, size: f64) 
     let font = unsafe { CTFont::with_name(&font_name, size, std::ptr::null()) };
     // SAFETY: the attribute-name statics are immutable CFStrings.
     let (font_key, color_key) = unsafe { (kCTFontAttributeName, kCTForegroundColorAttributeName) };
-    let color = objc2_core_graphics::CGColor::new_generic_rgb(0.94, 0.94, 0.96, 1.0);
+    let color = objc2_core_graphics::CGColor::new_generic_rgb(
+        color.red,
+        color.green,
+        color.blue,
+        color.alpha,
+    );
     let values: [&CFType; 2] = [font.as_ref(), color.as_ref()];
     let attributes: CFRetained<CFDictionary<CFString, CFType>> =
         CFDictionary::from_slices(&[font_key, color_key], &values);
@@ -310,8 +608,10 @@ fn draw_text(context: &CGContext, text: &str, x: f64, baseline: f64, size: f64) 
     };
     // SAFETY: attributed string is a valid CFAttributedString.
     let line = unsafe { CTLine::with_attributed_string(&attributed) };
-    // The SkyLight window context already has a top-left origin with y growing
-    // downwards; Core Text's default text matrix draws upright glyphs there.
+    // The SkyLight window context has a bottom-left origin with y growing
+    // upwards, so the baseline sits half the cap height below the middle.
+    // SAFETY: valid font.
+    let baseline = middle - unsafe { font.cap_height() } / 2.0;
     CGContext::set_text_matrix(
         Some(context),
         CGAffineTransform {
@@ -326,6 +626,125 @@ fn draw_text(context: &CGContext, text: &str, x: f64, baseline: f64, size: f64) 
     CGContext::set_text_position(Some(context), x, baseline);
     // SAFETY: valid line and context.
     unsafe { line.draw(context) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolved(mode: Mode) -> impl FnOnce() -> (Mode, TabBarPalette) {
+        move || (mode, TabBarPalette::defaults(mode))
+    }
+
+    fn not_due() -> (Mode, TabBarPalette) {
+        panic!("resolved before THEME_RECHECK elapsed")
+    }
+
+    #[test]
+    fn active_tab_uses_the_accent() {
+        for palette in [TabBarPalette::DARK, TabBarPalette::LIGHT] {
+            assert_eq!(
+                tab_colors(&palette, true),
+                TabColors {
+                    fill: palette.tab_active,
+                    text: palette.text_active,
+                    close: palette.text_active,
+                }
+            );
+            assert_eq!(
+                tab_colors(&palette, false),
+                TabColors {
+                    fill: palette.tab_inactive,
+                    text: palette.text,
+                    close: palette.close,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn drop_hint_is_the_translucent_accent() {
+        for palette in [TabBarPalette::DARK, TabBarPalette::LIGHT] {
+            let (fill, stroke) = hint_colors(&palette);
+            for color in [fill, stroke] {
+                assert_eq!(
+                    (color.red, color.green, color.blue),
+                    (
+                        palette.tab_active.red,
+                        palette.tab_active.green,
+                        palette.tab_active.blue
+                    )
+                );
+            }
+            assert!(fill.alpha < stroke.alpha && stroke.alpha < 1.0);
+        }
+    }
+
+    #[test]
+    fn tab_colors_follow_the_mode() {
+        let dark = tab_colors(&TabBarPalette::DARK, false);
+        let light = tab_colors(&TabBarPalette::LIGHT, false);
+        assert!(dark.fill.luminance() < light.fill.luminance());
+        assert!(dark.text.luminance() > light.text.luminance());
+        assert_ne!(
+            tab_colors(&TabBarPalette::DARK, true).fill,
+            tab_colors(&TabBarPalette::LIGHT, true).fill
+        );
+    }
+
+    #[test]
+    fn first_show_resolves_the_theme() {
+        let mut watch = ThemeWatch::new();
+        let now = Instant::now();
+        assert_eq!(watch.until_next(now), Duration::ZERO);
+        assert!(watch.refresh(now, resolved(Mode::Light)));
+        assert_eq!(watch.palette, TabBarPalette::LIGHT);
+        assert_eq!(watch.mode, Some(Mode::Light));
+        assert_eq!(watch.until_next(now), THEME_RECHECK);
+    }
+
+    #[test]
+    fn theme_is_rechecked_after_the_interval() {
+        let mut watch = ThemeWatch::new();
+        let start = Instant::now();
+        // Dark is the initial palette, so resolving dark is no change.
+        assert!(!watch.refresh(start, resolved(Mode::Dark)));
+        assert_eq!(watch.mode, Some(Mode::Dark));
+
+        let soon = start + THEME_RECHECK / 2;
+        assert!(!watch.refresh(soon, not_due));
+        assert_eq!(watch.until_next(soon), THEME_RECHECK / 2);
+
+        let due = start + THEME_RECHECK;
+        assert_eq!(watch.until_next(due), Duration::ZERO);
+        assert!(!watch.refresh(due, resolved(Mode::Dark)));
+        let later = due + THEME_RECHECK;
+        assert!(watch.refresh(later, resolved(Mode::Light)));
+        assert_eq!(watch.palette, TabBarPalette::LIGHT);
+        assert!(!watch.refresh(later + THEME_RECHECK / 4, not_due));
+    }
+
+    #[test]
+    fn accent_change_counts_as_a_change() {
+        let mut watch = ThemeWatch::new();
+        let start = Instant::now();
+        watch.refresh(start, resolved(Mode::Dark));
+        let mut orange = TabBarPalette::DARK;
+        orange.tab_active = Rgba::new(1.0, 0.5, 0.0, 1.0);
+        assert!(watch.refresh(start + THEME_RECHECK, move || (Mode::Dark, orange)));
+        assert_eq!(watch.palette, orange);
+    }
+
+    #[test]
+    fn macos_appearance_matches_defaults() {
+        let output = std::process::Command::new("/usr/bin/defaults")
+            .args(["read", "-g", theme::MACOS_STYLE_KEY])
+            .output()
+            .expect("run defaults");
+        let style = String::from_utf8_lossy(&output.stdout);
+        let expected = output.status.success() && theme::macos_style_is_dark(Some(&style));
+        assert_eq!(macos_prefers_dark(), expected, "defaults said {style:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

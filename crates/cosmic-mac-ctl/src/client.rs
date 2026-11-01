@@ -227,7 +227,8 @@ pub struct Reply {
 /// A client bound to one socket path and timeout.
 ///
 /// One request is sent per connection: the daemon contract is a single JSON line in each
-/// direction, and closing the stream after the reply keeps state out of the CLI.
+/// direction, and closing the stream after the reply keeps state out of the CLI.  The
+/// exception is [`Client::subscribe`], whose connection stays open as a stream of states.
 #[derive(Debug, Clone)]
 pub struct Client {
     path: PathBuf,
@@ -249,6 +250,38 @@ impl Client {
 
     /// Send one request and read one reply.
     pub fn request(&self, request: &Request) -> Result<Reply, ClientError> {
+        let mut reader = BufReader::new(self.send(request)?);
+        self.read_reply(&mut reader)?
+            .ok_or_else(|| ClientError::Closed {
+                path: self.path.clone(),
+            })
+    }
+
+    /// Send `Request::Subscribe` and keep the connection open as a [`Subscription`].
+    ///
+    /// The first reply (the current state, or an error from a daemon that predates
+    /// subscriptions) is read here, within the client's timeout, so a daemon that does not
+    /// answer is reported like any other request.  Later lines may take arbitrarily long:
+    /// the stream is silent while nothing changes, so no read timeout applies to them.
+    pub fn subscribe(&self) -> Result<Subscription, ClientError> {
+        let mut reader = BufReader::new(self.send(&Request::Subscribe)?);
+        let first = self
+            .read_reply(&mut reader)?
+            .ok_or_else(|| ClientError::Closed {
+                path: self.path.clone(),
+            })?;
+        // Best effort: macOS rejects the call with EINVAL once the daemon has closed its
+        // end, and then the next read reports the close anyway.
+        let _ = reader.get_ref().set_read_timeout(None);
+        Ok(Subscription {
+            client: self.clone(),
+            reader,
+            first: Some(first),
+        })
+    }
+
+    /// Connect, apply the timeouts and write one request line.
+    fn send(&self, request: &Request) -> Result<UnixStream, ClientError> {
         let payload = serde_json::to_string(request).map_err(ClientError::Encode)?;
 
         let mut stream =
@@ -277,8 +310,11 @@ impl Client {
                 path: self.path.clone(),
                 source,
             })?;
+        Ok(stream)
+    }
 
-        let mut reader = BufReader::new(stream);
+    /// Read and decode one reply line; `Ok(None)` when the daemon closed the connection.
+    fn read_reply(&self, reader: &mut BufReader<UnixStream>) -> Result<Option<Reply>, ClientError> {
         let mut line = String::new();
         let read = reader.read_line(&mut line).map_err(|source| {
             if matches!(
@@ -298,9 +334,7 @@ impl Client {
         })?;
 
         if read == 0 {
-            return Err(ClientError::Closed {
-                path: self.path.clone(),
-            });
+            return Ok(None);
         }
         if line.len() > MAX_REPLY_BYTES {
             return Err(ClientError::OversizedReply {
@@ -323,7 +357,35 @@ impl Client {
             })?;
         let data = value.get("data").cloned();
 
-        Ok(Reply { response, data })
+        Ok(Some(Reply { response, data }))
+    }
+}
+
+/// An open `Request::Subscribe` connection (see [`Client::subscribe`]).
+///
+/// The daemon sends the current shell state at once and another `Response::State` line
+/// whenever it changes.  Dropping the subscription closes the connection.
+#[derive(Debug)]
+pub struct Subscription {
+    client: Client,
+    reader: BufReader<UnixStream>,
+    first: Option<Reply>,
+}
+
+impl Subscription {
+    /// The next reply.  The first call returns the reply [`Client::subscribe`] already read;
+    /// later calls block until the daemon sends another line.  `Ok(None)` means the daemon
+    /// closed the stream (it stopped).
+    pub fn next_reply(&mut self) -> Result<Option<Reply>, ClientError> {
+        if let Some(first) = self.first.take() {
+            return Ok(Some(first));
+        }
+        self.client.read_reply(&mut self.reader)
+    }
+
+    /// The socket this subscription is connected to.
+    pub fn path(&self) -> &Path {
+        self.client.path()
     }
 }
 
@@ -395,5 +457,139 @@ mod tests {
         assert!(parse_timeout_ms(Some(0), None).is_err());
         assert!(parse_timeout_ms(None, Some("nope")).is_err());
         assert!(parse_timeout_ms(None, Some("99999999")).is_err());
+    }
+
+    mod subscription {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::thread;
+        use std::time::Duration;
+
+        use cosmic_mac_protocol::{Response, ShellState, WorkspaceInfo};
+
+        use super::super::{Client, ClientError};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        /// A socket path in a fresh directory, removed on drop.
+        struct Socket(PathBuf);
+
+        impl Socket {
+            fn new() -> Self {
+                let dir = std::env::temp_dir().join(format!(
+                    "cmc-sub-{}-{}",
+                    std::process::id(),
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                Socket(dir.join("wm.sock"))
+            }
+        }
+
+        impl Drop for Socket {
+            fn drop(&mut self) {
+                if let Some(dir) = self.0.parent() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+
+        fn state_line(active: u32) -> String {
+            let state = ShellState {
+                workspaces: (1..=2)
+                    .map(|index| WorkspaceInfo::new(index, index.to_string(), index == active, 0))
+                    .collect(),
+                tiling: true,
+                focused_floating: None,
+                max_workspaces: 9,
+            };
+            format!(
+                "{}\n",
+                serde_json::to_string(&Response::State(state)).unwrap()
+            )
+        }
+
+        /// Accept one connection, record its request line, then write `lines` with
+        /// `pause` before each line after the first, and close.
+        fn serve(
+            socket: &Socket,
+            lines: Vec<String>,
+            pause: Duration,
+        ) -> thread::JoinHandle<String> {
+            let listener = UnixListener::bind(&socket.0).unwrap();
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                for (index, line) in lines.iter().enumerate() {
+                    if index > 0 {
+                        thread::sleep(pause);
+                    }
+                    stream.write_all(line.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                }
+                request
+            })
+        }
+
+        fn active(reply: Option<super::super::Reply>) -> u32 {
+            match reply.expect("a reply").response {
+                Response::State(state) => state.active_workspace().unwrap().index,
+                other => panic!("expected a state, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn streams_states_beyond_the_reply_timeout_until_the_daemon_closes() {
+            let socket = Socket::new();
+            let server = serve(
+                &socket,
+                vec![state_line(1), state_line(2)],
+                Duration::from_millis(300),
+            );
+            // The second line arrives after the 100 ms timeout: only the first is timed.
+            let client = Client::new(socket.0.clone(), Duration::from_millis(100));
+            let mut subscription = client.subscribe().unwrap();
+            assert_eq!(subscription.path(), socket.0.as_path());
+            assert_eq!(active(subscription.next_reply().unwrap()), 1);
+            assert_eq!(active(subscription.next_reply().unwrap()), 2);
+            assert!(subscription.next_reply().unwrap().is_none());
+            assert_eq!(server.join().unwrap(), "{\"request\":\"subscribe\"}\n");
+        }
+
+        #[test]
+        fn a_daemon_without_subscriptions_answers_with_an_error_reply() {
+            let socket = Socket::new();
+            let error =
+                r#"{"response":"error","data":"invalid request: unknown variant `subscribe`"}"#;
+            let server = serve(&socket, vec![format!("{error}\n")], Duration::ZERO);
+            let client = Client::new(socket.0.clone(), Duration::from_secs(2));
+            let mut subscription = client.subscribe().unwrap();
+            let reply = subscription.next_reply().unwrap().unwrap();
+            assert!(
+                matches!(reply.response, Response::Error(message) if message.contains("subscribe"))
+            );
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn closing_before_the_first_state_is_an_error() {
+            let socket = Socket::new();
+            let server = serve(&socket, Vec::new(), Duration::ZERO);
+            let client = Client::new(socket.0.clone(), Duration::from_secs(2));
+            let error = client.subscribe().unwrap_err();
+            assert!(matches!(error, ClientError::Closed { .. }), "{error:?}");
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn no_daemon_is_a_connect_error() {
+            let socket = Socket::new();
+            let client = Client::new(socket.0.clone(), Duration::from_secs(2));
+            let error = client.subscribe().unwrap_err();
+            assert!(matches!(error, ClientError::Connect { .. }), "{error:?}");
+        }
     }
 }

@@ -730,6 +730,12 @@ mod tests {
         let error = fx.session(false).install(empty_bin.path()).unwrap_err();
         assert!(error.0.contains("missing program(s)"), "{error}");
         assert!(error.0.contains("cosmic-mac-wm"), "{error}");
+        assert!(
+            error
+                .0
+                .contains("cosmic-mac-launcher.app/Contents/MacOS/cosmic-mac-launcher"),
+            "{error}"
+        );
         assert!(fx.runner.calls.is_empty());
         assert!(!fx.paths().launch_agents_dir().exists());
     }

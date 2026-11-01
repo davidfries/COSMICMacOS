@@ -158,6 +158,25 @@ fn toggle_window_floating_tiles_a_floating_window() {
 }
 
 #[test]
+fn is_floating_follows_the_floating_layer() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    assert!(!harness.layout.is_floating(1));
+    assert!(!harness.layout.is_floating(2));
+    harness.act(Action::ToggleWindowFloating);
+    assert!(harness.layout.is_floating(2));
+    assert!(!harness.layout.is_floating(1));
+    // A window on another workspace is still reported.
+    harness.act(Action::MoveToWorkspace { index: 2 });
+    assert!(harness.layout.is_floating(2));
+    // With tiling disabled every window floats; unknown windows never do.
+    harness.act(Action::ToggleTiling);
+    assert!(harness.layout.is_floating(1));
+    assert!(!harness.layout.is_floating(99));
+}
+
+#[test]
 fn toggle_window_floating_keeps_focus() {
     let mut harness = Harness::new();
     harness.add();

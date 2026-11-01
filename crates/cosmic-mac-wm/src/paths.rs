@@ -29,6 +29,22 @@ pub fn socket_path() -> PathBuf {
     cosmic_dir().join("cosmic-mac-wm.sock")
 }
 
+/// `~/Library/Application Support/cosmic/cosmic-mac-launcher.sock`, the
+/// resident launcher's control socket (`cosmic_mac_protocol::launcher`).
+pub fn launcher_socket_path() -> PathBuf {
+    cosmic_dir().join(cosmic_mac_protocol::launcher::SOCKET_FILE_NAME)
+}
+
+/// `~/Library/Logs/cosmicMac/launcher.log`, shared with the launcher's
+/// launchd agent; an on-demand start appends its output there.
+pub fn launcher_log_path() -> PathBuf {
+    home_dir()
+        .join("Library")
+        .join("Logs")
+        .join("cosmicMac")
+        .join("launcher.log")
+}
+
 /// `~/Library/Application Support/cosmic/frame-journal.ron`.
 pub fn journal_path() -> PathBuf {
     cosmic_dir().join("frame-journal.ron")
@@ -65,6 +81,13 @@ mod tests {
         let dir = cosmic_dir();
         assert!(dir.ends_with("Library/Application Support/cosmic"));
         assert!(socket_path().ends_with("cosmic-mac-wm.sock"));
+        assert_eq!(
+            launcher_socket_path().parent(),
+            socket_path().parent(),
+            "the launcher socket sits next to the WM socket"
+        );
+        assert!(launcher_socket_path().ends_with("cosmic-mac-launcher.sock"));
+        assert!(launcher_log_path().ends_with("Library/Logs/cosmicMac/launcher.log"));
         assert!(journal_path().ends_with("frame-journal.ron"));
         assert!(session_path().ends_with("wm-session.ron"));
         assert!(
