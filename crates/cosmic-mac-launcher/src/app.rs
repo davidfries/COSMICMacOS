@@ -57,12 +57,12 @@ use cosmic::theme::{self, Button};
 use cosmic::widget::text_input::{self, StyleSheet as _};
 use cosmic::widget::{self, button, container, divider, icon};
 use cosmic::{Element, executor};
-use cosmic_mac_protocol::WindowState;
 use cosmic_mac_protocol::launcher::LauncherCommand;
 use cosmic_mac_protocol::theme::Mode;
+use cosmic_mac_protocol::{WindowId, WindowState};
 
 use crate::geometry::{self, MAX_ROWS};
-use crate::plugin::{Entry, IconSource};
+use crate::plugin::{Action, Entry, IconSource};
 use crate::plugins::{Plugins, apps, files, windows};
 use crate::{appkit, icons, theme as launcher_theme};
 
@@ -157,6 +157,8 @@ pub enum Message {
     },
     AppsScanned(Vec<apps::AppEntry>, Duration),
     WindowsLoaded(Result<Vec<WindowState>, String>, Duration),
+    /// The window manager's reply to a focus request.
+    WindowFocused(WindowId, Result<(), String>),
     /// Rendered (or cached) PNG icons per bundle or file path; `None` if
     /// rendering failed.
     IconsLoaded(Vec<(PathBuf, Option<Vec<u8>>)>),
@@ -328,6 +330,16 @@ impl Launcher {
             return Task::none();
         };
         log::info!("activating {:?}: {action:?}", entry.result.name);
+        if let Action::FocusWindow(wid) = action {
+            // The WM round trip can take a second; keep it off the UI thread.
+            // Hide first: hiding deactivates the launcher, and macOS would
+            // re-activate the previous app over a window focused before it.
+            let focus = background(
+                move || windows::focus_window_blocking(wid),
+                move |result| Message::WindowFocused(wid, result),
+            );
+            return self.hide().chain(focus);
+        }
         if let Err(error) = appkit::perform(&action) {
             log::error!("cannot perform {action:?}: {error}");
         }
@@ -839,6 +851,11 @@ impl cosmic::Application for Launcher {
                 );
                 self.plugins.set_windows(windows);
                 return self.refresh();
+            }
+            Message::WindowFocused(wid, result) => {
+                if let Err(error) = result {
+                    log::error!("cannot focus window {wid}: {error}");
+                }
             }
             Message::WindowsLoaded(Err(error), _) => {
                 log::info!("no window list from the window manager: {error}");

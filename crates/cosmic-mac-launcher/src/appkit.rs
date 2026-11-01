@@ -48,7 +48,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
 
 use crate::geometry::{self, Frame};
 use crate::plugin::Action;
-use crate::plugins::{terminal, windows};
+use crate::plugins::terminal;
 
 /// The launcher `NSWindow` after [`show_window`], for the log.
 #[derive(Clone, Debug)]
@@ -223,7 +223,8 @@ fn policy_name(policy: NSApplicationActivationPolicy) -> &'static str {
     }
 }
 
-/// Performs a result's action.
+/// Performs a result's action. [`Action::FocusWindow`] waits on the window
+/// manager and is run by the caller off the UI thread instead.
 pub fn perform(action: &Action) -> Result<(), String> {
     match action {
         Action::LaunchApp(path) | Action::OpenFile(path) => open_path(path),
@@ -237,10 +238,7 @@ pub fn perform(action: &Action) -> Result<(), String> {
             .map_err(|error| format!("cannot start {command:?}: {error}")),
         Action::OpenUrl(url) => open_url(url),
         Action::CopyText(text) => copy_text(text),
-        Action::FocusWindow(wid) => {
-            let client = windows::default_client(windows::FOCUS_TIMEOUT)?;
-            windows::focus_window(&client, *wid)
-        }
+        Action::FocusWindow(_) => Err("FocusWindow must not run on the UI thread".to_owned()),
     }
 }
 

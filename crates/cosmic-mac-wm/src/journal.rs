@@ -172,8 +172,13 @@ impl Journal {
         wid: WindowId,
         backend: &dyn PlatformBackend,
     ) -> Option<(i32, i32)> {
+        self.pid_changed(wid, owner_pid(backend, wid))
+    }
+
+    /// [`Journal::owner_changed`] for an already-read `current` owner.
+    fn pid_changed(&self, wid: WindowId, current: Option<i32>) -> Option<(i32, i32)> {
         let recorded = self.pid(wid)?;
-        let current = owner_pid(backend, wid)?;
+        let current = current?;
         (recorded != current).then_some((recorded, current))
     }
 
@@ -283,12 +288,16 @@ impl Journal {
         let mut errors = Vec::new();
         let entries: Vec<(WindowId, Rect)> = self.entries().collect();
         for (wid, frame) in entries {
-            if backend.frame(wid).is_none() {
+            // One read per window: each is a full Accessibility read that can
+            // cost the AX timeout against a hung app.
+            let info = backend.window_info(wid);
+            if info.as_ref().and_then(|info| info.initial_frame).is_none() {
                 log::info!("journal: window {wid} no longer exists; dropping its saved frame");
                 self.entries.remove(&wid);
                 continue;
             }
-            if let Some((recorded, current)) = self.owner_changed(wid, backend) {
+            let current = info.map(|info| info.pid).filter(|&pid| pid > 0);
+            if let Some((recorded, current)) = self.pid_changed(wid, current) {
                 log::info!(
                     "journal: window {wid} now belongs to pid {current}, not {recorded}; \
                      dropping its saved frame"

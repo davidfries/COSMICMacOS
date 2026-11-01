@@ -485,8 +485,12 @@ fn watch_super_tap(
     };
     let since_input =
         super_tap::duration_from_seconds(eventtap::seconds_since_click_scroll_or_key());
-    if !super_tap::no_input_during(held, since_input) {
-        log::debug!("Super tap ignored: click, scroll or key {since_input:?} ago, held {held:?}");
+    let button_down = eventtap::mouse_button_down();
+    if !super_tap::should_toggle(held, since_input, button_down) {
+        log::debug!(
+            "Super tap ignored: click, scroll or key {since_input:?} ago, held {held:?}, \
+             mouse button down: {button_down}"
+        );
         return;
     }
     if is_passthrough(passthrough) {

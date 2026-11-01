@@ -45,6 +45,18 @@
 //! never framed, parked, focused or probed.  Its [`WindowSlot`] is kept, so it
 //! comes back to the tile it left rather than wherever focus happens to be.
 //!
+//! # Windows that were away when they appeared
+//!
+//! A window that is minimized, hidden with its application or in native full
+//! screen when the daemon starts, or when it appears, is not managed then.
+//! Every sign that a window the core does not know is on screen (shown,
+//! deminimized, focused, its application shown or newly observed) looks at it
+//! again, with the same checks as a new window.  `AXMinimized` still reads true
+//! for about half a second after a deminimize, so on such a sign a window that
+//! reads minimized is re-checked later instead of dropped.  A window rejected
+//! for what it is (its level, application, role or size) is remembered until
+//! it closes or changes level, so focus moving to it does not read it again.
+//!
 //! # Native full screen and Space changes
 //!
 //! A window entering or leaving native full screen moves to another Space, and
@@ -52,8 +64,11 @@
 //! Accessibility cannot find it, and SkyLight reports it **destroyed** (and
 //! created again on the other Space).  So a destroy is only believed when the
 //! window server no longer knows the window
-//! ([`PlatformBackend::window_presence`]); a window that still exists is
-//! suspended as away in full screen instead of forgotten.  Reads that fail in
+//! ([`PlatformBackend::window_presence`]); a window that still exists on no
+//! Space or on a full-screen one is suspended as away in full screen instead
+//! of forgotten.  One still on the desktop's Space is most likely a close the
+//! window server has not finished: a re-check forgets it once it is gone (or
+//! suspends it if it left for full screen after all).  Reads that fail in
 //! the middle of such a transition are retried with **re-checks**: [`Core`]
 //! never sleeps; it queues `(window, delay)` requests ([`Core::take_rechecks`])
 //! that the daemon turns into timers and feeds back through [`Core::recheck`],
@@ -70,7 +85,10 @@
 //! While a full-screen Space is active the desktop's windows are on an inactive
 //! Space, where Accessibility cannot move them, and applications move them
 //! anyway (TextEdit resets its other windows' frames).  Such moves are not user
-//! moves and are left alone until then.  When a desktop Space
+//! moves and are left alone until then.  Keybinding and IPC actions are
+//! ignored as well: the layout's focus is then on a desktop window the user
+//! cannot see, so Super+Q would close that window instead of the full-screen
+//! one.  When a desktop Space
 //! becomes active again ([`PlatformEvent::ActiveSpaceChanged`]) the core
 //! resumes the windows that left full screen and **re-asserts** the layout:
 //! every managed window that drifted from its tile is framed again and every
@@ -149,6 +167,13 @@ pub struct Core {
     /// Windows that appeared but are not managed yet: they appeared during a
     /// Space transition, or could not be read.  A re-check decides.
     pending: HashSet<WindowId>,
+    /// Windows that later signs that they are on screen ([`Discovery::Back`])
+    /// do not pick up: looked at and rejected for what they are (their level,
+    /// application, role or size; never for being minimized or in full
+    /// screen), so they are not read again, or handed back to the user by
+    /// [`Request::Restore`].  Forgotten when the window is destroyed or
+    /// changes level.
+    ignored: HashSet<WindowId>,
     /// Re-checks per window: how many have run, and whether one is scheduled.
     rechecks: HashMap<WindowId, RecheckState>,
     /// Re-checks requested since the daemon last took them
@@ -284,6 +309,21 @@ enum SuspendKind {
     FullScreen,
 }
 
+/// Why [`Core::discover`] looks at a window the core does not manage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Discovery {
+    /// It was reported created.  A minimized window is not managed; it is
+    /// looked at again when it is back.
+    Created,
+    /// A sign that it is on screen: it was shown, deminimized or focused, its
+    /// application was shown or newly observed, or it is pending and its
+    /// re-check is due.  It may have been minimized or hidden when it
+    /// appeared (or when the daemon started).  A window that still reads
+    /// minimized is re-checked later, since `AXMinimized` keeps reading true
+    /// for about half a second after a deminimize.
+    Back,
+}
+
 /// What [`Core::admit`] decided for a window that is not managed yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
@@ -354,6 +394,7 @@ impl Core {
             suspended: HashMap::new(),
             suspend_seq: 0,
             pending: HashSet::new(),
+            ignored: HashSet::new(),
             rechecks: HashMap::new(),
             recheck_requests: Vec::new(),
             transition_until: None,
@@ -543,14 +584,19 @@ impl Core {
             }
             PlatformEvent::WindowHidden { wid } => self.window_hidden(wid),
             PlatformEvent::WindowShown { wid } => {
-                self.try_resume_at(u64::from(wid), captured, ResumeTrigger::Read);
+                self.window_back(u64::from(wid), captured, ResumeTrigger::Read);
             }
             PlatformEvent::WindowMinimized { wid } => self.window_minimized(wid, captured),
             PlatformEvent::WindowDeminimized { wid } => {
-                self.try_resume_at(u64::from(wid), captured, ResumeTrigger::Deminimized);
+                self.window_back(u64::from(wid), captured, ResumeTrigger::Deminimized);
             }
             PlatformEvent::AppHidden { pid } => self.app_hidden(pid),
-            PlatformEvent::AppShown { pid } => self.app_shown(pid),
+            PlatformEvent::AppShown { pid } => self.app_shown(pid, captured),
+            PlatformEvent::AppObserved { pid } => {
+                // An application hidden when the daemon started: showing it
+                // sent nothing, so its windows are only found now.
+                self.batched(|core| core.discover_app_windows(pid, captured));
+            }
             PlatformEvent::WindowLevelChanged { wid } => self.window_level_changed(wid),
             PlatformEvent::ActiveSpaceChanged { space, fullscreen } => {
                 self.active_space_changed(space, fullscreen, captured);
@@ -572,20 +618,67 @@ impl Core {
             }
             return;
         }
-        if pid == self.self_pid
-            || self.layout.window_info(wid).is_some()
+        if pid == self.self_pid {
+            return;
+        }
+        self.discover(wid, captured, Discovery::Created);
+    }
+
+    /// A window was shown or deminimized: resume it when it is suspended,
+    /// else look at it in case it was away when it appeared.
+    fn window_back(&mut self, wid: WindowId, captured: Instant, trigger: ResumeTrigger) {
+        if !self.try_resume_at(wid, captured, trigger) {
+            self.discover(wid, captured, Discovery::Back);
+        }
+    }
+
+    /// Look at a window the core may not know yet and manage it when it is a
+    /// real window on the desktop's Space.  Windows the core already tracks
+    /// (managed, suspended, pending, shell) are left alone, and so are those
+    /// rejected for what they are, unless they were just created.
+    ///
+    /// Called when a window appears and on every sign that a window is on
+    /// screen ([`Discovery::Back`]), which picks up windows that were
+    /// minimized or hidden when they appeared or when the daemon started.
+    fn discover(&mut self, wid: WindowId, captured: Instant, discovery: Discovery) {
+        if self.layout.window_info(wid).is_some()
+            || self.suspended.contains_key(&wid)
             || self.shell_strips.contains_key(&wid)
             || self.pending.contains(&wid)
         {
+            return;
+        }
+        // A window just created is always read: its first read may have come
+        // before Accessibility was ready (SkyLight and Accessibility both
+        // report a creation).
+        if discovery == Discovery::Back && self.ignored.contains(&wid) {
             return;
         }
         if self.in_transition(captured) {
             self.defer(wid, "appeared during a Space transition");
             return;
         }
-        match self.admit(wid) {
+        match self.admit(wid, discovery) {
             Admission::Managed | Admission::Rejected => {}
             Admission::Later(reason) => self.defer(wid, reason),
+        }
+    }
+
+    /// [`Core::discover`] for every on-screen window of application `pid`.
+    fn discover_app_windows(&mut self, pid: i32, captured: Instant) {
+        if pid == self.self_pid {
+            return;
+        }
+        let wids: Vec<WindowId> = self
+            .applier
+            .backend()
+            .windows()
+            .into_iter()
+            .filter(|info| info.pid == pid)
+            .map(|info| info.wid)
+            .collect();
+        for wid in wids {
+            self.discover(wid, captured, Discovery::Back);
         }
     }
 
@@ -595,7 +688,11 @@ impl Core {
     /// The full-screen animation creates helper windows that look like
     /// ordinary level-0 windows covering the display; they are on no Space
     /// when they appear (verified on macOS 15.6), which is what keeps them out.
-    fn admit(&mut self, wid: WindowId) -> Admission {
+    ///
+    /// A window rejected for what it is goes into [`Core::ignored`]; one that
+    /// is only minimized or in full screen does not, and on
+    /// [`Discovery::Back`] a minimized one is looked at again later.
+    fn admit(&mut self, wid: WindowId, discovery: Discovery) -> Admission {
         let backend = self.applier.backend();
         let Some(info) = backend.window_info(wid) else {
             if backend.window_presence(wid) == WindowPresence::Gone {
@@ -616,8 +713,19 @@ impl Core {
             self.recompute_work_area();
             return Admission::Rejected;
         }
-        if !rules::is_manageable(&info) {
+        if info.pid == self.self_pid || !rules::is_manageable_kind(&info) {
             log::debug!("ignoring unmanaged window {wid} ({})", info.app_id);
+            self.ignored.insert(wid);
+            return Admission::Rejected;
+        }
+        if info.minimized && discovery == Discovery::Back {
+            return Admission::Later("is still minimized");
+        }
+        if !rules::is_manageable(&info) {
+            log::debug!(
+                "not managing window {wid} ({}) while it is minimized or in full screen",
+                info.app_id
+            );
             return Admission::Rejected;
         }
         if info.role.is_none() {
@@ -637,6 +745,7 @@ impl Core {
             info.title
         );
         self.pending.remove(&wid);
+        self.ignored.remove(&wid);
         self.rechecks.remove(&wid);
         self.add_window(info);
         Admission::Managed
@@ -656,11 +765,14 @@ impl Core {
 
     /// SkyLight reports a window as destroyed when it closes, and also when it
     /// leaves its Space for a native full-screen one.  Only a window the
-    /// window server no longer has is forgotten; one that still exists is
-    /// suspended (or stays suspended) with its constraints and journal entry,
-    /// and a re-check follows it.
+    /// window server no longer has is forgotten.  One that still exists on no
+    /// Space or on a full-screen one is suspended (or stays suspended) with
+    /// its constraints and journal entry, and a re-check follows it.  One
+    /// still on the desktop's Space is most likely closing while the window
+    /// server tears it down: it is left as it is, and a re-check decides.
     fn window_destroyed(&mut self, wid: u32, captured: Instant) {
         let wid = u64::from(wid);
+        self.ignored.remove(&wid);
         if self.shell_strips.remove(&wid).is_some() {
             log::info!("shell window {wid} closed; releasing its strip");
             self.recompute_work_area();
@@ -679,6 +791,17 @@ impl Core {
         }
         if self.pending.contains(&wid) {
             // Its scheduled re-check decides.
+            return;
+        }
+        if presence == (WindowPresence::OnSpace { fullscreen: false }) {
+            // A window entering full screen is on no Space by now (traced on
+            // macOS 15.6).  Suspending a closing one would take the keyboard
+            // focus away with it; the re-check forgets it once it is gone.
+            log::debug!(
+                "window {wid}: destroy notification, but it is still on the desktop's Space; \
+                 checking it again later"
+            );
+            self.schedule_recheck(wid);
             return;
         }
         log::debug!("window {wid}: destroy notification, but it still exists ({presence:?})");
@@ -704,6 +827,9 @@ impl Core {
     /// A window that returns to level 0 is not picked up again.
     fn window_level_changed(&mut self, wid: u32) {
         let wid = u64::from(wid);
+        // A window ignored for its level may be manageable now; the next sign
+        // that it is on screen reads it again.
+        self.ignored.remove(&wid);
         if self.layout.window_info(wid).is_none() {
             return;
         }
@@ -946,8 +1072,9 @@ impl Core {
     }
 
     /// A hidden application was shown again: resume its suspended windows
-    /// that are back (a minimized one stays suspended).
-    fn app_shown(&mut self, pid: i32) {
+    /// that are back (a minimized one stays suspended), and manage its
+    /// windows the core never had (it was hidden when they appeared).
+    fn app_shown(&mut self, pid: i32, captured: Instant) {
         let mut wids: Vec<(u64, WindowId)> = self
             .suspended
             .iter_mut()
@@ -957,9 +1084,6 @@ impl Core {
                 (suspended.seq, *wid)
             })
             .collect();
-        if wids.is_empty() {
-            return;
-        }
         // Last suspended first: each window then finds the neighbours its
         // slot names already back in place.
         wids.sort_unstable_by(|a, b| b.cmp(a));
@@ -968,6 +1092,7 @@ impl Core {
             for wid in wids {
                 core.try_resume(wid);
             }
+            core.discover_app_windows(pid, captured);
         });
     }
 
@@ -1083,7 +1208,7 @@ impl Core {
             let outcome = if self.in_transition(now) {
                 Admission::Later("appeared during a Space transition")
             } else {
-                self.admit(wid)
+                self.admit(wid, Discovery::Back)
             };
             match outcome {
                 Admission::Managed => {}
@@ -1128,6 +1253,27 @@ impl Core {
     }
 
     fn recheck_managed(&mut self, wid: WindowId, now: Instant) {
+        match self.applier.backend().window_presence(wid) {
+            WindowPresence::Gone => {
+                // Closed: its destroy notification came while the window
+                // server still had it ([`Core::window_destroyed`]).
+                log::info!("window {wid} is gone; no longer managing it");
+                self.stop_managing(wid);
+                return;
+            }
+            WindowPresence::Detached | WindowPresence::OnSpace { fullscreen: true } => {
+                // It left the desktop's Space after all: native full screen.
+                self.mark_transition(now);
+                self.suspend(
+                    wid,
+                    "left its Space (native full screen?)",
+                    SuspendKind::FullScreen,
+                );
+                self.schedule_recheck(wid);
+                return;
+            }
+            WindowPresence::OnSpace { fullscreen: false } => {}
+        }
         if self.on_fullscreen_space {
             // The desktop is an inactive Space: nothing there can be read or
             // moved.  Changing back re-asserts every tile.
@@ -1537,6 +1683,9 @@ impl Core {
             return;
         }
         if self.layout.window_info(wid).is_none() {
+            // Perhaps a window that was away when it appeared; managing it
+            // focuses it.
+            self.discover(wid, captured, Discovery::Back);
             return;
         }
         if self.is_recent_focus_event_at(captured) {
@@ -1570,7 +1719,16 @@ impl Core {
     }
 
     /// Handle a keybinding action.
+    ///
+    /// Ignored while a native full-screen Space is active: the layout's
+    /// windows are on the inactive desktop, and its focus is on one of them,
+    /// not on the full-screen window ([`Core::suspend`]).  Super+Q would close
+    /// that invisible window, and focusing or moving desktop windows from
+    /// there makes them key without showing them.
     pub fn action(&mut self, action: Action) {
+        if self.layout_paused(&action) {
+            return;
+        }
         // Resize mode routes arrow keys to Resize, matching cosmic-comp.
         let action = if self.layout.resize_mode() {
             match action {
@@ -1584,8 +1742,24 @@ impl Core {
         self.apply(commands);
     }
 
+    /// Whether `action` must be ignored because a native full-screen Space
+    /// is active ([`Core::action`]).  Logs it when so.
+    fn layout_paused(&self, action: &Action) -> bool {
+        if self.on_fullscreen_space {
+            log::debug!(
+                "ignoring {action:?}: a native full-screen Space is active and the layout's \
+                 windows are on the inactive desktop"
+            );
+        }
+        self.on_fullscreen_space
+    }
+
     /// Handle one IPC request.  Mutations go through the same `Core`; queries
     /// are answered from the layout snapshot.
+    ///
+    /// Actions and focus requests are ignored while a native full-screen
+    /// Space is active ([`Core::action`]) and answered with
+    /// [`Response::Ok`], like any other action that changes nothing.
     pub fn request(&mut self, request: Request) -> Response {
         match request {
             Request::ListWindows => {
@@ -1606,7 +1780,9 @@ impl Core {
                 Response::Ok
             }
             Request::Focus { wid } => {
-                self.focus_window(wid);
+                if !self.layout_paused(&Action::FocusWindow { wid }) {
+                    self.focus_window(wid);
+                }
                 Response::Ok
             }
             Request::Restore => {
@@ -1624,11 +1800,13 @@ impl Core {
                     .collect();
                 for wid in managed {
                     let _ = self.layout.window_removed(wid);
+                    self.ignored.insert(wid);
                 }
                 // Suspended windows were restored from the journal as well;
                 // they are not managed again when they come back either.
                 for wid in std::mem::take(&mut self.suspended).into_keys() {
                     self.constraints.remove(&wid);
+                    self.ignored.insert(wid);
                 }
                 // The discarded commands included the tab bar's removal; hide the
                 // overlay explicitly so it does not float over a restored window.
@@ -2087,6 +2265,7 @@ mod tests {
         Probe(WindowId),
         ForgetProbe(WindowId),
         Focus(WindowId),
+        Close(WindowId),
         Park(WindowId, Rect),
         Unpark(WindowId),
         StackBar(Option<StackInfo>),
@@ -2409,7 +2588,8 @@ mod tests {
             self.state.lock().unwrap().calls.push(Call::Focus(wid));
             Ok(())
         }
-        fn close(&self, _: WindowId) -> PlatformResult<()> {
+        fn close(&self, wid: WindowId) -> PlatformResult<()> {
+            self.state.lock().unwrap().calls.push(Call::Close(wid));
             Ok(())
         }
         fn park(&self, wid: WindowId, display: Rect) -> PlatformResult<Option<Rect>> {
@@ -4090,6 +4270,7 @@ mod tests {
                 | Call::Probe(w)
                 | Call::ForgetProbe(w)
                 | Call::Focus(w)
+                | Call::Close(w)
                 | Call::Park(w, _)
                 | Call::Unpark(w) => *w == wid,
                 Call::StackBar(_) | Call::DropHint(_) => false,
@@ -4630,7 +4811,14 @@ mod tests {
         assert!(!core.is_suspended(1));
         backend.set_minimized(1, false);
         core.platform_event(shown(1));
+        core.platform_event(deminimized(1));
         assert!(core.layout().window_info(1).is_none());
+        // Nor is a restored window that takes focus.
+        core.platform_event(PlatformEvent::FocusChanged {
+            wid: Some(2),
+            pid: Some(test_pid(2)),
+        });
+        assert!(core.layout().window_info(2).is_none());
     }
 
     // ---------------------------------------------------------------------
@@ -4991,6 +5179,318 @@ mod tests {
         assert!(core.layout().window_info(1).is_none());
         assert!(!core.applier().journal().contains(1));
         assert_eq!(core.take_rechecks(), [], "no further re-checks");
+    }
+
+    // --- windows that were away when they appeared ----------------------------------------------
+
+    fn focused_on(wid: WindowId) -> PlatformEvent {
+        PlatformEvent::FocusChanged {
+            wid: Some(wid as u32),
+            pid: Some(test_pid(wid)),
+        }
+    }
+
+    #[test]
+    fn a_window_minimized_at_startup_is_managed_once_it_is_deminimized() {
+        let (mut core, backend, _dir) = core(&[(1, START), (2, START)]);
+        backend.set_minimized(2, true);
+        core.startup(backend.windows());
+        assert!(core.layout().window_info(2).is_none());
+        core.take_rechecks();
+        let t0 = Instant::now();
+
+        // Restored from the Dock: `AXMinimized` still reads true when the
+        // notification arrives, and SkyLight's shown notification and the
+        // focus change come at the same moment.
+        core.platform_event_at(deminimized(2), t0);
+        let reads = backend.info_reads();
+        core.platform_event_at(shown(2), t0);
+        core.platform_event_at(focused_on(2), t0);
+        assert_eq!(
+            backend.info_reads(),
+            reads,
+            "a pending window is not read again"
+        );
+        assert!(core.is_pending(2), "looked at again later, not dropped");
+        assert!(core.layout().window_info(2).is_none());
+        assert_eq!(core.take_rechecks(), [(2, RECHECK_DELAYS[0])]);
+
+        // Still animating at the first re-check: deferred again.
+        core.recheck_at(2, after(t0, 500));
+        assert!(core.is_pending(2));
+        assert_eq!(core.take_rechecks(), [(2, RECHECK_DELAYS[1])]);
+
+        // The attribute has caught up.
+        backend.set_minimized(2, false);
+        core.recheck_at(2, after(t0, 2000));
+        assert!(!core.is_pending(2));
+        assert!(core.layout().window_info(2).is_some());
+        assert_eq!(core.layout().focused(), Some(2));
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+        assert_eq!(core.take_rechecks(), []);
+    }
+
+    #[test]
+    fn a_window_created_minimized_is_managed_once_it_is_shown() {
+        let (mut core, backend, _dir) = started(&[1]);
+        backend.add_window(2, START);
+        backend.set_minimized(2, true);
+        core.platform_event(created(2));
+        assert!(core.layout().window_info(2).is_none());
+        assert!(
+            !core.is_pending(2),
+            "a minimized new window is not waited for"
+        );
+
+        backend.set_minimized(2, false);
+        core.platform_event(shown(2));
+        assert!(core.layout().window_info(2).is_some());
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+    }
+
+    #[test]
+    fn an_application_hidden_at_startup_is_managed_when_it_is_shown() {
+        let (mut core, backend, _dir) = core(&[(1, START)]);
+        core.startup(backend.windows());
+
+        // Hidden at startup: its window was not on screen, so not enumerated.
+        // Another application's unmanaged window is on screen too.
+        backend.add_window(2, START);
+        backend.add_window(3, START);
+        core.platform_event(PlatformEvent::AppShown { pid: test_pid(2) });
+
+        assert!(core.layout().window_info(2).is_some());
+        assert!(
+            core.layout().window_info(3).is_none(),
+            "only the shown application's windows"
+        );
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+    }
+
+    #[test]
+    fn a_newly_observed_application_has_its_windows_managed() {
+        let (mut core, backend, _dir) = core(&[(1, START)]);
+        core.startup(backend.windows());
+
+        // Hidden when the daemon started, so not observed: showing it sent
+        // nothing, until the observers picked it up.
+        backend.add_window(2, START);
+        core.platform_event(PlatformEvent::AppObserved { pid: test_pid(2) });
+        assert!(core.layout().window_info(2).is_some());
+
+        // A newly launched application whose window is already managed.
+        let marker = backend.calls().len();
+        core.platform_event(PlatformEvent::AppObserved { pid: test_pid(2) });
+        assert_eq!(backend.calls()[marker..], []);
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+    }
+
+    #[test]
+    fn focus_on_an_unknown_manageable_window_manages_it() {
+        let (mut core, backend, _dir) = started(&[1]);
+        backend.add_window(2, START);
+
+        core.platform_event(focused_on(2));
+
+        assert!(core.layout().window_info(2).is_some());
+        assert_eq!(core.layout().focused(), Some(2));
+        assert_tiles_cover(&backend, &[1, 2], WORK_AREA);
+    }
+
+    #[test]
+    fn focus_on_a_window_rejected_for_what_it_is_reads_it_once() {
+        let (mut core, backend, _dir) = started(&[1]);
+        // A launcher-like panel above the normal level, and a window in
+        // native full screen.
+        backend.add_window(2, START);
+        backend.set_level(2, 25);
+        backend.add_window(3, DISPLAY);
+        backend.set_fullscreen(3, true);
+        let marker = backend.calls().len();
+
+        let reads = backend.info_reads();
+        core.platform_event(focused_on(2));
+        core.platform_event(focused_on(2));
+        core.platform_event(shown(2));
+        assert_eq!(backend.info_reads(), reads + 1);
+        assert!(core.layout().window_info(2).is_none());
+
+        // Being in full screen is no reason to stop looking.
+        let reads = backend.info_reads();
+        core.platform_event(focused_on(3));
+        core.platform_event(focused_on(3));
+        assert_eq!(backend.info_reads(), reads + 2);
+        assert!(core.layout().window_info(3).is_none());
+        assert_eq!(backend.calls()[marker..], []);
+
+        // Back at the normal level: looked at again.
+        backend.set_level(2, 0);
+        core.platform_event(PlatformEvent::WindowLevelChanged { wid: 2 });
+        core.platform_event(focused_on(2));
+        assert!(core.layout().window_info(2).is_some());
+
+        // A closed window's id is forgotten.
+        backend.add_window(4, START);
+        backend.set_level(4, 25);
+        core.platform_event(focused_on(4));
+        backend.remove_window(4);
+        core.platform_event(destroyed(4));
+        let reads = backend.info_reads();
+        backend.add_window(4, START);
+        core.platform_event(focused_on(4));
+        assert_eq!(backend.info_reads(), reads + 1);
+    }
+
+    #[test]
+    fn a_creation_report_reads_an_ignored_window_again() {
+        let (mut core, backend, _dir) = started(&[1]);
+        // SkyLight reports the window before Accessibility can tell its role.
+        backend.add_window(2, START);
+        backend.set_level(2, 3);
+        core.platform_event(created(2));
+        assert!(core.layout().window_info(2).is_none());
+
+        // Accessibility's own creation report reads it again.
+        backend.set_level(2, 0);
+        core.platform_event(created(2));
+        assert!(core.layout().window_info(2).is_some());
+    }
+
+    // --- native full-screen Space: actions -------------------------------------------------------
+
+    #[test]
+    fn actions_are_ignored_while_a_full_screen_space_is_active() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        let t0 = Instant::now();
+        // Window 1 enters native full screen; the layout's focus moves on to
+        // window 2 on the desktop, which the user cannot see.
+        backend.set_unlisted(1, true);
+        core.platform_event_at(destroyed(1), t0);
+        core.platform_event_at(space_changed(5, true), after(t0, 550));
+        backend.set_unlisted(1, false);
+        backend.set_fullscreen(1, true);
+        assert!(core.is_suspended(1));
+        assert_eq!(core.layout().focused(), Some(2));
+        let workspace = core.layout().active_workspace();
+        let marker = backend.calls().len();
+
+        core.action(Action::Close);
+        core.action(Action::Focus {
+            direction: cosmic_mac_protocol::Direction::Left,
+        });
+        core.action(Action::MoveToWorkspace { index: 2 });
+        assert_eq!(core.request(Request::Action(Action::Close)), Response::Ok);
+        assert_eq!(core.request(Request::Focus { wid: 2 }), Response::Ok);
+
+        let calls = backend.calls();
+        assert_eq!(calls[marker..], [], "{calls:?}");
+        assert_eq!(core.layout().active_workspace(), workspace);
+        // Queries still answer.
+        let Response::Windows(windows) = core.request(Request::ListWindows) else {
+            panic!("expected a window list");
+        };
+        let listed: Vec<WindowId> = windows.iter().map(|state| state.info.wid).collect();
+        assert_eq!(listed, vec![2]);
+
+        // Back on the desktop: window 1 is back and actions work again.
+        backend.set_fullscreen(1, false);
+        core.platform_event_at(space_changed(1, false), after(t0, 5000));
+        assert!(!core.is_suspended(1));
+        assert_eq!(core.layout().focused(), Some(1));
+        let marker = backend.calls().len();
+        core.action(Action::Close);
+        let calls = backend.calls();
+        assert_eq!(calls_for(&calls, marker, 1), [Call::Close(1)], "{calls:?}");
+    }
+
+    // --- a close racing the window server's teardown ---------------------------------------------
+
+    #[test]
+    fn a_window_destroyed_while_still_on_the_desktop_is_forgotten_by_its_re_check() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.take_rechecks();
+        let t0 = Instant::now();
+        assert_eq!(core.layout().focused(), Some(1));
+        let marker = backend.calls().len();
+
+        // Closed: the destroy notification arrives while the window server
+        // still has the window on the desktop's Space.
+        core.platform_event_at(destroyed(1), t0);
+        assert!(!core.is_suspended(1));
+        assert!(
+            core.layout().window_info(1).is_some(),
+            "nothing decided yet"
+        );
+        assert_eq!(backend.calls()[marker..], []);
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+
+        // Torn down by the re-check: forgotten like any closed window, and
+        // the keyboard focus moves on.
+        backend.remove_window(1);
+        core.recheck_at(1, after(t0, 500));
+
+        assert!(!core.is_suspended(1));
+        assert!(core.layout().window_info(1).is_none());
+        assert!(!core.applier().journal().contains(1));
+        assert_eq!(core.layout().focused(), Some(2));
+        let calls = backend.calls();
+        assert!(calls[marker..].contains(&Call::Focus(2)), "{calls:?}");
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+        assert_eq!(core.take_rechecks(), []);
+
+        // It was no Space transition: a new window is managed at once.
+        backend.add_window(3, START);
+        core.platform_event_at(created(3), after(t0, 600));
+        assert!(core.layout().window_info(3).is_some());
+    }
+
+    #[test]
+    fn a_window_destroyed_on_the_desktop_that_then_leaves_for_full_screen_is_suspended() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        core.take_rechecks();
+        let before = backend.frames();
+        let t0 = Instant::now();
+
+        core.platform_event_at(destroyed(1), t0);
+        assert!(core.layout().window_info(1).is_some());
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+
+        // It was entering full screen after all: between Spaces when its
+        // re-check runs, with the full-screen Space already active.
+        core.platform_event_at(space_changed(5, true), after(t0, 450));
+        backend.set_unlisted(1, true);
+        let marker = backend.calls().len();
+        core.recheck_at(1, after(t0, 500));
+
+        assert!(core.is_suspended(1));
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+        let calls = backend.calls();
+        assert!(
+            !calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Focus(_))),
+            "the full-screen window keeps the keyboard: {calls:?}"
+        );
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[1])]);
+
+        // Leaving full screen puts it back into its tile.
+        backend.set_unlisted(1, false);
+        core.platform_event_at(space_changed(1, false), after(t0, 10_000));
+        assert!(!core.is_suspended(1));
+        assert_eq!(backend.frames(), before);
+    }
+
+    #[test]
+    fn a_window_destroyed_on_a_full_screen_space_is_suspended() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        backend.set_presence(1, WindowPresence::OnSpace { fullscreen: true });
+
+        core.platform_event(destroyed(1));
+
+        assert!(core.is_suspended(1));
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
     }
 
     // --- drag to stack -----------------------------------------------------------------------

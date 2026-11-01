@@ -1142,7 +1142,18 @@ that IPSW. Testing on 26/27 therefore needs a host upgrade or another Mac.
    `cosmic-mac-status`, `Request::Subscribe`), ~~resident launcher, Super tap,
    bundle~~ and ~~theming~~ (dark/light for the launcher and the tab bar)
    implemented; run their VM test steps (sections above).
-6. Minor backlog: SLS pump `mach_msg`, IPC line limit / UTF-8 error reply,
-   windows rejected at creation never re-checked.
-7. Commit the uncommitted work, then first ship: `gh repo create` (private),
-   push, tag.
+6. Minor backlog: SLS pump `mach_msg`. (~~IPC line limit~~ and ~~windows
+   rejected at creation never re-checked~~ fixed in the PR #1 review round.)
+7. ~~First ship~~: milestone 2 merged to `main` through PR #1 (squash).
+8. PR #1 review follow-ups, not yet done:
+   - Journal: on restart, replay drops the saved frames of windows that still
+     exist but are off screen (hidden app, minimized): "no longer exists;
+     dropping its saved frame". Their original frames are lost.
+   - A deminimized window the WM never managed is tiled only at its ~1.5 s
+     re-check (`AXMinimized` still reads true at 0.5 s); it could trust the
+     deminimize notification like suspended windows do.
+   - The close-versus-teardown race (destroy while still on the desktop Space)
+     is covered by unit tests only; not reproduced in the VM.
+   - vm-test.sh nits: `close-finder-windows` closes whatever is focused after
+     `ctl focus`; the full-screen step embeds the window title in nested quotes;
+     the scenario fails when a non-test window (e.g. Terminal) is tiled.

@@ -91,10 +91,20 @@ pub fn is_shell_window(info: &ToplevelInfo) -> bool {
 /// excluded.  The filter is deliberately conservative: a window
 /// that is wrongly managed is much more disruptive than one that is ignored.
 pub fn is_manageable(info: &ToplevelInfo) -> bool {
+    !info.minimized && !info.fullscreen && is_manageable_kind(info)
+}
+
+/// [`is_manageable`] without the minimized and full-screen checks: whether
+/// this is a kind of window the daemon manages once it is on the desktop.
+///
+/// A window that fails this (its level, application, role or size) stays
+/// unmanaged while it keeps them; one that only fails [`is_manageable`] is
+/// away for now and may be managed when it is back.
+pub fn is_manageable_kind(info: &ToplevelInfo) -> bool {
     if info.wid == 0 {
         return false;
     }
-    if info.level != 0 || info.minimized || info.fullscreen {
+    if info.level != 0 {
         return false;
     }
     if SYSTEM_APP_IDS
@@ -242,6 +252,20 @@ mod tests {
     fn fullscreen_windows_are_ignored() {
         assert!(!is_manageable(&info().with_fullscreen(true)));
         assert!(is_manageable(&info().with_fullscreen(false)));
+    }
+
+    #[test]
+    fn minimized_and_full_screen_windows_are_of_a_manageable_kind() {
+        // Away for now, not a kind of window that is never managed.
+        assert!(is_manageable_kind(&info().with_minimized(true)));
+        assert!(is_manageable_kind(&info().with_fullscreen(true)));
+        assert!(!is_manageable_kind(&info().with_level(25)));
+        assert!(!is_manageable_kind(
+            &info().with_minimized(true).with_level(25)
+        ));
+        let mut menu = info().with_minimized(true);
+        menu.role = Some("AXMenuBar".into());
+        assert!(!is_manageable_kind(&menu));
     }
 
     #[test]

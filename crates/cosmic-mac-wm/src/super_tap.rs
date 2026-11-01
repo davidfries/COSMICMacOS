@@ -149,6 +149,13 @@ pub fn no_input_during(held: Duration, since_input: Duration) -> bool {
     since_input > held + INPUT_SLACK
 }
 
+/// Whether a Super tap candidate should toggle the launcher: no click,
+/// scroll or key during the hold ([`no_input_during`]) and no mouse button
+/// held down (Command tapped in the middle of a drag).
+pub fn should_toggle(held: Duration, since_input: Duration, button_down: bool) -> bool {
+    !button_down && no_input_during(held, since_input)
+}
+
 /// `seconds` (from `CGEventSourceSecondsSinceLastEventType`) as a duration;
 /// negative, NaN or infinite values (never any input) mean "long ago".
 pub fn duration_from_seconds(seconds: f64) -> Duration {
@@ -414,6 +421,15 @@ mod tests {
             held + INPUT_SLACK + Duration::from_millis(1)
         ));
         assert!(no_input_during(held, Duration::MAX));
+    }
+
+    #[test]
+    fn a_held_mouse_button_rejects_the_tap() {
+        let held = Duration::from_millis(120);
+        assert!(should_toggle(held, Duration::from_secs(2), false));
+        // The drag started long before Command went down.
+        assert!(!should_toggle(held, Duration::from_secs(2), true));
+        assert!(!should_toggle(held, Duration::from_millis(60), false));
     }
 
     #[test]

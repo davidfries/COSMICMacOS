@@ -69,18 +69,35 @@ pub fn user_shell(shell_env: Option<&str>) -> String {
     }
 }
 
+/// Arguments that run `command` in `shell` as a login shell. csh and tcsh
+/// reject `-l` combined with other flags, so they run it without.
+pub fn shell_args(shell: &str, command: &str) -> Vec<String> {
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    let mut args = Vec::new();
+    if !matches!(name, "csh" | "tcsh") {
+        args.push("-l".to_owned());
+    }
+    args.push("-c".to_owned());
+    args.push(command.to_owned());
+    args
+}
+
 /// The `.command` script that runs `command` in a Terminal window.
 pub fn terminal_script(command: &str, shell: &str) -> String {
+    let args = shell_args(shell, command)
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         "#!/bin/sh\n\
          # Written by cosmic-mac-launcher; removes itself.\n\
          rm -f -- \"$0\"\n\
-         {shell} -l -c {command}\n\
+         {shell} {args}\n\
          status=$?\n\
          printf '\\n[exit status %s] Press Return to close.' \"$status\"\n\
          read -r _\n",
         shell = shell_quote(shell),
-        command = shell_quote(command),
     )
 }
 
@@ -112,9 +129,7 @@ pub fn write_script(dir: &Path, script: &str) -> std::io::Result<PathBuf> {
 /// helper thread reaps it.
 pub fn spawn_background(command: &str, shell: &str) -> std::io::Result<()> {
     let mut child = Command::new(shell)
-        .arg("-l")
-        .arg("-c")
-        .arg(command)
+        .args(shell_args(shell, command))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -236,10 +251,21 @@ mod tests {
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("rm -f -- \"$0\"\n"));
         assert!(
-            script.contains(r#"'/bin/zsh' -l -c 'echo "it'\''s $HOME"'"#),
+            script.contains(r#"'/bin/zsh' '-l' '-c' 'echo "it'\''s $HOME"'"#),
             "{script}"
         );
         assert!(script.ends_with("read -r _\n"));
+    }
+
+    #[test]
+    fn csh_and_tcsh_run_without_the_login_flag() {
+        assert_eq!(shell_args("/bin/zsh", "ls"), ["-l", "-c", "ls"]);
+        assert_eq!(shell_args("/bin/csh", "ls"), ["-c", "ls"]);
+        assert_eq!(shell_args("/usr/local/bin/tcsh", "ls"), ["-c", "ls"]);
+        assert_eq!(shell_args("/opt/bin/tcshx", "ls"), ["-l", "-c", "ls"]);
+        let script = terminal_script("ls", "/bin/tcsh");
+        assert!(script.contains("'/bin/tcsh' '-c' 'ls'\n"), "{script}");
+        assert!(!script.contains("'-l'"), "{script}");
     }
 
     /// The generated script, run by `/bin/sh` with Return on stdin, deletes

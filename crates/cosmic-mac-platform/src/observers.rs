@@ -122,6 +122,18 @@ pub enum PlatformEvent {
         /// The application's PID.
         pid: libc::pid_t,
     },
+    /// [`PlatformObserver::refresh_apps`] started observing an application
+    /// after the first refresh: it owns on-screen windows now but had none
+    /// before (it was launched, or it was hidden when the observers started).
+    ///
+    /// An application hidden at startup is not observed and its windows are
+    /// not on screen, so showing it again sends no notification at all
+    /// (verified in the macOS 15.6 VM).  Consumers should look at its
+    /// on-screen windows.
+    AppObserved {
+        /// The application's PID.
+        pid: libc::pid_t,
+    },
     /// Focus moved.
     FocusChanged {
         /// Focused window, when known.
@@ -558,6 +570,9 @@ pub struct PlatformObserver {
     handler: EventHandler,
     apps: HashMap<libc::pid_t, AxEntry>,
     sls_started: bool,
+    /// [`PlatformObserver::refresh_apps`] has completed once: applications it
+    /// observes from then on are announced ([`PlatformEvent::AppObserved`]).
+    refreshed: bool,
     /// The `NSWorkspace` notification-center registration for Space changes.
     space_observer: Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
 }
@@ -574,6 +589,7 @@ impl PlatformObserver {
             handler,
             apps: HashMap::new(),
             sls_started: false,
+            refreshed: false,
             space_observer: None,
         }
     }
@@ -729,6 +745,10 @@ impl PlatformObserver {
     /// AX callbacks, and per-window AX reads would let one hung application
     /// stall it.  Only a newly seen pid costs AX calls, in `observe_app`.
     ///
+    /// Every application observed after the first refresh is announced with
+    /// [`PlatformEvent::AppObserved`] (the first refresh happens before the
+    /// daemon enumerates the windows on screen).
+    ///
     /// Returns the number of listed applications that are observed.
     pub fn refresh_apps(&mut self) -> Result<usize> {
         if !crate::ax::is_process_trusted() {
@@ -748,9 +768,16 @@ impl PlatformObserver {
             }
         }
         let mut observed = 0;
+        let mut announced = Vec::new();
         for &pid in &pids {
+            let known = self.apps.contains_key(&pid);
             match self.observe_app(pid) {
-                Ok(()) => observed += 1,
+                Ok(()) => {
+                    observed += 1;
+                    if !known && self.refreshed {
+                        announced.push(pid);
+                    }
+                }
                 Err(err) => log::debug!("cannot observe pid {pid}: {err}"),
             }
         }
@@ -759,6 +786,11 @@ impl PlatformObserver {
                 log::debug!("pid {pid} exited; releasing its AX observer");
                 entry.release();
             }
+        }
+        self.refreshed = true;
+        for pid in announced {
+            log::debug!("observing pid {pid}, which has windows on screen now");
+            (self.handler)(PlatformEvent::AppObserved { pid });
         }
         Ok(observed)
     }

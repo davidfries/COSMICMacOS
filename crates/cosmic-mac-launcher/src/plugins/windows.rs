@@ -42,6 +42,12 @@ pub fn fetch_windows(client: &Client) -> Result<Vec<WindowState>, String> {
     }
 }
 
+/// Asks the WM to focus `wid`, waiting up to [`FOCUS_TIMEOUT`] for the
+/// reply. Blocking: call it off the UI thread.
+pub fn focus_window_blocking(wid: WindowId) -> Result<(), String> {
+    focus_window(&default_client(FOCUS_TIMEOUT)?, wid)
+}
+
 /// Asks the WM to focus `wid`.
 pub fn focus_window(client: &Client, wid: WindowId) -> Result<(), String> {
     match client

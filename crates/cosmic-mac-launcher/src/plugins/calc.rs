@@ -25,6 +25,8 @@ pub enum CalcError {
     UnexpectedEnd,
     /// The result is infinite or not a number (e.g. division by zero).
     NotFinite,
+    /// Parentheses or unary signs are nested too deeply.
+    TooDeep,
 }
 
 impl std::fmt::Display for CalcError {
@@ -34,6 +36,7 @@ impl std::fmt::Display for CalcError {
             CalcError::Unexpected(at) => write!(f, "unexpected input at position {}", at + 1),
             CalcError::UnexpectedEnd => write!(f, "incomplete expression"),
             CalcError::NotFinite => write!(f, "result is not a finite number"),
+            CalcError::TooDeep => write!(f, "expression is nested too deeply"),
         }
     }
 }
@@ -53,6 +56,7 @@ pub fn evaluate(input: &str) -> Result<Evaluation, CalcError> {
     let mut parser = Parser {
         chars: &chars,
         pos: 0,
+        depth: 0,
         has_operator: false,
     };
     parser.skip_whitespace();
@@ -97,10 +101,23 @@ pub fn format_value(value: f64) -> String {
 struct Parser<'a> {
     chars: &'a [char],
     pos: usize,
+    /// Current nesting of parentheses and unary signs.
+    depth: usize,
     has_operator: bool,
 }
 
+/// Deepest nesting accepted; keeps the recursion off the stack limit.
+const MAX_DEPTH: usize = 256;
+
 impl Parser<'_> {
+    fn enter(&mut self) -> Result<(), CalcError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(CalcError::TooDeep);
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn at_end(&self) -> bool {
         self.pos >= self.chars.len()
     }
@@ -160,7 +177,10 @@ impl Parser<'_> {
         match self.peek() {
             Some(op @ ('+' | '-')) => {
                 self.bump(op);
-                let value = self.unary()?;
+                self.enter()?;
+                let value = self.unary();
+                self.depth -= 1;
+                let value = value?;
                 Ok(if op == '-' { -value } else { value })
             }
             _ => self.power(),
@@ -185,7 +205,10 @@ impl Parser<'_> {
             None => Err(CalcError::UnexpectedEnd),
             Some('(') => {
                 self.bump('(');
-                let value = self.expression()?;
+                self.enter()?;
+                let value = self.expression();
+                self.depth -= 1;
+                let value = value?;
                 match self.peek() {
                     Some(')') => {
                         self.bump(')');
@@ -340,6 +363,19 @@ mod tests {
         assert_eq!(evaluate("1 / 0"), Err(CalcError::NotFinite));
         assert_eq!(evaluate("(-1) ^ 0.5"), Err(CalcError::NotFinite));
         assert_eq!(evaluate("safari"), Err(CalcError::Unexpected(0)));
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_not_a_stack_overflow() {
+        let parens = format!("{}1{}", "(".repeat(50_000), ")".repeat(50_000));
+        assert_eq!(evaluate(&parens), Err(CalcError::TooDeep));
+        let minuses = format!("{}1", "-".repeat(50_000));
+        assert_eq!(evaluate(&minuses), Err(CalcError::TooDeep));
+        // Just inside the limit still works.
+        let ok = format!("{}1{}", "(".repeat(100), ")".repeat(100));
+        assert_eq!(evaluate(&ok).unwrap().value, 1.0);
+        let ok = format!("{}1", "-".repeat(100));
+        assert_eq!(evaluate(&ok).unwrap().value, 1.0);
     }
 
     #[test]

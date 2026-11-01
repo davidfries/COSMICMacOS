@@ -248,11 +248,19 @@ impl EventTap {
         // SAFETY: context is still alive.
         unsafe { (*context).tap = tap_ptr.cast() };
 
-        let source = CFMachPort::new_run_loop_source(None, Some(&tap), 0)
-            .ok_or_else(|| PlatformError::Other("CFMachPortCreateRunLoopSource failed".into()))?;
+        let source = CFMachPort::new_run_loop_source(None, Some(&tap), 0).ok_or_else(|| {
+            tap.invalidate();
+            // SAFETY: the port is invalidated, so the callback cannot run.
+            unsafe { drop(Box::from_raw(context)) };
+            PlatformError::Other("CFMachPortCreateRunLoopSource failed".into())
+        })?;
 
-        let run_loop = CFRunLoop::current()
-            .ok_or_else(|| PlatformError::Other("no current CFRunLoop".into()))?;
+        let run_loop = CFRunLoop::current().ok_or_else(|| {
+            tap.invalidate();
+            // SAFETY: the port is invalidated, so the callback cannot run.
+            unsafe { drop(Box::from_raw(context)) };
+            PlatformError::Other("no current CFRunLoop".into())
+        })?;
         run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
         CGEvent::tap_enable(&tap, true);
 
@@ -426,8 +434,12 @@ impl MouseTap {
             unsafe { drop(Box::from_raw(context)) };
             PlatformError::Other("CFMachPortCreateRunLoopSource failed".into())
         })?;
-        let run_loop = CFRunLoop::current()
-            .ok_or_else(|| PlatformError::Other("no current CFRunLoop".into()))?;
+        let run_loop = CFRunLoop::current().ok_or_else(|| {
+            tap.invalidate();
+            // SAFETY: the port is invalidated, so the callback cannot run.
+            unsafe { drop(Box::from_raw(context)) };
+            PlatformError::Other("no current CFRunLoop".into())
+        })?;
         run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
         CGEvent::tap_enable(&tap, true);
         Ok(Self {
@@ -500,6 +512,19 @@ pub fn seconds_since_click_scroll_or_key() -> f64 {
         )
     })
     .fold(f64::INFINITY, f64::min)
+}
+
+/// Whether any mouse button (left, right or centre) is held down right now,
+/// by the login session's combined state (so a Finder file drag counts).
+/// The WM's Super tap is ignored then. Safe from any thread.
+pub fn mouse_button_down() -> bool {
+    [
+        objc2_core_graphics::CGMouseButton::Left,
+        objc2_core_graphics::CGMouseButton::Right,
+        objc2_core_graphics::CGMouseButton::Center,
+    ]
+    .into_iter()
+    .any(|button| CGEventSource::button_state(CGEventSourceStateID::CombinedSessionState, button))
 }
 
 /// Post a synthetic modifier change (`kCGEventFlagsChanged`) at the HID

@@ -409,7 +409,9 @@ impl<'a> Session<'a> {
 
             let plist_path = self.paths.plist_path(agent);
             if plist_path.exists() {
-                self.remove_file(&plist_path)?;
+                if let Err(error) = self.remove_file(&plist_path) {
+                    failures.push(error.0);
+                }
             } else {
                 self.say(format_args!(
                     "{}: no plist at {}",
@@ -843,6 +845,22 @@ mod tests {
             "{error}"
         );
         assert!(!fx.plist(wm).exists());
+    }
+
+    #[test]
+    fn uninstall_keeps_going_when_a_plist_cannot_be_removed() {
+        let mut fx = Fixture::new();
+        let bin = fx.bin.path().to_path_buf();
+        fx.session(false).install(&bin).unwrap();
+        // A non-empty directory in place of the wm plist cannot be unlinked.
+        let wm = &AGENTS[0];
+        fs::remove_file(fx.plist(wm)).unwrap();
+        fs::create_dir_all(fx.plist(wm).join("blocker")).unwrap();
+        let error = fx.session(false).uninstall().unwrap_err();
+        assert!(error.0.contains("cannot remove"), "{error}");
+        for agent in &AGENTS[1..] {
+            assert!(!fx.plist(agent).exists());
+        }
     }
 
     #[test]

@@ -10,16 +10,22 @@
 //! [`shell_state::Publisher`](crate::shell_state::Publisher), the current state
 //! first and then one line per change, until the client disconnects or the
 //! daemon stops.
+//!
+//! A line longer than [`MAX_LINE_BYTES`] gets an error reply and the
+//! connection is closed (a subscription is just closed).
 
 use std::path::Path;
 
 use cosmic_mac_protocol::{Request, Response, ShellState};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::daemon::Message;
+
+/// Longest accepted request line, without the newline.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// Whether a live daemon is already listening on `path`.
 ///
@@ -93,13 +99,22 @@ async fn handle(
     shell_state: watch::Receiver<ShellState>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut reader = BufReader::new(reader);
+    loop {
+        let line = match read_line(&mut reader).await? {
+            Line::Eof => return Ok(()),
+            Line::TooLong => {
+                let error =
+                    Response::Error(format!("request line longer than {MAX_LINE_BYTES} bytes"));
+                return write_response(&mut writer, &error).await;
+            }
+            Line::Text(line) => line,
+        };
         if line.trim().is_empty() {
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(Request::Subscribe) => return subscription(lines, writer, shell_state).await,
+            Ok(Request::Subscribe) => return subscription(reader, writer, shell_state).await,
             Ok(request) => {
                 let (response_tx, response_rx) = oneshot::channel();
                 if tx.send(Message::Ipc(request, response_tx)).is_err() {
@@ -114,24 +129,59 @@ async fn handle(
         };
         write_response(&mut writer, &response).await?;
     }
-    Ok(())
+}
+
+enum Line {
+    Eof,
+    Text(String),
+    TooLong,
+}
+
+/// Reads one line of at most [`MAX_LINE_BYTES`] without buffering more.
+/// A final line without a newline counts as a line.
+async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> std::io::Result<Line> {
+    let mut line = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(if line.is_empty() {
+                Line::Eof
+            } else {
+                Line::Text(String::from_utf8_lossy(&line).into_owned())
+            });
+        }
+        let newline = chunk.iter().position(|&byte| byte == b'\n');
+        let content = newline.unwrap_or(chunk.len());
+        if line.len() + content > MAX_LINE_BYTES {
+            return Ok(Line::TooLong);
+        }
+        line.extend_from_slice(&chunk[..content]);
+        let used = content + usize::from(newline.is_some());
+        reader.consume(used);
+        if newline.is_some() {
+            return Ok(Line::Text(String::from_utf8_lossy(&line).into_owned()));
+        }
+    }
 }
 
 /// Serve a subscribed connection: the current shell state at once, then every
 /// change.  Ends when the client closes the connection (or a write fails) or
 /// the daemon drops its publisher.  Lines the client sends are read only to
-/// notice the disconnect and are otherwise ignored.
+/// notice the disconnect and are otherwise ignored; a line longer than
+/// [`MAX_LINE_BYTES`] also ends the connection.
 async fn subscription(
-    mut lines: Lines<BufReader<OwnedReadHalf>>,
+    mut reader: BufReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
     mut shell_state: watch::Receiver<ShellState>,
 ) -> std::io::Result<()> {
     log::debug!("IPC subscriber connected");
     let current = shell_state.borrow_and_update().clone();
     write_response(&mut writer, &Response::State(current)).await?;
+    // Bytes received since the last newline.
+    let mut partial = 0usize;
     loop {
-        // Both branches are cancel safe: an unfinished line stays buffered in
-        // `lines`, and a missed change is still pending on `shell_state`.
+        // Both branches are cancel safe: `fill_buf` consumes nothing until
+        // `consume`, and a missed change is still pending on `shell_state`.
         tokio::select! {
             changed = shell_state.changed() => {
                 if changed.is_err() {
@@ -141,9 +191,20 @@ async fn subscription(
                 let current = shell_state.borrow_and_update().clone();
                 write_response(&mut writer, &Response::State(current)).await?;
             }
-            line = lines.next_line() => {
-                if line?.is_none() {
+            chunk = reader.fill_buf() => {
+                let chunk = chunk?;
+                if chunk.is_empty() {
                     log::debug!("IPC subscriber disconnected");
+                    return Ok(());
+                }
+                partial = match chunk.iter().rposition(|&byte| byte == b'\n') {
+                    Some(last) => chunk.len() - last - 1,
+                    None => partial + chunk.len(),
+                };
+                let used = chunk.len();
+                reader.consume(used);
+                if partial > MAX_LINE_BYTES {
+                    log::debug!("IPC subscriber sent an over-long line; closing");
                     return Ok(());
                 }
             }
@@ -172,6 +233,7 @@ mod tests {
     use std::time::Duration;
 
     use cosmic_mac_protocol::{Action, WorkspaceInfo};
+    use tokio::io::Lines;
 
     use crate::shell_state::Publisher;
 
@@ -400,6 +462,48 @@ mod tests {
             ]
         );
         subscriber.assert_silent().await;
+    }
+
+    #[tokio::test]
+    async fn an_over_long_request_line_gets_an_error_and_a_closed_connection() {
+        let server = Server::start();
+        let mut client = server.connect().await;
+        // A line just inside the limit is parsed (and rejected as JSON).
+        client.send_raw(&"x".repeat(MAX_LINE_BYTES)).await;
+        match client.next().await {
+            Response::Error(message) => {
+                assert!(message.starts_with("invalid request"), "{message}")
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+        // One byte more, and no newline ever: refused.
+        client
+            .writer
+            .write_all("x".repeat(MAX_LINE_BYTES + 1).as_bytes())
+            .await
+            .unwrap();
+        match client.next().await {
+            Response::Error(message) => assert!(message.contains("longer than"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        client.assert_closed().await;
+    }
+
+    #[tokio::test]
+    async fn an_over_long_line_on_a_subscribed_connection_closes_it() {
+        let server = Server::start();
+        let mut subscriber = server.subscribe().await;
+        subscriber.next_state().await;
+        // Sent in pieces without a newline; the total passes the limit.
+        for _ in 0..3 {
+            // The server may already have closed; a failed write is fine.
+            let _ = subscriber
+                .writer
+                .write_all("x".repeat(MAX_LINE_BYTES / 2).as_bytes())
+                .await;
+        }
+        subscriber.assert_closed().await;
+        server.wait_for_receivers(1).await;
     }
 
     #[tokio::test]

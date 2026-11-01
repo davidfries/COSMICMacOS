@@ -36,6 +36,10 @@ pub const IO_TIMEOUT: Duration = Duration::from_millis(500);
 /// again.
 pub const SPAWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Queued toggles older than this are dropped: the user has long stopped
+/// waiting for them.
+pub const MAX_TOGGLE_AGE: Duration = Duration::from_secs(1);
+
 /// The launcher bundle's directory name inside the bin dir.
 pub const BUNDLE_NAME: &str = "cosmic-mac-launcher.app";
 /// The launcher's executable name (in the bin dir and inside the bundle).
@@ -261,6 +265,23 @@ impl LauncherPort for SocketPort {
     }
 }
 
+/// Reduces the toggles queued while the client thread was busy to the one
+/// that matters: stale ones (older than `max_age` at `now`) are dropped, and
+/// of the fresh ones an even number cancels out. Returns the time of the
+/// last fresh toggle when a single toggle should be sent.
+pub fn coalesce_toggles(queued: &[Instant], now: Instant, max_age: Duration) -> Option<Instant> {
+    let fresh: Vec<Instant> = queued
+        .iter()
+        .copied()
+        .filter(|at| now.saturating_duration_since(*at) <= max_age)
+        .collect();
+    if fresh.len() % 2 == 1 {
+        fresh.last().copied()
+    } else {
+        None
+    }
+}
+
 /// A handle to the `launcher-client` thread.
 #[derive(Clone)]
 pub struct LauncherClient {
@@ -275,7 +296,19 @@ impl LauncherClient {
             .name("launcher-client".into())
             .spawn(move || {
                 let mut toggler = Toggler::new(port, SPAWN_GRACE);
-                for tapped in receiver {
+                while let Ok(first) = receiver.recv() {
+                    // Taps queued while the last request was slow are
+                    // dropped or merged, not replayed late.
+                    let mut queued = vec![first];
+                    queued.extend(receiver.try_iter());
+                    let Some(tapped) = coalesce_toggles(&queued, Instant::now(), MAX_TOGGLE_AGE)
+                    else {
+                        log::debug!(
+                            "Super tap: {} queued taps cancel out or are stale",
+                            queued.len()
+                        );
+                        continue;
+                    };
                     let outcome = toggler.tap(Instant::now());
                     let waited = tapped.elapsed();
                     match outcome {
@@ -308,6 +341,28 @@ mod tests {
             .prefix("cmwl")
             .tempdir_in("/tmp")
             .unwrap()
+    }
+
+    #[test]
+    fn queued_toggles_are_dropped_when_stale_and_merged_by_parity() {
+        let now = Instant::now();
+        let max_age = Duration::from_secs(1);
+        let ago = |ms: u64| now - Duration::from_millis(ms);
+        // One fresh toggle goes through.
+        assert_eq!(coalesce_toggles(&[ago(10)], now, max_age), Some(ago(10)));
+        // Two fresh toggles cancel out, three make one.
+        assert_eq!(coalesce_toggles(&[ago(300), ago(10)], now, max_age), None);
+        assert_eq!(
+            coalesce_toggles(&[ago(500), ago(300), ago(10)], now, max_age),
+            Some(ago(10))
+        );
+        // Stale ones are ignored before counting.
+        assert_eq!(coalesce_toggles(&[ago(5000)], now, max_age), None);
+        assert_eq!(
+            coalesce_toggles(&[ago(5000), ago(4000), ago(10)], now, max_age),
+            Some(ago(10))
+        );
+        assert_eq!(coalesce_toggles(&[], now, max_age), None);
     }
 
     #[test]
