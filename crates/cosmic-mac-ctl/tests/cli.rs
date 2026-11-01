@@ -63,6 +63,7 @@ fn global_help_lists_commands_and_exit_zero() {
         "config",
         "restore",
         "ping",
+        "watch",
         "--socket",
         "--timeout-ms",
         "COSMIC_MAC_WM_SOCKET",
@@ -119,6 +120,7 @@ fn per_command_help_is_available() {
         ("config", "active_hint"),
         ("restore", "frame journal"),
         ("ping", "no dedicated ping request"),
+        ("watch", "Request::Subscribe"),
     ] {
         let output = cli().args([command, "--help"]).output().unwrap();
         assert_ok(&output);
@@ -604,6 +606,96 @@ fn ping_uses_list_windows_without_a_protocol_ping() {
     assert_ok(&output);
     assert!(stdout(&output).contains("2 windows"));
     assert_request(&daemon, json!({"request": "list_windows"}));
+}
+
+// ---------------------------------------------------------------------------------------------
+// watch (Request::Subscribe)
+// ---------------------------------------------------------------------------------------------
+
+fn state_payload(active: u32, tiling: bool, focused_floating: Option<bool>) -> serde_json::Value {
+    json!({
+        "workspaces": [
+            {"index": 1, "name": "1", "active": active == 1, "window_count": 2},
+            {"index": 2, "name": "2", "active": active == 2, "window_count": 0}
+        ],
+        "tiling": tiling,
+        "focused_floating": focused_floating,
+        "max_workspaces": 9
+    })
+}
+
+/// Several state lines in one canned reply: the mock writes them, then closes the stream.
+fn state_stream(payloads: &[serde_json::Value]) -> String {
+    payloads
+        .iter()
+        .map(|payload| reply("state", payload.clone()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn watch_prints_one_line_per_state_until_the_daemon_closes() {
+    let daemon = mock(vec![state_stream(&[
+        state_payload(1, true, Some(false)),
+        state_payload(2, false, None),
+    ])]);
+    let output = run(&daemon, &["watch"]);
+    // The stream ended because the daemon closed it.
+    assert_exit(&output, 3);
+    assert_eq!(
+        stdout(&output),
+        "workspace=1 workspaces=2 tiling=on focused=tiled windows=1*:2,2:0\n\
+         workspace=2 workspaces=2 tiling=off focused=none windows=1:2,2*:0\n"
+    );
+    assert!(stderr(&output).contains("closed the subscription"));
+    assert_request(&daemon, json!({"request": "subscribe"}));
+}
+
+#[test]
+fn watch_json_prints_each_payload_as_one_compact_line() {
+    let first = state_payload(1, true, Some(true));
+    let second = state_payload(2, true, None);
+    let daemon = mock(vec![state_stream(&[first.clone(), second.clone()])]);
+    let output = run(&daemon, &["watch", "--json"]);
+    assert_exit(&output, 3);
+    let text = stdout(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(lines[0]).unwrap(),
+        first
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(lines[1]).unwrap(),
+        second
+    );
+}
+
+#[test]
+fn watch_against_a_daemon_without_subscriptions_exits_one() {
+    let daemon = mock(vec![error_reply(
+        "invalid request: unknown variant `subscribe`",
+    )]);
+    let output = run(&daemon, &["watch"]);
+    assert_exit(&output, 1);
+    assert!(stderr(&output).contains("unknown variant `subscribe`"));
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
+fn watch_rejects_a_non_state_reply() {
+    let daemon = mock(vec![ok_reply()]);
+    let output = run(&daemon, &["watch"]);
+    assert_exit(&output, 3);
+    assert!(stderr(&output).contains("expected `state`, got `ok`"));
+}
+
+#[test]
+fn watch_without_a_daemon_exits_three() {
+    let dir = TempDir::new("watch-missing");
+    let output = run_at(&dir.path().join("absent.sock"), &["watch"]);
+    assert_exit(&output, 3);
+    assert!(stderr(&output).contains("daemon not running"));
 }
 
 // ---------------------------------------------------------------------------------------------

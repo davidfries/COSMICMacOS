@@ -6,7 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cosmic_mac_layout::Layout;
-use cosmic_mac_protocol::{Action, Command, Config, Rect, Size, StackInfo, ToplevelInfo, WindowId};
+use cosmic_mac_protocol::{
+    Action, Command, Config, Rect, STACK_BAR_HEIGHT, Size, StackInfo, ToplevelInfo, TreeNode,
+    WindowId,
+};
 
 pub const WORK: Rect = Rect::new(0.0, 0.0, 1000.0, 500.0);
 pub const TALL_WORK: Rect = Rect::new(0.0, 0.0, 500.0, 1000.0);
@@ -214,6 +217,47 @@ impl Harness {
     }
 }
 
+impl Harness {
+    /// Compact rendering of the active tiling tree: `H[1 V[2 3]]` for window 1 beside a
+    /// vertical group of 2 over 3 (`H` = side by side, `V` = stacked vertically), `S[1 2]` for
+    /// a stack, and an empty string for an empty tree.
+    pub fn shape(&self) -> String {
+        fn render(node: &TreeNode, out: &mut String) {
+            match node {
+                TreeNode::Group {
+                    orientation,
+                    children,
+                    ..
+                } => {
+                    out.push(if orientation.is_horizontal() {
+                        'H'
+                    } else {
+                        'V'
+                    });
+                    out.push('[');
+                    for (index, child) in children.iter().enumerate() {
+                        if index > 0 {
+                            out.push(' ');
+                        }
+                        render(child, out);
+                    }
+                    out.push(']');
+                }
+                TreeNode::Window { wid, .. } => out.push_str(&wid.to_string()),
+                TreeNode::Stack { tabs, .. } => {
+                    let wids: Vec<String> = tabs.iter().map(|tab| tab.wid.to_string()).collect();
+                    out.push_str(&format!("S[{}]", wids.join(" ")));
+                }
+            }
+        }
+        let mut out = String::new();
+        if let Some(tree) = self.layout.tree_snapshot() {
+            render(&tree, &mut out);
+        }
+        out
+    }
+}
+
 /// Frames from a command batch, in command order (last write wins).
 pub fn set_frames(commands: &[Command]) -> BTreeMap<WindowId, Rect> {
     let mut frames = BTreeMap::new();
@@ -289,6 +333,27 @@ pub fn stack_changes(commands: &[Command]) -> Vec<Option<StackInfo>> {
 }
 
 /// Assert that `rects` exactly tile `area` (no overlap, no gaps).
+/// The tile every visible window was allocated: the visible frames, with each stack's frame
+/// grown back over the tab-bar strip above it.
+pub fn visible_tiles(layout: &Layout) -> Vec<Rect> {
+    let mut frames = layout.visible_frames();
+    for stack in layout.stacks() {
+        let wid = stack.tabs[stack.active].wid;
+        let frame = frames[&wid];
+        assert_eq!(frame, stack.frame, "stack {wid} frame");
+        frames.insert(
+            wid,
+            Rect::new(
+                frame.x,
+                frame.y - STACK_BAR_HEIGHT,
+                frame.width,
+                frame.height + STACK_BAR_HEIGHT,
+            ),
+        );
+    }
+    frames.into_values().collect()
+}
+
 pub fn assert_tiles(area: Rect, rects: &[Rect]) {
     let mut sum = 0.0;
     for (index, rect) in rects.iter().enumerate() {

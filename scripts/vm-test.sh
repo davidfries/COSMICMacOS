@@ -50,7 +50,8 @@ AFTER=/tmp/cosmicmac-vm-after.json
 
 # Shell fragment executed remotely. $HOME must be expanded by the remote shell.
 REMOTE_CTL="\"\$HOME/$REMOTE_BIN/cosmic-mac-ctl\" --socket \"\$HOME/Library/Application Support/cosmic/cosmic-mac-wm.sock\""
-# Synthetic key chords (Super = Command) for the keybinding phase; see examples/send-key.rs.
+# Synthetic key chords (Super = Command) and mouse drags for the keybinding and drag phases;
+# see examples/send-key.rs.
 REMOTE_SENDKEY="\"\$HOME/$REMOTE_BIN/send-key\""
 
 STARTED_DAEMON=0
@@ -273,7 +274,7 @@ build_and_deploy() {
         fi
     fi
 
-    # Synthetic key injection for the keybinding phase (built with the daemon above).
+    # Synthetic keys and drags for the keybinding and drag phases (built with the daemon above).
     local sendkey="$ROOT/target/release/examples/send-key"
     [[ -x "$sendkey" ]] && binaries+=("$sendkey")
 
@@ -406,11 +407,34 @@ case "${1:-}" in
     test-wids)
         ctl list-windows --json | python3 /tmp/cosmicmac-vm-assert.py test-wids
         ;;
+    close-finder-windows)
+        # Finder windows tile too, and where they land decides which window a
+        # directional focus or Super+S picks; the assertions assume only test
+        # windows are tiled.  Closed through the daemon (Accessibility): an
+        # AppleScript `tell Finder` needs an Automation grant and times out.
+        for wid in $(ctl list-windows --json | python3 -c 'import json,sys; print(" ".join(str(w["info"]["wid"]) for w in json.load(sys.stdin) if w["info"]["app_id"] == "com.apple.finder"))'); do
+            ctl focus "$wid" >/dev/null 2>&1 && ctl action close >/dev/null 2>&1 || true
+        done
+        sleep 1
+        ;;
+    focus-visible-test)
+        # Other apps' windows (a Finder window, say) may sit next to the test
+        # windows in the tree, so "focus left" can land on them; focus a test
+        # window explicitly before moving it.
+        wid="$(ctl list-windows --json | python3 /tmp/cosmicmac-vm-assert.py visible-test-wid)"
+        ctl focus "$wid"
+        ;;
     open-windows)
         open_windows "${2:?open-windows needs a count}"
         ;;
     close-test-windows)
         close_test_windows
+        ;;
+    set-fullscreen)
+        # set-fullscreen <pid> <title> <true|false>: native full screen through the
+        # window's AXFullScreen attribute.  System Events needs no Automation grant for the
+        # app (a `tell application "TextEdit"` does, and times out without one).
+        osascript -e "tell application \"System Events\" to tell (first process whose unix id is $2) to set value of attribute \"AXFullScreen\" of (first window whose name contains \"$3\") to $4" >/dev/null
         ;;
     wake-display)
         # A sleeping virtual display enumerates as zero displays (CGGetActiveDisplayList),
@@ -435,11 +459,18 @@ case "${1:-}" in
         echo "started pid $(cat "$PIDFILE")"
         ;;
     wait-daemon)
+        # The daemon waits for an active display before it binds the socket, so
+        # keep the (virtual) display awake while waiting.
         deadline=$((SECONDS + 20))
+        next_wake=0
         while (( SECONDS < deadline )); do
             if ctl ping >/dev/null 2>&1; then
                 echo "daemon ready"
                 exit 0
+            fi
+            if (( SECONDS >= next_wake )); then
+                caffeinate -u -t 1 &
+                next_wake=$((SECONDS + 4))
             fi
             sleep 0.25
         done
@@ -832,6 +863,57 @@ def main():
         print(" ".join(str(window["info"]["wid"]) for window in test_windows(read())))
         return
 
+    if mode == "visible-test-wid":
+        visible = [window for window in test_windows(read()) if window.get("visible")]
+        if not visible:
+            fail("no visible test window")
+        print(visible[0]["info"]["wid"])
+        return
+
+    if mode == "fullscreen-candidate":
+        # "<pid>\t<title>" of a visible test window, preferring one without focus: a
+        # window resumed next to the focused one instead of into its old tile then shows.
+        visible = [window for window in test_windows(read()) if window.get("visible")]
+        if not visible:
+            fail("no visible test window")
+        visible.sort(key=lambda window: bool(window.get("focused")))
+        info = visible[0]["info"]
+        print("%d\t%s" % (info["pid"], info["title"]))
+        return
+
+    if mode == "in-tiles":
+        # Every visible test window is where the layout put it (ACTUAL = FRAME).
+        for window in test_windows(read()):
+            if not window.get("visible"):
+                continue
+            actual = window.get("actual_frame")
+            if actual is None:
+                fail("window %s has no actual frame" % window["info"]["wid"])
+            rect = (
+                float(actual["x"]),
+                float(actual["y"]),
+                float(actual["width"]),
+                float(actual["height"]),
+            )
+            if not close(rect, frame(window)):
+                fail(
+                    "window %s is at %s, not in its tile %s"
+                    % (window["info"]["wid"], rect, frame(window))
+                )
+        return
+
+    if mode == "geometry-unchanged":
+        before = {
+            window["info"]["wid"]: frame(window) for window in test_windows(read(sys.argv[2]))
+        }
+        after = {window["info"]["wid"]: frame(window) for window in test_windows(read())}
+        if sorted(before) != sorted(after):
+            fail("test windows changed: %s before, %s now" % (sorted(before), sorted(after)))
+        for wid, rect in before.items():
+            if not close(rect, after[wid]):
+                fail("window %s moved from %s to %s" % (wid, rect, after[wid]))
+        return
+
     if mode == "tiled":
         mode_tiled(read(), int(sys.argv[2]))
         return
@@ -859,6 +941,51 @@ def main():
         stacked = [window for window in test_windows(read()) if window.get("in_stack")]
         if stacked:
             fail("expected no stacked test windows, found %d" % len(stacked))
+        return
+
+    if mode in ("drag-to-centre", "drag-to-corner"):
+        # "<wid> <target> X1,Y1 X2,Y2": a drag from one visible tiled test window's title
+        # bar to another's tile, at its centre (in the middle third: stacks) or a sixth in
+        # from its top-left corner (outside the middle third: snaps back).
+        tiles = visible_tiled(read())
+        if len(tiles) < 2:
+            fail("a drag needs two visible tiled test windows, found %d" % len(tiles))
+        source, target = tiles[0], tiles[1]
+        actual = source.get("actual_frame")
+        if actual is None:
+            sx, sy, sw, _ = frame(source)
+        else:
+            sx, sy, sw = float(actual["x"]), float(actual["y"]), float(actual["width"])
+        tx, ty, tw, th = frame(target)
+        share = 2.0 if mode == "drag-to-centre" else 6.0
+        print(
+            "%d %d %.0f,%.0f %.0f,%.0f"
+            % (
+                source["info"]["wid"],
+                target["info"]["wid"],
+                sx + sw / 2.0,
+                sy + 12.0,
+                tx + tw / share,
+                ty + th / share,
+            )
+        )
+        return
+
+    if mode == "stacked-onto":
+        # stacked-onto <wid> <target>: both share one stack and <wid> is its visible tab.
+        wid, target = int(sys.argv[2]), int(sys.argv[3])
+        windows = {window["info"]["wid"]: window for window in test_windows(read())}
+        dropped, under = windows.get(wid), windows.get(target)
+        if dropped is None or under is None:
+            fail("window %s or %s is gone" % (wid, target))
+        if not (dropped.get("in_stack") and under.get("in_stack")):
+            fail("windows %s and %s are not both stacked" % (wid, target))
+        if not (dropped.get("stack_active") and dropped.get("visible")):
+            fail("the dropped window %s is not the visible active tab" % wid)
+        if under.get("visible"):
+            fail("the target %s is still shown next to the dropped window" % target)
+        if not close(frame(dropped), frame(under)):
+            fail("windows %s and %s do not share a stack frame" % (wid, target))
         return
 
     if mode == "visible":
@@ -1066,6 +1193,13 @@ key() {
     run_remote "key: $*" "$REMOTE_SENDKEY $* && sleep 0.5"
 }
 
+# Drag with the left button from $1 to $2 ("X,Y" global points). The drag holds at its end
+# point before the release, so every move reaches the daemon while the button is down.
+drag() {
+    run_remote "drag: $1 -> $2" \
+        "$REMOTE_SENDKEY --drag $1 $2 --steps 20 --step-ms 16 --hold-ms 300 && sleep 1"
+}
+
 snapshot_geometry() {
     run_remote "snapshot geometry to $BEFORE" "$REMOTE_CTL list-windows --json > $BEFORE"
 }
@@ -1101,6 +1235,8 @@ else
         die "the daemon is not running and ~/$REMOTE_BIN/cosmic-mac-wm is not deployed"
     fi
 fi
+
+run_remote "close Finder windows" "bash $HELPER close-finder-windows"
 
 COUNT="$(remote_capture "open and wait for test windows" \
     "bash $HELPER open-windows $WINDOWS" "$WINDOWS")"
@@ -1140,7 +1276,7 @@ action workspace 1
 assert_workspaces "workspace 1 is active again" "workspace 1"
 assert_windows "windows are back on workspace 1" "visible $COUNT"
 
-action focus left
+run_remote "focus a visible test window" "bash $HELPER focus-visible-test"
 action move-to-workspace 2
 assert_workspaces "moving a window does not follow it" "workspace 1"
 assert_windows "one window left workspace 1" "visible $((COUNT - 1))"
@@ -1157,7 +1293,7 @@ action last-workspace
 assert_workspaces "last-workspace returns to workspace 2" "workspace 2"
 
 action workspace 1
-action focus left
+run_remote "focus a visible test window" "bash $HELPER focus-visible-test"
 action move-to-workspace 2
 assert_workspaces "the second move stays on workspace 1" "workspace 1"
 assert_windows "two windows left workspace 1" "visible $((COUNT - 2))"
@@ -1280,6 +1416,64 @@ if remote_ok "send-key is deployed" "test -x \"\$HOME/$REMOTE_BIN/send-key\""; t
     # the single-document TextEdit instance and quit it, which looks identical to Close.
 else
     warn "send-key is not deployed; skipping the keybinding phase"
+fi
+
+# --- drag to stack -----------------------------------------------------------------------------
+# A title-bar drag that ends in the middle third of another tile stacks the dragged window onto
+# that tile (COSMIC's stack zone); a drag that ends anywhere else snaps back into its tile.
+if (( COUNT >= 2 )) && remote_ok "send-key is deployed" "test -x \"\$HOME/$REMOTE_BIN/send-key\""; then
+    step "drag to stack"
+    run_remote "wake the VM display (a sleeping display ignores synthetic clicks)" \
+        "bash $HELPER wake-display"
+    DRAG="$(remote_capture "pick a drag onto another tile's centre" \
+        "$REMOTE_CTL list-windows --json | python3 $ASSERT drag-to-centre" "0 0 0,0 0,0")"
+    read -r DRAG_WID DRAG_TARGET DRAG_FROM DRAG_TO <<<"$DRAG"
+    drag "$DRAG_FROM" "$DRAG_TO"
+    assert_windows "dropping on the tile's centre stacks $DRAG_WID onto $DRAG_TARGET" \
+        "stacked-onto $DRAG_WID $DRAG_TARGET"
+    assert_windows "the new stack tiles with the other windows" "tiled $((COUNT - 1))"
+    screenshot "vm-test-09-drag-stack"
+    action toggle-stacking
+    assert_windows "toggle-stacking takes the dropped window out again" "unstacked"
+    assert_windows "windows tile again after the unstack" "tiled $COUNT"
+
+    DRAG="$(remote_capture "pick a drag onto another tile's corner" \
+        "$REMOTE_CTL list-windows --json | python3 $ASSERT drag-to-corner" "0 0 0,0 0,0")"
+    read -r DRAG_WID DRAG_TARGET DRAG_FROM DRAG_TO <<<"$DRAG"
+    snapshot_geometry
+    drag "$DRAG_FROM" "$DRAG_TO"
+    assert_windows "a drop outside the middle third stacks nothing" "unstacked"
+    assert_windows "the layout is unchanged after the snap-back" "geometry-unchanged $BEFORE"
+    assert_windows "window $DRAG_WID snapped back into its tile (ACTUAL = FRAME)" "in-tiles"
+else
+    warn "send-key is not deployed or fewer than two test windows; skipping drag to stack"
+fi
+
+# --- native full screen ------------------------------------------------------------------------
+# A window entering native full screen moves to a Space of its own, and SkyLight reports it
+# destroyed on the way.  The WM must suspend it rather than forget it, re-flow the rest, never
+# tile the transition's helper windows, and once the window leaves full screen put it and its
+# neighbours back into their old tiles (the app moves its other windows while their Space is
+# inactive).
+if (( COUNT >= 2 )); then
+    step "native full screen"
+    FS_TARGET="$(remote_capture "pick a test window for full screen" \
+        "$REMOTE_CTL list-windows --json | python3 $ASSERT fullscreen-candidate" $'0\tdry-run')"
+    FS_PID="${FS_TARGET%%$'\t'*}"
+    FS_TITLE="${FS_TARGET#*$'\t'}"
+    snapshot_geometry
+    run_remote "enter native full screen ($FS_TITLE)" \
+        "bash $HELPER set-fullscreen $FS_PID '$FS_TITLE' true && sleep 5"
+    assert_windows "the full-screen window is suspended, not listed" "count $((COUNT - 1))"
+    assert_windows "the other windows still tile" "tiled $((COUNT - 1))"
+    screenshot "vm-test-08-fullscreen"
+    run_remote "leave native full screen ($FS_TITLE)" \
+        "bash $HELPER set-fullscreen $FS_PID '$FS_TITLE' false && sleep 5"
+    assert_windows "the window is managed again after full screen" "count $COUNT"
+    assert_windows "every window is back in its old tile" "geometry-unchanged $BEFORE"
+    assert_windows "every window sits in its tile (ACTUAL = FRAME)" "in-tiles"
+else
+    warn "fewer than two test windows; skipping the native full-screen phase"
 fi
 
 action focus left

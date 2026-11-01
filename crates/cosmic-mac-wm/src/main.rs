@@ -1,22 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Entry point for the cosmicMac window-manager daemon.
 
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cosmic_mac_platform::eventtap::TapHandler;
-use cosmic_mac_platform::{EventTap, PlatformObserver, ax, display, tcc};
-use cosmic_mac_protocol::Config;
+use cosmic_mac_platform::eventtap::{self, TapHandler};
+use cosmic_mac_platform::{EventTap, KeyEvent, MouseTap, PlatformObserver, ax, display, tcc};
+use cosmic_mac_protocol::{Config, Rect};
 use objc2_app_kit::NSWorkspace;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
 use tokio::sync::mpsc;
 
-use cosmic_mac_wm::backend::PlatformBackend;
 use cosmic_mac_wm::daemon::Message;
 use cosmic_mac_wm::keybindings::{self, KeyMap};
-use cosmic_mac_wm::macos::{self, MacPlatform};
+use cosmic_mac_wm::launcher::{LauncherClient, SocketPort};
+use cosmic_mac_wm::macos::{self, DisplayUpdate, MacPlatform};
+use cosmic_mac_wm::super_tap::{self, SuperTap, TapEvent};
 use cosmic_mac_wm::{daemon, ipc, journal, paths};
 
 fn main() {
@@ -54,31 +57,31 @@ fn main() {
     }
     log::info!("{} keybindings armed", keymap.len());
 
+    // Refuse a second daemon before the display wait below, which can last
+    // as long as the display sleeps; checked again after it.
+    exit_if_already_running();
+
     // The backend and the observers must be created on the main thread: NSScreen
     // work areas and the AX observer run loop live here.  The event tap runs on
-    // its own thread (see `spawn_event_tap`).
-    let backend = Arc::new(MacPlatform::new());
-    let work_area = backend.main_work_area();
-
-    if ipc::is_listening(&paths::socket_path()) {
-        eprintln!(
-            "cosmic-mac-wm: another daemon is already listening on {}; refusing to start",
-            paths::socket_path().display()
-        );
-        std::process::exit(1);
-    }
+    // its own thread (see `spawn_event_tap`).  Nothing is managed until a real
+    // display is active.
+    let (work_area, main_frame) = wait_for_main_display();
+    exit_if_already_running();
+    let backend = Arc::new(MacPlatform::new(work_area, main_frame));
 
     let restored = journal::restore_stale(&paths::journal_path(), backend.as_ref());
     if restored > 0 {
         log::info!("restored {restored} windows from a crashed run");
     }
 
+    let launcher = start_launcher_client(config.super_tap_launcher);
     let (tx, rx) = mpsc::unbounded_channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let (observer, tap_thread) = match start_observers(
         tx.clone(),
         Arc::new(keymap),
         Arc::new(config.passthrough.clone()),
+        launcher,
         backend.clone(),
         shutdown.clone(),
     ) {
@@ -134,6 +137,139 @@ fn main() {
     log::info!("cosmic-mac-wm exited");
 }
 
+/// The Super-tap launcher client, unless `super_tap_launcher` is off in the
+/// WM config. The launcher is started on demand from the directory of this
+/// executable (`cosmic-mac-launcher.app`, else `cosmic-mac-launcher`).
+fn start_launcher_client(enabled: bool) -> Option<LauncherClient> {
+    if !enabled {
+        log::info!("Super tap: off (super_tap_launcher: false)");
+        return None;
+    }
+    let bin_dir = executable_dir().unwrap_or_else(|error| {
+        log::warn!(
+            "cannot locate the running executable ({error}); the launcher cannot be \
+             started on demand"
+        );
+        PathBuf::new()
+    });
+    let port = SocketPort {
+        socket: paths::launcher_socket_path(),
+        bin_dir,
+        log: Some(paths::launcher_log_path()),
+    };
+    log::info!(
+        "Super tap toggles the launcher ({}; on demand from {})",
+        port.socket.display(),
+        port.bin_dir.display()
+    );
+    match LauncherClient::spawn(port) {
+        Ok(client) => Some(client),
+        Err(error) => {
+            log::warn!("Super tap: off (cannot start the launcher-client thread: {error})");
+            None
+        }
+    }
+}
+
+fn executable_dir() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(exe.parent().map(Path::to_path_buf).unwrap_or_default())
+}
+
+fn exit_if_already_running() {
+    if ipc::is_listening(&paths::socket_path()) {
+        eprintln!(
+            "cosmic-mac-wm: another daemon is already listening on {}; refusing to start",
+            paths::socket_path().display()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Run loop slice between two polls of the startup display wait.
+const DISPLAY_POLL_SECS: f64 = 0.5;
+/// How often the startup display wait logs that it is still waiting.
+const DISPLAY_WAIT_REPORT: Duration = Duration::from_secs(60);
+
+/// Block until the main display is active and return its `(work_area,
+/// frame)`.
+///
+/// A sleeping display enumerates as zero displays.  Starting against an
+/// invented area tiles past the real screen edge and learns that edge as
+/// application size limits, so there is no timeout.  The main run loop runs
+/// in short slices between polls because AppKit refreshes `NSScreen` (the work
+/// area) from notifications delivered there; a plain sleep loop could see
+/// CoreGraphics wake up while `NSScreen` stays empty.
+///
+/// No signal handler is installed yet (the daemon's tokio handler comes
+/// later), so SIGTERM/SIGINT keep their default disposition and end the
+/// process at once during the wait.  Nothing needs restoring then: no window
+/// has been touched, no socket bound, no journal written.
+fn wait_for_main_display() -> (Rect, Rect) {
+    let started = Instant::now();
+    let mut active_since: Option<Instant> = None;
+    let mut last_report: Option<Instant> = None;
+    loop {
+        let now = Instant::now();
+        let mut error = None;
+        let enumerated = match display::active_display_count() {
+            Ok(0) => None,
+            Ok(_) => macos::main_display_frames_now(),
+            Err(count_error) => {
+                error = Some(count_error.to_string());
+                None
+            }
+        };
+        if enumerated.is_some() {
+            active_since.get_or_insert(now);
+        } else {
+            active_since = None;
+        }
+        let active_for = active_since.map_or(Duration::ZERO, |since| now - since);
+        if let Some(frames) = macos::startup_display_frames(enumerated, active_for) {
+            if !frames.work_area_known {
+                log::warn!(
+                    "NSScreen does not list the main display {:?}; using its full frame as \
+                     the work area until the next display change",
+                    frames.frame
+                );
+            }
+            if last_report.is_some() {
+                log::info!(
+                    "display active after {}s; work area {:?}",
+                    started.elapsed().as_secs(),
+                    frames.work_area
+                );
+            }
+            return frames.pair();
+        }
+        let waiting_for = match (&enumerated, &error) {
+            (Some(_), _) => "NSScreen to list the main display".to_string(),
+            (None, Some(error)) => format!("an active display ({error})"),
+            (None, None) => "an active display (asleep?)".to_string(),
+        };
+        match last_report {
+            None => {
+                log::warn!("waiting for {waiting_for} before managing windows");
+                last_report = Some(now);
+            }
+            Some(reported) if now - reported >= DISPLAY_WAIT_REPORT => {
+                log::info!(
+                    "still waiting for {waiting_for} ({}s)",
+                    started.elapsed().as_secs()
+                );
+                last_report = Some(now);
+            }
+            Some(_) => {}
+        }
+        let mode = unsafe { kCFRunLoopDefaultMode };
+        if CFRunLoop::run_in_mode(mode, DISPLAY_POLL_SECS, false) == CFRunLoopRunResult::Finished {
+            // No source in the mode yet: returns at once, so never spin.
+            std::thread::sleep(Duration::from_secs_f64(DISPLAY_POLL_SECS));
+        }
+    }
+}
+
 /// Sets the shutdown flag when dropped, so the main thread stops pumping its
 /// run loop and the tap thread releases the event tap, however the runtime
 /// thread ends.
@@ -174,6 +310,7 @@ fn start_observers(
     tx: mpsc::UnboundedSender<Message>,
     keymap: Arc<KeyMap>,
     passthrough: Arc<Vec<String>>,
+    launcher: Option<LauncherClient>,
     backend: Arc<MacPlatform>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(ObserverRuntime, JoinHandle<()>), String> {
@@ -191,14 +328,30 @@ fn start_observers(
     observer
         .refresh_apps()
         .map_err(|error| format!("AX observers: {error}"))?;
+    // Native full screen and desktop switches: the core re-checks windows
+    // away in full screen and re-asserts the tiles on every change.
+    observer.start_space_observer();
 
-    let tap_thread = spawn_event_tap(tx.clone(), keymap, passthrough, shutdown)?;
+    let tap_thread = spawn_event_tap(tx.clone(), keymap, passthrough, launcher, shutdown)?;
 
     let display_tx = tx.clone();
     display::set_display_change_handler(Arc::new(move || {
-        let (work_area, main_frame) = macos::main_display_frames_now();
-        backend.update_displays(work_area, main_frame);
-        let _ = display_tx.send(Message::WorkArea(work_area));
+        let previous = backend.display_frames();
+        match macos::next_display_frames(previous, macos::main_display_frames_now()) {
+            DisplayUpdate::Apply { work_area, frame } => {
+                backend.update_displays(work_area, frame);
+                let _ = display_tx.send(Message::WorkArea(work_area));
+            }
+            DisplayUpdate::NoDisplay => log::info!(
+                "display change with no active display (asleep?); keeping the work area {:?}",
+                previous.0
+            ),
+            DisplayUpdate::WorkAreaPending => log::info!(
+                "display change before NSScreen lists the display; keeping the work area {:?}",
+                previous.0
+            ),
+            DisplayUpdate::Unchanged => log::debug!("display change; geometry unchanged"),
+        }
     }))
     .map_err(|error| format!("display change handler: {error}"))?;
 
@@ -212,10 +365,14 @@ fn start_observers(
 /// loop, one beach-balling app stalled keyboard input system-wide until macOS
 /// disabled the tap.  Creation errors are sent back so they still fail daemon
 /// startup.
+///
+/// The listen-only mouse tap for drag to stack shares the thread.  Without it
+/// the daemon still runs; tiled windows then always snap back.
 fn spawn_event_tap(
     tx: mpsc::UnboundedSender<Message>,
     keymap: Arc<KeyMap>,
     passthrough: Arc<Vec<String>>,
+    launcher: Option<LauncherClient>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -224,13 +381,20 @@ fn spawn_event_tap(
         .spawn(move || {
             // `EventTap::new` adds its source to the *current* run loop, which
             // is this thread's.
-            let tap = match EventTap::new(Vec::new(), key_handler(tx, keymap, passthrough)) {
+            let mouse_tx = tx.clone();
+            let handler = key_handler(tx, keymap, passthrough, launcher);
+            let tap = match EventTap::new(Vec::new(), handler) {
                 Ok(tap) => tap,
                 Err(error) => {
                     let _ = ready_tx.send(Err(format!("global event tap: {error}")));
                     return;
                 }
             };
+            let mouse = MouseTap::new(Box::new(move |event| {
+                let _ = mouse_tx.send(Message::Mouse(event, Instant::now()));
+            }))
+            .map_err(|error| log::warn!("mouse tap: {error}; drag to stack is off"))
+            .ok();
             let _ = ready_tx.send(Ok(()));
             while !shutdown.load(Ordering::SeqCst) {
                 let mode = unsafe { kCFRunLoopDefaultMode };
@@ -240,6 +404,7 @@ fn spawn_event_tap(
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
+            drop(mouse);
             drop(tap);
         })
         .map_err(|error| format!("cannot spawn the event-tap thread: {error}"))?;
@@ -256,15 +421,26 @@ fn spawn_event_tap(
     }
 }
 
-/// The tap callback: dispatch bound chords to the daemon and swallow them.
+/// The tap callback: dispatch bound chords to the daemon and swallow them,
+/// and watch every key and modifier event for a Super tap.
 fn key_handler(
     tap_tx: mpsc::UnboundedSender<Message>,
     tap_keymap: Arc<KeyMap>,
     tap_passthrough: Arc<Vec<String>>,
+    launcher: Option<LauncherClient>,
 ) -> TapHandler {
+    // Only the tap thread calls the handler.
+    let detector = RefCell::new(SuperTap::default());
     // The static swallow list is empty: the handler decides per event, which
     // is what makes the per-application `passthrough` list possible.
     Box::new(move |key| {
+        if let Some(launcher) = &launcher {
+            watch_super_tap(&detector, launcher, &tap_passthrough, key);
+        }
+        if key.is_flags_changed {
+            // Modifier changes always pass (the tap ignores the result too).
+            return false;
+        }
         let Some(action) = tap_keymap.lookup(key.keycode, key.modifiers()).cloned() else {
             return false;
         };
@@ -286,6 +462,45 @@ fn key_handler(
         // Swallow both down and up so the app never sees a stuck key.
         true
     })
+}
+
+/// Feeds `key` to the Super-tap detector; on a confirmed tap outside the
+/// `passthrough` apps, queues a launcher toggle (never blocks the tap).
+fn watch_super_tap(
+    detector: &RefCell<SuperTap>,
+    launcher: &LauncherClient,
+    passthrough: &[String],
+    key: KeyEvent,
+) {
+    let event = if key.is_flags_changed {
+        TapEvent::Flags {
+            keycode: key.keycode,
+            flags: key.flags,
+        }
+    } else {
+        TapEvent::Key
+    };
+    let Some(held) = detector.borrow_mut().observe(event, Instant::now()) else {
+        return;
+    };
+    let since_input =
+        super_tap::duration_from_seconds(eventtap::seconds_since_click_scroll_or_key());
+    let button_down = eventtap::mouse_button_down();
+    if !super_tap::should_toggle(held, since_input, button_down) {
+        log::debug!(
+            "Super tap ignored: click, scroll or key {since_input:?} ago, held {held:?}, \
+             mouse button down: {button_down}"
+        );
+        return;
+    }
+    if is_passthrough(passthrough) {
+        log::debug!("Super tap ignored: the frontmost app is in `passthrough`");
+        return;
+    }
+    log::debug!("Super tap (held {held:?})");
+    if !launcher.toggle() {
+        log::warn!("Super tap: the launcher-client thread is gone");
+    }
 }
 
 fn is_passthrough(patterns: &[String]) -> bool {

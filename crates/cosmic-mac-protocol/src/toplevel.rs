@@ -5,10 +5,17 @@
 //! `cosmic_toplevel_management_v1`, adapted to macOS concepts:
 //!
 //! * `app_id` is the application bundle identifier (`NSRunningApplication.bundleIdentifier`).
+//!   An unbundled process (a bare executable) has no bundle identifier; its application name
+//!   (the localized name, or the CoreGraphics owner name, which is the executable name) is used
+//!   instead.
 //! * `role` / `subrole` are the Accessibility role and subrole (`AXWindow`, `AXDialog`, …).
 //! * `initial_frame` is the window's frame when it was first observed.  The protocol
 //!   toplevel-info interface does not carry geometry, but the layout engine needs a size to
 //!   place floating windows, and macOS hands us the frame for free via AX.
+//! * `level`, `minimized` and `fullscreen` are the window-server level and the AX minimized
+//!   and full-screen flags.  Like `initial_frame` they describe the moment the record was
+//!   read: the daemon uses them to decide whether to manage a window, they are not kept
+//!   current afterwards.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +32,8 @@ pub struct ToplevelInfo {
     pub wid: WindowId,
     /// Process id of the owning application.
     pub pid: i32,
-    /// Bundle identifier of the owning application ("" when unknown).
+    /// Bundle identifier of the owning application, or its application name when it has no
+    /// bundle ("" when unknown).
     pub app_id: String,
     /// Window title ("" when unknown).
     pub title: String,
@@ -56,6 +64,21 @@ pub struct ToplevelInfo {
     /// constrained (see [`Size::UNBOUNDED`]).
     #[serde(default)]
     pub max_size: Option<Size>,
+    /// Window-server level when the record was read (0 = normal application window).
+    ///
+    /// Used to decide whether the window is managed; not kept current afterwards.
+    #[serde(default)]
+    pub level: i32,
+    /// Whether the window was minimized when the record was read.
+    ///
+    /// Used to decide whether the window is managed; not kept current afterwards.
+    #[serde(default)]
+    pub minimized: bool,
+    /// Whether the window was in native full screen when the record was read.
+    ///
+    /// Used to decide whether the window is managed; not kept current afterwards.
+    #[serde(default)]
+    pub fullscreen: bool,
 }
 
 impl Default for ToplevelInfo {
@@ -72,6 +95,9 @@ impl Default for ToplevelInfo {
             initial_frame: None,
             min_size: None,
             max_size: None,
+            level: 0,
+            minimized: false,
+            fullscreen: false,
         }
     }
 }
@@ -116,6 +142,24 @@ impl ToplevelInfo {
     /// Attach the maximum size the application accepts.
     pub fn with_max_size(mut self, max: Size) -> Self {
         self.max_size = Some(max);
+        self
+    }
+
+    /// Set the window-server level (0 = normal application window).
+    pub fn with_level(mut self, level: i32) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Mark the window as minimized.
+    pub fn with_minimized(mut self, minimized: bool) -> Self {
+        self.minimized = minimized;
+        self
+    }
+
+    /// Mark the window as being in native full screen.
+    pub fn with_fullscreen(mut self, fullscreen: bool) -> Self {
+        self.fullscreen = fullscreen;
         self
     }
 }
@@ -230,6 +274,9 @@ mod tests {
         assert!(info.role.is_none());
         assert!(info.min_size.is_none());
         assert!(info.max_size.is_none());
+        assert_eq!(info.level, 0);
+        assert!(!info.minimized);
+        assert!(!info.fullscreen);
     }
 
     #[test]
@@ -240,9 +287,15 @@ mod tests {
             .with_dialog(true)
             .with_initial_frame(Rect::new(10.0, 20.0, 300.0, 200.0))
             .with_min_size(Size::new(642.0, 100.0))
-            .with_max_size(Size::new(4000.0, Size::UNBOUNDED.height));
+            .with_max_size(Size::new(4000.0, Size::UNBOUNDED.height))
+            .with_level(25)
+            .with_minimized(true)
+            .with_fullscreen(true);
         let json = serde_json::to_string(&info).unwrap();
         assert_eq!(serde_json::from_str::<ToplevelInfo>(&json).unwrap(), info);
+        assert_eq!(info.level, 25);
+        assert!(info.minimized);
+        assert!(info.fullscreen);
         assert_eq!(info.min_size, Some(Size::new(642.0, 100.0)));
         assert!(!info.max_size.unwrap().is_unbounded());
     }
@@ -256,6 +309,10 @@ mod tests {
         assert_eq!(info.initial_frame, None);
         assert_eq!(info.min_size, None);
         assert_eq!(info.max_size, None);
+        // Payloads written before the level/minimized/fullscreen fields existed.
+        assert_eq!(info.level, 0);
+        assert!(!info.minimized);
+        assert!(!info.fullscreen);
     }
 
     #[test]

@@ -62,13 +62,49 @@ const SYSTEM_APP_IDS: &[&str] = &[
     "com.apple.SecurityAgent",
 ];
 
+/// Applications whose windows are shell surfaces (the cosmicMac panel).
+///
+/// The bundle identifier is the panel's identity once it ships as an app; an
+/// unbundled build runs as a bare executable whose `app_id` falls back to the
+/// executable name.
+const SHELL_APP_IDS: &[&str] = &["cosmic-mac-panel", "com.cosmicmac.panel"];
+
+/// Whether this window is a shell surface whose strip is reserved from the
+/// work area (like a Wayland layer-shell exclusive zone) instead of being
+/// managed.
+///
+/// Identified by application id, not by level: the panel's window is created
+/// at the normal level and raised to the status level a moment later, so the
+/// level may still be 0 when the window is first seen.  Callers must check
+/// this before [`is_manageable`].
+pub fn is_shell_window(info: &ToplevelInfo) -> bool {
+    SHELL_APP_IDS
+        .iter()
+        .any(|app| info.app_id.eq_ignore_ascii_case(app))
+}
+
 /// Whether the daemon should manage this window at all.
 ///
-/// Minimised windows, zero-sized helper windows, non-standard roles and
-/// system UI are excluded.  The filter is deliberately conservative: a window
+/// Windows above the normal level (Spotlight, launcher panels, overlays),
+/// minimised windows, windows in native full screen (they fill their own
+/// Space), zero-sized helper windows, non-standard roles and system UI are
+/// excluded.  The filter is deliberately conservative: a window
 /// that is wrongly managed is much more disruptive than one that is ignored.
 pub fn is_manageable(info: &ToplevelInfo) -> bool {
+    !info.minimized && !info.fullscreen && is_manageable_kind(info)
+}
+
+/// [`is_manageable`] without the minimized and full-screen checks: whether
+/// this is a kind of window the daemon manages once it is on the desktop.
+///
+/// A window that fails this (its level, application, role or size) stays
+/// unmanaged while it keeps them; one that only fails [`is_manageable`] is
+/// away for now and may be managed when it is back.
+pub fn is_manageable_kind(info: &ToplevelInfo) -> bool {
     if info.wid == 0 {
+        return false;
+    }
+    if info.level != 0 {
         return false;
     }
     if SYSTEM_APP_IDS
@@ -196,6 +232,55 @@ mod tests {
         let mut secure = info();
         secure.subrole = Some("AXSecureTextField".into());
         assert!(!is_manageable(&secure));
+    }
+
+    #[test]
+    fn windows_above_the_normal_level_are_ignored() {
+        assert!(!is_manageable(&info().with_level(25)));
+        assert!(!is_manageable(&info().with_level(8)));
+        assert!(!is_manageable(&info().with_level(-1)));
+        assert!(is_manageable(&info().with_level(0)));
+    }
+
+    #[test]
+    fn minimized_windows_are_ignored() {
+        assert!(!is_manageable(&info().with_minimized(true)));
+        assert!(is_manageable(&info().with_minimized(false)));
+    }
+
+    #[test]
+    fn fullscreen_windows_are_ignored() {
+        assert!(!is_manageable(&info().with_fullscreen(true)));
+        assert!(is_manageable(&info().with_fullscreen(false)));
+    }
+
+    #[test]
+    fn minimized_and_full_screen_windows_are_of_a_manageable_kind() {
+        // Away for now, not a kind of window that is never managed.
+        assert!(is_manageable_kind(&info().with_minimized(true)));
+        assert!(is_manageable_kind(&info().with_fullscreen(true)));
+        assert!(!is_manageable_kind(&info().with_level(25)));
+        assert!(!is_manageable_kind(
+            &info().with_minimized(true).with_level(25)
+        ));
+        let mut menu = info().with_minimized(true);
+        menu.role = Some("AXMenuBar".into());
+        assert!(!is_manageable_kind(&menu));
+    }
+
+    #[test]
+    fn shell_windows_are_identified_by_app_id() {
+        let app = |app_id: &str| ToplevelInfo::new(1, app_id, "");
+        assert!(is_shell_window(&app("cosmic-mac-panel")));
+        assert!(is_shell_window(&app("com.cosmicmac.panel")));
+        // Case-insensitive, like the system app list.
+        assert!(is_shell_window(&app("Cosmic-Mac-Panel")));
+        assert!(is_shell_window(&app("COM.CosmicMac.Panel")));
+        // The level does not matter: the panel is created at level 0.
+        assert!(is_shell_window(&app("cosmic-mac-panel").with_level(25)));
+        assert!(!is_shell_window(&info()));
+        assert!(!is_shell_window(&app("")));
+        assert!(!is_shell_window(&app("cosmic-mac-panel-helper")));
     }
 
     #[test]

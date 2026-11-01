@@ -93,6 +93,9 @@ impl WorkspaceGroup {
     }
 }
 
+/// Height in points of the tab-bar strip above a stack's windows; layout reserves it.
+pub const STACK_BAR_HEIGHT: f64 = 26.0;
+
 /// A stack (COSMIC "tabbed" group) as seen by the tab-bar overlay.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StackInfo {
@@ -102,7 +105,7 @@ pub struct StackInfo {
     pub tabs: Vec<TabInfo>,
     /// Index of the active tab in `tabs`.
     pub active: usize,
-    /// Frame occupied by the stack; the tab bar is drawn at its top edge.
+    /// Frame of the stack's visible window; the tab bar is drawn directly above it.
     pub frame: Rect,
 }
 

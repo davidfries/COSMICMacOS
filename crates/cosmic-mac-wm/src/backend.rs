@@ -98,6 +98,37 @@ impl AppliedFrame {
     }
 }
 
+/// The drag-to-stack highlight: dropping the dragged window now would stack it onto
+/// `target`, whose tile is `frame`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DropHint {
+    /// The window (or the visible member of the stack) the drop would join.
+    pub target: WindowId,
+    /// The target's tile, which the highlight covers.
+    pub frame: Rect,
+}
+
+/// Where the window server has a window, beyond what a [`PlatformBackend::window_info`]
+/// read says.
+///
+/// Native full screen moves a window to a Space of its own.  Mid-transition the window is
+/// on no Space at all, CoreGraphics does not list it, Accessibility cannot find it, and
+/// SkyLight reports it destroyed (verified on macOS 15.6).  The window server still knows
+/// its owner, which is what tells such a window from a closed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowPresence {
+    /// The window server does not know the window: it was closed.
+    Gone,
+    /// The window exists but is on no Space: moving between Spaces (entering or leaving
+    /// native full screen), ordered out, or a transition helper that is about to close.
+    Detached,
+    /// The window is on a Space; `fullscreen` when that is a native full-screen Space.
+    OnSpace {
+        /// The Space is a native full-screen Space.
+        fullscreen: bool,
+    },
+}
+
 /// Platform operations needed by the window manager.
 ///
 /// All methods must be safe to call from any thread (the AX and SkyLight
@@ -141,10 +172,33 @@ pub trait PlatformBackend: Send + Sync {
     fn frame(&self, wid: WindowId) -> Option<Rect>;
     /// Refresh one window's metadata.
     fn window_info(&self, wid: WindowId) -> Option<ToplevelInfo>;
+    /// Whether the window server still has `wid`, and on what kind of Space.
+    ///
+    /// The default treats every window with a readable frame as on an ordinary Space and
+    /// every other window as gone; the real backend asks SkyLight.
+    fn window_presence(&self, wid: WindowId) -> WindowPresence {
+        if self.frame(wid).is_some() {
+            WindowPresence::OnSpace { fullscreen: false }
+        } else {
+            WindowPresence::Gone
+        }
+    }
     /// Every on-screen window, front-to-back.
     fn windows(&self) -> Vec<ToplevelInfo>;
+    /// On-screen shell windows (the panel) at any level, whose strips are
+    /// reserved from the work area.
+    ///
+    /// [`PlatformBackend::windows`] only lists normal-level windows, so a
+    /// panel that is already running when the daemon starts is not in it.
+    fn shell_windows(&self) -> Vec<ToplevelInfo> {
+        Vec::new()
+    }
     /// Show, update or hide the stack tab bar.
     fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()>;
+    /// Show, move or hide the drag-to-stack highlight.  `None` hides it.
+    fn set_drop_hint(&self, _hint: Option<DropHint>) -> PlatformResult<()> {
+        Ok(())
+    }
     /// Work area of the main display (top-left global coordinates).
     fn main_work_area(&self) -> Rect;
     /// Full frame of the display containing `wid`, for corner parking.
@@ -153,3 +207,15 @@ pub trait PlatformBackend: Send + Sync {
 
 /// Convenience alias for the shared backend handle.
 pub type SharedBackend = Arc<dyn PlatformBackend>;
+
+/// Whether `frame` is where [`PlatformBackend::park`] leaves a window on
+/// `display_frame` (the platform's own test,
+/// [`cosmic_mac_platform::window::is_parked_frame`]).
+///
+/// A window found there without a journal entry was parked by a crashed run;
+/// its frame is not an original worth restoring.
+pub fn is_parked_frame(frame: Rect, display_frame: Rect) -> bool {
+    let platform =
+        |rect: Rect| cosmic_mac_platform::Rect::new(rect.x, rect.y, rect.width, rect.height);
+    cosmic_mac_platform::window::is_parked_frame(platform(frame), platform(display_frame))
+}

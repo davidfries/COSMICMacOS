@@ -29,19 +29,24 @@ mod action;
 mod command;
 mod config;
 mod ipc;
+mod shell;
 mod toplevel;
 mod tree;
 mod workspace;
+
+pub mod launcher;
+pub mod theme;
 
 pub use action::{Action, Axis, Direction};
 pub use command::Command;
 pub use config::{Config, ConfigChanged, Gaps, TilingException};
 pub use ipc::{Request, Response};
+pub use shell::ShellState;
 pub use toplevel::{
     TabInfo, ToplevelCapability, ToplevelInfo, ToplevelManagement, ToplevelState, WindowState,
 };
 pub use tree::TreeNode;
-pub use workspace::{Orientation, StackInfo, WorkspaceGroup, WorkspaceInfo};
+pub use workspace::{Orientation, STACK_BAR_HEIGHT, StackInfo, WorkspaceGroup, WorkspaceInfo};
 
 use serde::{Deserialize, Serialize};
 

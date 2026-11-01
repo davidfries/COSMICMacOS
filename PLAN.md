@@ -216,24 +216,42 @@ windows between them, Super+Q closes; quitting the daemon restores every window.
 
 ## Milestone 2: Visual shell
 
-1. `cosmic-mac-session`: launchd agents for wm, overlay, panel, launcher; `install`/
-   `uninstall` subcommands; macOS defaults: Dock autohide with huge delay, `_HIHideMenuBar`,
-   wallpaper via `NSWorkspace.setDesktopImageURL` (cosmic-bg equivalent), reserve top/bottom
-   work-area for panel/dock in the layout engine.
-2. `cosmic-mac-panel`: port cosmic-panel's look (cosmic-panel-config RON honoured for size,
-   anchor, autohide, opacity) as two libcosmic windows (panel top, dock bottom) at status
-   level, all Spaces, non-activating. Applets in-process as libcosmic widgets, adapted from
-   cosmic-applets: time/date, workspaces (from WM IPC), app-list/dock (running apps from WM
-   IPC, pinned apps from cosmic-app-list-config, icons from `NSWorkspace` rasterised to PNG
-   cache), tiling toggle, battery (IOKit), audio (CoreAudio), network/Wi-Fi (CoreWLAN,
-   SystemConfiguration), power menu (logout/sleep/restart via `osascript`/`pmset`), status
-   area showing macOS menu-bar extras is out of scope (not accessible).
+1. `cosmic-mac-session`: launchd agents for the WM and the resident launcher;
+   `install`/`uninstall`/`status` subcommands. No macOS defaults are changed (menu bar and Dock
+   stay). Wallpaper via `NSWorkspace.setDesktopImageURL` is a possible follow-up.
+2. ~~`cosmic-mac-panel`~~ **dropped (2026-10-31)**: Spike A proved a libcosmic bar works, but
+   replacing the macOS menu bar means hiding it, and that hides every app's menus (File, Edit,
+   View), which COSMIC's panel never has to carry on Linux. The native menu bar and Dock stay.
+   Instead: a **menu-bar status item** (`NSStatusItem`) showing the active workspace, with a
+   menu to switch workspaces and toggle tiling. The WM keeps its shell-strip reservation
+   (`reserve.rs`) for a possible COSMIC dock later. `crates/cosmic-mac-panel` remains as Spike A
+   reference code.
+   **Status (2026-11-01): implemented, host-tested, VM check pending.** `crates/cosmic-mac-status`
+   is a separate AppKit process (Accessory policy, no Dock icon) that subscribes to the WM over
+   IPC (`Request::Subscribe`, a stream of `ShellState` lines), sends menu actions as one-shot
+   requests and reconnects with backoff when the WM is down. It runs as the
+   `com.cosmicmac.status` launchd agent; `cosmic-mac-ctl watch` prints the same stream.
 3. `cosmic-mac-launcher`: cosmic-launcher UI with pop-launcher service; plugins: apps
    (LaunchServices database + `/Applications`, `~/Applications`, `/System/Applications`),
    calc, web, files (`mdfind`), terminal, window switcher (Alt-Tab, Super+Tab via WM IPC).
    Opened by tap-Super (tap detection in the event tap: Cmd down/up with no other key).
+   Status: in-process plugins (own `Plugin` trait, pop-launcher's prefixes: `=` calc,
+   `g `/`ddg ` web, `run `/`t:` Terminal, `:` background command, `find ` Spotlight files;
+   no prefix: windows and apps). As in pop-launcher, a prefix owns the query, so the app
+   "Find My" is found with `find` or `my`, not `find my`. The launcher is resident (launchd
+   agent, started hidden, `toggle`/`show`/`hide` on its Unix socket; hiding closes the window,
+   the renderer stays warm), runs as `cosmic-mac-launcher.app` (`LSUIElement`, no Dock icon),
+   and the WM toggles it on a Super tap (`super_tap_launcher`, default on). Details in
+   HANDOFF.md "Launcher". Alt-Tab/Super+Tab switcher still open.
 4. Theming: cosmic-theme dark/light from `com.system76.CosmicTheme.Mode`; follow macOS
    appearance as fallback.
+   **Status (2026-11-01): implemented and verified in the VM.** One rule in
+   `cosmic_mac_protocol::theme`: COSMIC's `is_dark` when readable and `auto_switch` is off,
+   else macOS `AppleInterfaceStyle`. The launcher loads COSMIC's theme for that mode as a
+   custom libcosmic theme and re-resolves on show, on `AppleInterfaceThemeChangedNotification`
+   and on Mode config changes. The WM tab bar uses COSMIC's default dark/light colours (plus the
+   user's COSMIC accent) and re-checks every 2 s while visible. Details in HANDOFF.md
+   "Theming".
 
 ## Milestone 3: Completeness
 

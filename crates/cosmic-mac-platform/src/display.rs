@@ -30,7 +30,16 @@ pub struct DisplayInfo {
     /// Full frame in global top-left coordinates.
     pub frame: Rect,
     /// Work area (menu bar and Dock excluded) in global top-left coordinates.
+    ///
+    /// The full [`frame`](Self::frame) when no `NSScreen` matched this display;
+    /// see [`visible_frame_known`](Self::visible_frame_known).
     pub visible_frame: Rect,
+    /// Whether [`visible_frame`](Self::visible_frame) came from
+    /// `NSScreen.visibleFrame`.  False off the main thread, and on the main
+    /// thread while `NSScreen` has not caught up with a display change (a
+    /// display that just woke up can be active in CoreGraphics before AppKit
+    /// lists it).
+    pub visible_frame_known: bool,
     /// Backing scale factor (2.0 on Retina displays).
     pub scale: f64,
     /// Whether this is the display with the menu bar.
@@ -61,14 +70,18 @@ pub fn main_display_id() -> CGDirectDisplayID {
 /// available.
 static SNAPSHOT: OnceLock<Mutex<Vec<DisplayInfo>>> = OnceLock::new();
 
-/// Displays as of the last [`list_displays`] call made **on the main thread**,
-/// or `None` if that never happened.
+/// Displays as of the last [`list_displays`] call made **on the main thread**
+/// that found at least one display, or `None` if that never happened.
 ///
 /// Off-main-thread callers (the WM thread's probes and `display_frame`) use this
 /// instead of [`list_displays`], which would log a warning and fall back to full
 /// display frames.  The daemon populates it at startup on the main thread and
 /// refreshes it from the display-change handler, which re-enumerates the main
-/// display on the main thread (`macos::main_work_area_now`).
+/// display on the main thread (`macos::main_display_frames_now`).
+///
+/// An enumeration that finds no display (a sleeping display enumerates as
+/// zero displays) does not clear the snapshot: probes and parking keep the
+/// last known geometry instead of losing their display while it sleeps.
 pub fn cached_displays() -> Option<Vec<DisplayInfo>> {
     let displays = SNAPSHOT.get()?.lock().ok()?;
     (!displays.is_empty()).then(|| displays.clone())
@@ -81,10 +94,26 @@ pub fn cached_main_display() -> Option<DisplayInfo> {
         .find(|display| display.is_main)
 }
 
+/// Number of active displays, without enumerating `NSScreen`.
+///
+/// Zero while the only display sleeps.  Cheap enough to poll.
+pub fn active_display_count() -> Result<u32> {
+    let mut count: u32 = 0;
+    // SAFETY: a null list with a zero capacity asks only for the count.
+    let err = unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &mut count) };
+    if err.0 != 0 {
+        return Err(PlatformError::Os {
+            context: "CGGetActiveDisplayList",
+            message: format!("CGError {}", err.0),
+        });
+    }
+    Ok(count)
+}
+
 /// Enumerate active displays.
 ///
 /// Calls made on the main thread also refresh the snapshot behind
-/// [`cached_displays`].
+/// [`cached_displays`] (an empty result keeps the previous snapshot).
 pub fn list_displays() -> Result<Vec<DisplayInfo>> {
     let mut ids = [0u32; 32];
     let mut count: u32 = 0;
@@ -133,14 +162,15 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
                     && (screen_frame.size.height - frame.size.height).abs() < 1.0
             })
             .cloned();
-        let (visible_frame, scale, name) = match matched {
-            Some((_, visible, scale, name)) => (visible, scale, name),
-            None => (frame, 1.0, None),
+        let (visible_frame, visible_frame_known, scale, name) = match matched {
+            Some((_, visible, scale, name)) => (visible, true, scale, name),
+            None => (frame, false, 1.0, None),
         };
         displays.push(DisplayInfo {
             id,
             frame,
             visible_frame,
+            visible_frame_known,
             scale,
             is_main: id == main_id,
             name,
@@ -154,10 +184,18 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
     if on_main_thread {
         let slot = SNAPSHOT.get_or_init(|| Mutex::new(Vec::new()));
         if let Ok(mut snapshot) = slot.lock() {
-            *snapshot = displays.clone();
+            refresh_snapshot(&mut snapshot, &displays);
         }
     }
     Ok(displays)
+}
+
+/// Replace the snapshot with a main-thread enumeration, unless it found no
+/// display: the last known geometry stays in place while a display sleeps.
+fn refresh_snapshot(snapshot: &mut Vec<DisplayInfo>, displays: &[DisplayInfo]) {
+    if !displays.is_empty() {
+        *snapshot = displays.to_vec();
+    }
 }
 
 /// The main display.
@@ -254,5 +292,40 @@ mod tests {
         let _ = list_displays();
         assert!(cached_displays().is_none());
         assert!(cached_main_display().is_none());
+    }
+
+    #[test]
+    fn the_display_count_matches_the_enumeration() {
+        // Both are zero on a headless host and while the display sleeps.
+        if let (Ok(count), Ok(displays)) = (active_display_count(), list_displays()) {
+            assert_eq!(count as usize, displays.len());
+        }
+    }
+
+    fn display(id: CGDirectDisplayID, width: f64) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            frame: Rect::new(0.0, 0.0, width, 1117.0),
+            visible_frame: Rect::new(0.0, 25.0, width, 1092.0),
+            visible_frame_known: true,
+            scale: 2.0,
+            is_main: true,
+            name: Some("Display".into()),
+        }
+    }
+
+    #[test]
+    fn an_empty_enumeration_keeps_the_last_known_snapshot() {
+        let mut snapshot = Vec::new();
+        refresh_snapshot(&mut snapshot, &[display(1, 1728.0)]);
+        assert_eq!(snapshot, vec![display(1, 1728.0)]);
+
+        // The display went to sleep: CoreGraphics lists nothing.
+        refresh_snapshot(&mut snapshot, &[]);
+        assert_eq!(snapshot, vec![display(1, 1728.0)]);
+
+        // It woke up with a new resolution.
+        refresh_snapshot(&mut snapshot, &[display(1, 1920.0)]);
+        assert_eq!(snapshot, vec![display(1, 1920.0)]);
     }
 }

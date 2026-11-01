@@ -2,32 +2,41 @@
 //! Real macOS backend: a thin adapter over `cosmic-mac-platform`.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use cosmic_mac_platform::window::{self, ParkStore, WindowInfo};
-use cosmic_mac_platform::{Rect as PlatformRect, display};
+use cosmic_mac_platform::{Rect as PlatformRect, display, skylight};
 use cosmic_mac_protocol::{Rect, StackInfo, ToplevelInfo, WindowId};
 
-use crate::backend::{AppliedFrame, PlatformBackend, PlatformResult, SizeConstraints};
+use crate::backend::{
+    AppliedFrame, DropHint, PlatformBackend, PlatformResult, SizeConstraints, WindowPresence,
+};
+use crate::rules;
 use crate::tabbar::TabBarHandle;
 
 /// The production backend.
 pub struct MacPlatform {
     park: ParkStore,
+    /// Work area of the main display: the startup value, then the last one a
+    /// display change delivered.  Kept while no display is enumerated (asleep).
     work_area: Mutex<Rect>,
     /// Full frame of the main display, cached on the main thread and refreshed
     /// on every display change.  Used as the parking corner so `display_frame`
-    /// does not have to call `NSScreen` from the layout thread.
+    /// does not have to call `NSScreen` from the layout thread.  Like
+    /// `work_area` it keeps the last known value while no display is active,
+    /// so parking during display sleep still uses the real corner.
     main_frame: Mutex<Rect>,
     tab_bar: Option<TabBarHandle>,
 }
 
 impl MacPlatform {
-    /// Create the backend and cache the main display's work area.
+    /// Create the backend for the main display's `work_area` and full
+    /// `main_frame`.
     ///
-    /// Must be called on the main thread so `NSScreen.visibleFrame` is
-    /// available.
-    pub fn new() -> Self {
-        let (work_area, main_frame) = main_display_frames_now();
+    /// Both must come from a real display ([`main_display_frames_now`] on the
+    /// main thread); the daemon waits for one at startup instead of inventing
+    /// a rect.
+    pub fn new(work_area: Rect, main_frame: Rect) -> Self {
         let tab_bar = match TabBarHandle::spawn() {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -51,17 +60,19 @@ impl MacPlatform {
         *self.main_frame.lock().expect("main frame poisoned") = main_frame;
     }
 
+    /// The cached `(work_area, main_frame)`: the last real display geometry.
+    pub fn display_frames(&self) -> (Rect, Rect) {
+        (
+            *self.work_area.lock().expect("work area poisoned"),
+            *self.main_frame.lock().expect("main frame poisoned"),
+        )
+    }
+
     fn info(&self, wid: WindowId) -> Option<ToplevelInfo> {
         window::window_info(wid as u32)
             .ok()
             .flatten()
             .map(|info| to_toplevel(&info))
-    }
-}
-
-impl Default for MacPlatform {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -155,6 +166,27 @@ impl PlatformBackend for MacPlatform {
         self.info(wid)
     }
 
+    fn window_presence(&self, wid: WindowId) -> WindowPresence {
+        let wid = wid as u32;
+        // A closed window has no owner any more (CGError 1000), while one moving to a
+        // full-screen Space keeps it even though nothing else can read it.
+        if skylight::window_owner_pid(wid).is_err() {
+            return WindowPresence::Gone;
+        }
+        match skylight::window_spaces(wid) {
+            Ok(spaces) if !spaces.is_empty() => WindowPresence::OnSpace {
+                fullscreen: spaces.iter().any(|space| {
+                    skylight::space_type(*space).ok() == Some(skylight::SPACE_TYPE_FULLSCREEN)
+                }),
+            },
+            Ok(_) => WindowPresence::Detached,
+            Err(error) => {
+                log::debug!("window {wid}: cannot read its Spaces: {error}");
+                WindowPresence::Detached
+            }
+        }
+    }
+
     fn windows(&self) -> Vec<ToplevelInfo> {
         window::list_windows()
             .map(|windows| {
@@ -170,9 +202,33 @@ impl PlatformBackend for MacPlatform {
             })
     }
 
+    fn shell_windows(&self) -> Vec<ToplevelInfo> {
+        // CG data only: shell windows are found by app id, and AX enrichment
+        // would talk to every app with a window at any level.
+        window::list_windows_all_levels()
+            .map(|windows| {
+                windows
+                    .iter()
+                    .map(to_toplevel)
+                    .filter(rules::is_shell_window)
+                    .collect()
+            })
+            .unwrap_or_else(|error| {
+                log::warn!("shell window enumeration failed: {error}");
+                Vec::new()
+            })
+    }
+
     fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()> {
         match &self.tab_bar {
             Some(tab_bar) => tab_bar.update(stack),
+            None => Ok(()),
+        }
+    }
+
+    fn set_drop_hint(&self, hint: Option<DropHint>) -> PlatformResult<()> {
+        match &self.tab_bar {
+            Some(tab_bar) => tab_bar.drop_hint(hint),
             None => Ok(()),
         }
     }
@@ -203,30 +259,118 @@ impl PlatformBackend for MacPlatform {
     }
 }
 
-/// Current main-display work area.  Call on the main thread.
-pub fn main_work_area_now() -> Rect {
-    main_display_frames_now().0
+/// The main display's geometry as enumerated on the main thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayFrames {
+    /// Work area (`NSScreen.visibleFrame`), or the full frame when
+    /// `work_area_known` is false.
+    pub work_area: Rect,
+    /// Full frame, the parking corner.
+    pub frame: Rect,
+    /// Whether `work_area` came from `NSScreen`.  False while AppKit has not
+    /// caught up with a display that CoreGraphics already lists (just woke up).
+    pub work_area_known: bool,
 }
 
-/// Current `(visible_frame, frame)` of the main display: the work area and the
-/// full frame used as the parking corner.  Call on the main thread.
-pub fn main_display_frames_now() -> (Rect, Rect) {
-    if let Ok(display) = display::main_display() {
-        return (
-            from_platform(display.visible_frame),
-            from_platform(display.frame),
-        );
+impl DisplayFrames {
+    /// `(work_area, frame)`.
+    pub fn pair(self) -> (Rect, Rect) {
+        (self.work_area, self.frame)
     }
-    if let Ok(displays) = display::list_displays()
-        && let Some(display) = displays.first()
-    {
-        return (
-            from_platform(display.visible_frame),
-            from_platform(display.frame),
-        );
+}
+
+/// Current main-display work area, or `None` when no display is active.
+/// Call on the main thread.
+pub fn main_work_area_now() -> Option<Rect> {
+    main_display_frames_now().map(|frames| frames.work_area)
+}
+
+/// Current geometry of the main display (the first display if none is
+/// flagged main), or `None` when no display is enumerated: a sleeping display
+/// enumerates as zero displays.  Call on the main thread.
+///
+/// There is deliberately no fallback rect: a daemon that tiles into an
+/// invented area tiles past the real screen edge and learns that edge as an
+/// application size limit.
+pub fn main_display_frames_now() -> Option<DisplayFrames> {
+    let displays = match display::list_displays() {
+        Ok(displays) => displays,
+        Err(error) => {
+            log::debug!("display enumeration failed: {error}");
+            return None;
+        }
+    };
+    let display = displays
+        .iter()
+        .find(|display| display.is_main)
+        .or_else(|| displays.first())?;
+    Some(DisplayFrames {
+        work_area: from_platform(display.visible_frame),
+        frame: from_platform(display.frame),
+        work_area_known: display.visible_frame_known,
+    })
+}
+
+/// How long the startup wait gives `NSScreen` to list a display CoreGraphics
+/// already reports before it settles for the full frame as the work area.
+pub const WORK_AREA_GRACE: Duration = Duration::from_secs(5);
+
+/// Startup: the frames to start with, or `None` to keep waiting.
+///
+/// `active_for` is how long the polls have seen an active display in a row.
+/// No display means wait (there is no timeout).  A display whose work area
+/// `NSScreen` does not know yet is waited for up to [`WORK_AREA_GRACE`], then
+/// accepted with its full frame as the work area rather than blocking a
+/// running session forever.
+pub fn startup_display_frames(
+    enumerated: Option<DisplayFrames>,
+    active_for: Duration,
+) -> Option<DisplayFrames> {
+    let frames = enumerated?;
+    (frames.work_area_known || active_for >= WORK_AREA_GRACE).then_some(frames)
+}
+
+/// What a display-reconfiguration callback should do.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DisplayUpdate {
+    /// Adopt this `work_area` and main display `frame`.
+    Apply {
+        /// New work area.
+        work_area: Rect,
+        /// New main display frame.
+        frame: Rect,
+    },
+    /// No display is enumerated (asleep or disconnected): keep the last
+    /// known geometry.  The callback after wake-up delivers the real one.
+    NoDisplay,
+    /// The display frame is unchanged but `NSScreen` has not caught up with
+    /// its work area: keep the last known work area rather than tile under
+    /// the menu bar.
+    WorkAreaPending,
+    /// Same geometry as before (typically a wake-up): nothing to do.
+    Unchanged,
+}
+
+/// Decide what a display change means, given the last known
+/// `(work_area, frame)` and a fresh [`main_display_frames_now`].
+pub fn next_display_frames(
+    previous: (Rect, Rect),
+    enumerated: Option<DisplayFrames>,
+) -> DisplayUpdate {
+    let Some(frames) = enumerated else {
+        return DisplayUpdate::NoDisplay;
+    };
+    let (previous_work_area, previous_frame) = previous;
+    if !frames.work_area_known && frames.frame == previous_frame {
+        return DisplayUpdate::WorkAreaPending;
     }
-    let fallback = Rect::new(0.0, 0.0, 1920.0, 1080.0);
-    (fallback, fallback)
+    if frames.work_area == previous_work_area && frames.frame == previous_frame {
+        return DisplayUpdate::Unchanged;
+    }
+    DisplayUpdate::Apply {
+        work_area: frames.work_area,
+        frame: frames.frame,
+    }
 }
 
 /// Convert a platform window record into the protocol shape.
@@ -243,7 +387,7 @@ pub fn to_toplevel(info: &WindowInfo) -> ToplevelInfo {
     ToplevelInfo {
         wid: u64::from(info.wid),
         pid: info.pid,
-        app_id: info.bundle_id.clone().unwrap_or_default(),
+        app_id: app_id(info),
         title,
         role: info.role.clone(),
         subrole,
@@ -256,7 +400,25 @@ pub fn to_toplevel(info: &WindowInfo) -> ToplevelInfo {
         // probing every window during enumeration would move them all.
         min_size: None,
         max_size: None,
+        level: info.level,
+        minimized: info.is_minimized,
+        fullscreen: info.is_fullscreen,
     }
+}
+
+/// The bundle identifier, or the application name for an unbundled process.
+///
+/// A bare executable (the panel during development) has no
+/// `bundleIdentifier`; its localized name, or failing that the CoreGraphics
+/// owner name, is the executable name, which is what the shell-window rules
+/// match on.
+fn app_id(info: &WindowInfo) -> String {
+    info.bundle_id
+        .as_deref()
+        .filter(|bundle_id| !bundle_id.is_empty())
+        .or(info.app_name.as_deref())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn from_platform(rect: PlatformRect) -> Rect {
@@ -280,6 +442,113 @@ fn to_platform(rect: Rect) -> PlatformRect {
 mod tests {
     use super::*;
 
+    const FRAME: Rect = Rect::new(0.0, 0.0, 1728.0, 1117.0);
+    const WORK_AREA: Rect = Rect::new(0.0, 25.0, 1728.0, 1092.0);
+
+    fn known(work_area: Rect, frame: Rect) -> DisplayFrames {
+        DisplayFrames {
+            work_area,
+            frame,
+            work_area_known: true,
+        }
+    }
+
+    /// A display CoreGraphics lists before `NSScreen` does.
+    fn pending(frame: Rect) -> DisplayFrames {
+        DisplayFrames {
+            work_area: frame,
+            frame,
+            work_area_known: false,
+        }
+    }
+
+    #[test]
+    fn startup_waits_while_no_display_is_active() {
+        assert_eq!(startup_display_frames(None, Duration::ZERO), None);
+        // There is no timeout: an hour of display sleep still waits.
+        assert_eq!(
+            startup_display_frames(None, Duration::from_secs(3600)),
+            None
+        );
+    }
+
+    #[test]
+    fn startup_takes_a_known_work_area_at_once() {
+        let frames = known(WORK_AREA, FRAME);
+        assert_eq!(
+            startup_display_frames(Some(frames), Duration::ZERO),
+            Some(frames)
+        );
+    }
+
+    #[test]
+    fn startup_gives_nsscreen_a_grace_period_then_takes_the_full_frame() {
+        let frames = pending(FRAME);
+        assert_eq!(startup_display_frames(Some(frames), Duration::ZERO), None);
+        assert_eq!(
+            startup_display_frames(Some(frames), WORK_AREA_GRACE - Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            startup_display_frames(Some(frames), WORK_AREA_GRACE),
+            Some(frames)
+        );
+    }
+
+    #[test]
+    fn a_display_change_without_a_display_keeps_the_last_area() {
+        // The VM display fell asleep: the callback must not re-tile into an
+        // invented area over the menu bar.
+        assert_eq!(
+            next_display_frames((WORK_AREA, FRAME), None),
+            DisplayUpdate::NoDisplay
+        );
+    }
+
+    #[test]
+    fn waking_up_with_the_same_geometry_changes_nothing() {
+        assert_eq!(
+            next_display_frames((WORK_AREA, FRAME), Some(known(WORK_AREA, FRAME))),
+            DisplayUpdate::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_real_display_change_applies_the_new_area() {
+        let frame = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let work_area = Rect::new(0.0, 25.0, 1920.0, 1055.0);
+        assert_eq!(
+            next_display_frames((WORK_AREA, FRAME), Some(known(work_area, frame))),
+            DisplayUpdate::Apply { work_area, frame }
+        );
+        // The Dock grew: same frame, smaller work area.
+        let docked = Rect::new(0.0, 25.0, 1728.0, 1000.0);
+        assert_eq!(
+            next_display_frames((WORK_AREA, FRAME), Some(known(docked, FRAME))),
+            DisplayUpdate::Apply {
+                work_area: docked,
+                frame: FRAME
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_work_area_keeps_the_last_one_for_the_same_frame() {
+        assert_eq!(
+            next_display_frames((WORK_AREA, FRAME), Some(pending(FRAME))),
+            DisplayUpdate::WorkAreaPending
+        );
+        // A new resolution: the full frame beats a work area for the old size.
+        let frame = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(
+            next_display_frames((WORK_AREA, FRAME), Some(pending(frame))),
+            DisplayUpdate::Apply {
+                work_area: frame,
+                frame
+            }
+        );
+    }
+
     #[test]
     fn rect_conversion_round_trips() {
         let rect = Rect::new(1.5, 2.5, 300.0, 200.0);
@@ -302,6 +571,7 @@ mod tests {
             is_dialog: false,
             is_floating: false,
             is_minimized: false,
+            is_fullscreen: false,
             ax_backed: true,
         };
         assert!(to_toplevel(&info).is_dialog);
@@ -315,5 +585,71 @@ mod tests {
 
         info.subrole = Some("AXStandardWindow".into());
         assert!(!to_toplevel(&info).is_dialog);
+    }
+
+    fn platform_window() -> WindowInfo {
+        WindowInfo {
+            wid: 1,
+            pid: 2,
+            bundle_id: Some("com.example.app".into()),
+            app_name: Some("Example".into()),
+            title: Some("Document".into()),
+            role: Some("AXWindow".into()),
+            subrole: Some("AXStandardWindow".into()),
+            frame: PlatformRect::new(0.0, 0.0, 800.0, 600.0),
+            level: 0,
+            resizable: true,
+            is_dialog: false,
+            is_floating: false,
+            is_minimized: false,
+            is_fullscreen: false,
+            ax_backed: true,
+        }
+    }
+
+    #[test]
+    fn app_id_falls_back_to_the_app_name_without_a_bundle() {
+        let mut info = platform_window();
+        assert_eq!(to_toplevel(&info).app_id, "com.example.app");
+
+        // A bare executable has no bundle identifier.
+        info.bundle_id = None;
+        info.app_name = Some("cosmic-mac-panel".into());
+        let toplevel = to_toplevel(&info);
+        assert_eq!(toplevel.app_id, "cosmic-mac-panel");
+        assert!(rules::is_shell_window(&toplevel));
+
+        info.bundle_id = Some(String::new());
+        assert_eq!(to_toplevel(&info).app_id, "cosmic-mac-panel");
+
+        info.app_name = None;
+        assert_eq!(to_toplevel(&info).app_id, "");
+    }
+
+    #[test]
+    fn level_and_minimized_reach_the_admission_filter() {
+        let mut info = platform_window();
+        let toplevel = to_toplevel(&info);
+        assert_eq!((toplevel.level, toplevel.minimized), (0, false));
+        assert!(rules::is_manageable(&toplevel));
+
+        // Spotlight and launcher panels sit above the normal level.
+        info.level = 25;
+        let toplevel = to_toplevel(&info);
+        assert_eq!(toplevel.level, 25);
+        assert!(!rules::is_manageable(&toplevel));
+
+        info.level = 0;
+        info.is_minimized = true;
+        let toplevel = to_toplevel(&info);
+        assert!(toplevel.minimized);
+        assert!(!rules::is_manageable(&toplevel));
+
+        // A window in native full screen fills its own Space.
+        info.is_minimized = false;
+        info.is_fullscreen = true;
+        let toplevel = to_toplevel(&info);
+        assert!(toplevel.fullscreen);
+        assert!(!rules::is_manageable(&toplevel));
     }
 }

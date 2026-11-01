@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use cosmic_mac_protocol::{Command, Rect, StackInfo, WindowId};
 
-use crate::backend::{AppliedFrame, PlatformBackend, PlatformResult};
-use crate::journal::Journal;
+use crate::backend::{AppliedFrame, PlatformBackend, PlatformResult, is_parked_frame};
+use crate::journal::{Journal, owner_pid};
 
 /// How long after a programmatic move we ignore platform move notifications.
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -124,7 +124,7 @@ impl CommandApplier {
             Command::SetFrame { wid, rect } => {
                 // The journal must be on disk before the first frame is
                 // touched, no matter what the platform answers.
-                self.record_original(*wid);
+                self.record_original(*wid, Some(*rect));
                 // Mark the window in flight before the first AX call: the
                 // move's notifications start while `set_frame` is still
                 // reading the frame back, and a failed call can still have
@@ -170,7 +170,7 @@ impl CommandApplier {
     fn hide(&mut self, wid: WindowId) -> PlatformResult<()> {
         // Record before the first park: the journal must be on disk before the
         // window is moved off its original frame.
-        self.record_original(wid);
+        self.record_original(wid, None);
         if !self.visible.remove(&wid) && self.backend.saved_frame(wid).is_some() {
             // Already parked; nothing to do.
             return Ok(());
@@ -195,19 +195,8 @@ impl CommandApplier {
     /// Returns the clamp when the app refused this frame too, so the layout
     /// owner can learn from it.
     pub fn reapply_frame(&mut self, wid: WindowId, rect: Rect) -> Option<ClampNotice> {
-        // In flight before the first AX call, as in `apply_one`.
-        self.mark_programmed(wid, rect);
-        match self.backend.set_frame(wid, rect) {
-            Ok(outcome) => {
-                self.mark_programmed(wid, outcome.applied);
-                (outcome.clamped && outcome.size_differs(AppliedFrame::TOLERANCE)).then_some(
-                    ClampNotice {
-                        wid,
-                        requested: rect,
-                        applied: outcome.applied,
-                    },
-                )
-            }
+        match self.try_reapply_frame(wid, rect) {
+            Ok(clamp) => clamp,
             Err(error) => {
                 log::warn!("snapping window {wid} back failed: {error}");
                 None
@@ -215,18 +204,111 @@ impl CommandApplier {
         }
     }
 
-    /// Record the window's current frame in the journal unless it is already
-    /// there.  Called before the first `SetFrame`/`Hide` for a window.
-    pub fn record_original(&mut self, wid: WindowId) {
+    /// [`CommandApplier::reapply_frame`], reporting a failed call to the caller, which
+    /// may retry it later (a window on an inactive Space cannot be moved through
+    /// Accessibility).  This always sends the frame: the layout's command diff only
+    /// emits frames that changed in the layout, not frames the window drifted away from.
+    pub fn try_reapply_frame(
+        &mut self,
+        wid: WindowId,
+        rect: Rect,
+    ) -> PlatformResult<Option<ClampNotice>> {
+        // In flight before the first AX call, as in `apply_one`.
+        self.mark_programmed(wid, rect);
+        let outcome = self.backend.set_frame(wid, rect)?;
+        self.mark_programmed(wid, outcome.applied);
+        Ok(
+            (outcome.clamped && outcome.size_differs(AppliedFrame::TOLERANCE)).then_some(
+                ClampNotice {
+                    wid,
+                    requested: rect,
+                    applied: outcome.applied,
+                },
+            ),
+        )
+    }
+
+    /// Park a window that should be parked again, after something moved it out of the
+    /// corner (an application that re-positions its windows across a Space change).
+    ///
+    /// Unlike [`Command::Hide`] this moves the window even when the backend already holds
+    /// its saved frame; the saved frame is kept, so the window still comes back to it.
+    pub fn repark(&mut self, wid: WindowId) -> PlatformResult<()> {
+        self.record_original(wid, None);
+        self.visible.remove(&wid);
+        let display = self.backend.display_frame(wid);
+        self.backend.park(wid, display)?;
+        Ok(())
+    }
+
+    /// Record the window's original frame in the journal unless it already
+    /// has one.  Called before every `SetFrame` (with the frame the layout is
+    /// about to apply as `placement`) and `Hide` (no placement).
+    ///
+    /// - An existing entry wins.  Besides our own earlier record, that is an
+    ///   entry a crashed run left behind whose replay failed: the daemon opens
+    ///   the journal [`crate::journal::restore_stale`] wrote back, and such a
+    ///   window may still sit at the park corner.  An inherited entry is
+    ///   checked once, on the first touch: if the window now belongs to
+    ///   another process (a reused id, see [`Journal::owner_changed`]), the
+    ///   entry is dropped and the window recorded afresh.
+    /// - Otherwise the window's current frame is recorded with its owner pid,
+    ///   unless it is at the park corner ([`is_parked_frame`]): a crashed run
+    ///   parked it there (or its app reopened it there).  The corner is never
+    ///   recorded, since shutdown would restore the window to it and park it
+    ///   for good.  The layout's `placement` is recorded instead, so shutdown
+    ///   leaves the window on screen; without one (`Hide`) nothing is
+    ///   recorded and the next `SetFrame` records its tile.
+    pub fn record_original(&mut self, wid: WindowId, placement: Option<Rect>) {
         if self.journal.contains(wid) {
+            if !self.journal.is_inherited(wid) {
+                return;
+            }
+            match self.journal.owner_changed(wid, self.backend.as_ref()) {
+                Some((recorded, current)) => {
+                    log::info!(
+                        "window {wid} now belongs to pid {current}, not {recorded}; dropping its \
+                         saved frame"
+                    );
+                    self.journal.remove(wid);
+                }
+                None => {
+                    self.journal.adopt(wid);
+                    return;
+                }
+            }
+        }
+        let Some(frame) = self.backend.frame(wid) else {
+            return;
+        };
+        let pid = owner_pid(self.backend.as_ref(), wid);
+        let display = self.backend.display_frame(wid);
+        if !is_parked_frame(frame, display) {
+            self.journal.record(wid, frame, pid);
             return;
         }
-        if let Some(frame) = self.backend.frame(wid) {
-            self.journal.record(wid, frame);
+        match placement.filter(|placement| !is_parked_frame(*placement, display)) {
+            Some(placement) => {
+                log::warn!(
+                    "window {wid} is at the park corner {frame:?} with no saved frame (parked by \
+                     a crashed run?); journaling its layout frame {placement:?} as the original"
+                );
+                self.journal.record(wid, placement, pid);
+            }
+            None => log::warn!(
+                "window {wid} is at the park corner {frame:?} with no saved frame; not \
+                 journaling the corner as its original"
+            ),
         }
     }
 
     /// Remember a frame we just programmed.
+    /// The frame we last programmed for `wid`, as the application applied it
+    /// (a grid-snapping app reports its snapped size here, not the request).
+    pub fn programmed_frame(&self, wid: WindowId) -> Option<Rect> {
+        self.programmed.get(&wid).map(|programmed| programmed.rect)
+    }
+
     pub fn mark_programmed(&mut self, wid: WindowId, rect: Rect) {
         self.programmed.insert(
             wid,
@@ -289,6 +371,27 @@ impl CommandApplier {
         self.programmed.remove(&wid);
     }
 
+    /// Stop driving a window that stays open but leaves the layout for a
+    /// while (minimized, hidden with its application, or in native full
+    /// screen).
+    ///
+    /// Unlike [`CommandApplier::forget_window`] the journal entry is **kept**:
+    /// the daemon moved the window off its original frame, so a shutdown, an
+    /// emergency restore or a crash replay must still put it back there.  A
+    /// parked window is not unparked (it is invisible anyway); its park record
+    /// is dropped without moving it.  Kept, the record would make the next
+    /// `Show` restore a frame from a layout that no longer holds the window,
+    /// and a later park would keep that stale frame as the one to return to.
+    /// When the window comes back it is framed like a newly added window, and
+    /// until then the journal restores it, from the park corner if need be.
+    pub fn release_window(&mut self, wid: WindowId) {
+        self.visible.remove(&wid);
+        self.programmed.remove(&wid);
+        if self.backend.saved_frame(wid).is_some() {
+            self.backend.forget(wid);
+        }
+    }
+
     /// Update the tab bar, only calling the backend when something changed.
     pub fn sync_stack_bar(&mut self, stack: Option<StackInfo>) -> PlatformResult<()> {
         if self.stack_initialised && self.last_stack == stack {
@@ -306,13 +409,15 @@ impl CommandApplier {
         self.backend.set_stack_bar(stack)
     }
 
-    /// Restore every frame the daemon ever changed and remove the journal.
+    /// Restore every frame the daemon ever changed.
     ///
+    /// The journal file is removed once every entry is restored; entries that
+    /// fail stay in it, so a later restore or the next start retries them.
     /// Returns the number of restored windows.
     pub fn restore_all(&mut self) -> usize {
         let (restored, errors) = self.journal.restore(self.backend.as_ref());
         for (wid, error) in errors {
-            log::warn!("restore: window {wid}: {error}");
+            log::warn!("restore: window {wid}: {error}; keeping its saved frame in the journal");
         }
         for (wid, _) in self.backend.parked() {
             self.backend.forget(wid);
@@ -351,6 +456,9 @@ mod tests {
 
     use crate::backend::SizeConstraints;
 
+    /// Where parking leaves a 300×200 window on the mock's 1920×1080 display.
+    const PARKED: Rect = Rect::new(1919.0, 1079.0, 300.0, 200.0);
+
     #[derive(Debug, Clone, PartialEq)]
     enum Call {
         SetFrame(WindowId, Rect),
@@ -375,6 +483,13 @@ mod tests {
         min_sizes: HashMap<WindowId, Size>,
         /// When set, `set_frame` fails (after the AX call would have started).
         fail_set_frame: bool,
+        /// Owner pids that differ from [`owner`].
+        owners: HashMap<WindowId, i32>,
+    }
+
+    /// Default owner pid of a test window.
+    fn owner(wid: WindowId) -> i32 {
+        1000 + wid as i32
     }
 
     struct MockBackend {
@@ -392,6 +507,7 @@ mod tests {
                     display: Rect::new(0.0, 0.0, 1920.0, 1080.0),
                     min_sizes: HashMap::new(),
                     fail_set_frame: false,
+                    owners: HashMap::new(),
                 }),
             }
         }
@@ -491,9 +607,14 @@ mod tests {
             self.state.lock().unwrap().frames.get(&wid).copied()
         }
         fn window_info(&self, wid: WindowId) -> Option<ToplevelInfo> {
-            self.frame(wid).map(|frame| {
-                ToplevelInfo::new(wid, "com.example.app", "title").with_initial_frame(frame)
-            })
+            let state = self.state.lock().unwrap();
+            let frame = state.frames.get(&wid).copied()?;
+            let pid = state.owners.get(&wid).copied().unwrap_or(owner(wid));
+            Some(
+                ToplevelInfo::new(wid, "com.example.app", "title")
+                    .with_pid(pid)
+                    .with_initial_frame(frame),
+            )
         }
         fn windows(&self) -> Vec<ToplevelInfo> {
             let frames = self.frames();
@@ -604,6 +725,36 @@ mod tests {
         applier.apply(&[Command::Show { wid: 1 }]);
         assert!(applier.is_visible(1));
         assert_eq!(backend.saved_frame(1), None);
+    }
+
+    #[test]
+    fn releasing_a_window_keeps_its_journal_entry_and_drops_the_park_record() {
+        let original = Rect::new(10.0, 20.0, 300.0, 200.0);
+        let tile = Rect::new(0.0, 0.0, 500.0, 400.0);
+        let (mut applier, backend, _dir) = applier(&[(1, original), (2, original)]);
+        applier.apply(&[
+            Command::SetFrame { wid: 1, rect: tile },
+            Command::SetFrame { wid: 2, rect: tile },
+            Command::Hide { wid: 2 },
+        ]);
+        assert!(applier.is_visible(1));
+        assert_eq!(backend.saved_frame(2), Some(tile));
+        let marker = backend.calls().len();
+
+        applier.release_window(1);
+        applier.release_window(2);
+
+        // Nothing is moved: a parked window stays at the corner.
+        assert_eq!(backend.calls()[marker..], [Call::Forget(2)]);
+        assert!(!applier.is_visible(1));
+        assert!(!applier.is_visible(2));
+        assert_eq!(backend.saved_frame(2), None);
+        // No longer in flight: its frames are not echoes any more.
+        applier.set_debounce(Duration::ZERO);
+        assert!(!applier.is_echo(1, tile));
+        // The original frames survive for shutdown and crash replay.
+        assert_eq!(applier.journal().get(1), Some(original));
+        assert_eq!(applier.journal().get(2), Some(original));
     }
 
     #[test]
@@ -750,6 +901,136 @@ mod tests {
         assert!(applier.journal().contains(1));
         applier.forget_window(1);
         assert!(!applier.journal().contains(1));
+    }
+
+    #[test]
+    fn restore_all_keeps_failed_entries_for_a_later_restore() {
+        let original = Rect::new(10.0, 20.0, 300.0, 200.0);
+        let (mut applier, backend, _dir) = applier(&[(1, original)]);
+        applier.apply(&[Command::SetFrame {
+            wid: 1,
+            rect: Rect::new(0.0, 0.0, 500.0, 400.0),
+        }]);
+        let journal_path = applier.journal().path().to_path_buf();
+
+        backend.state.lock().unwrap().fail_set_frame = true;
+        assert_eq!(applier.restore_all(), 0);
+        assert_eq!(applier.journal().get(1), Some(original));
+        assert_eq!(Journal::load(&journal_path).unwrap().get(1), Some(original));
+
+        backend.state.lock().unwrap().fail_set_frame = false;
+        assert_eq!(applier.restore_all(), 1);
+        assert_eq!(backend.frames().get(&1), Some(&original));
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn a_surviving_stale_entry_is_preferred_over_the_current_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame-journal.ron");
+        let original = Rect::new(10.0, 20.0, 300.0, 200.0);
+        let legacy = Rect::new(40.0, 50.0, 300.0, 200.0);
+        // A crashed run parked windows 1 and 2 and the replay of their entries
+        // failed: the entries survived and the windows are still at the
+        // corner.  Window 2's entry predates the owner pid.
+        let mut stale = Journal::new(&path);
+        stale.record(1, original, Some(owner(1)));
+        stale.record(2, legacy, None);
+        let work_area = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let backend = Arc::new(MockBackend::new(&[(1, PARKED), (2, PARKED)], work_area));
+        let mut applier = CommandApplier::new(backend.clone(), Journal::open(&path), work_area);
+        assert!(applier.journal().is_inherited(1));
+
+        applier.apply(&[
+            Command::SetFrame {
+                wid: 1,
+                rect: Rect::new(0.0, 0.0, 500.0, 400.0),
+            },
+            Command::SetFrame {
+                wid: 2,
+                rect: Rect::new(500.0, 0.0, 500.0, 400.0),
+            },
+        ]);
+
+        assert_eq!(applier.journal().get(1), Some(original));
+        assert_eq!(
+            applier.journal().get(2),
+            Some(legacy),
+            "a missing pid is accepted"
+        );
+        assert!(
+            !applier.journal().is_inherited(1),
+            "checked once, then adopted"
+        );
+        assert_eq!(Journal::load(&path).unwrap().get(1), Some(original));
+        // Shutdown puts the windows back where they were before the crashed run.
+        assert_eq!(applier.restore_all(), 2);
+        assert_eq!(backend.frames().get(&1), Some(&original));
+        assert_eq!(backend.frames().get(&2), Some(&legacy));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_stale_entry_of_another_process_is_replaced_by_the_current_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame-journal.ron");
+        // Left by a run before a reboot; id 1 now names another app's window.
+        Journal::new(&path).record(1, Rect::new(10.0, 20.0, 300.0, 200.0), Some(999));
+        let current = Rect::new(200.0, 100.0, 640.0, 480.0);
+        let work_area = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let backend = Arc::new(MockBackend::new(&[(1, current)], work_area));
+        let mut applier = CommandApplier::new(backend.clone(), Journal::open(&path), work_area);
+
+        applier.apply(&[Command::SetFrame {
+            wid: 1,
+            rect: Rect::new(0.0, 0.0, 500.0, 400.0),
+        }]);
+
+        assert_eq!(applier.journal().get(1), Some(current));
+        assert_eq!(applier.journal().pid(1), Some(owner(1)));
+        let saved = Journal::load(&path).unwrap();
+        assert_eq!(
+            (saved.get(1), saved.pid(1)),
+            (Some(current), Some(owner(1)))
+        );
+        assert_eq!(applier.restore_all(), 1);
+        assert_eq!(backend.frames().get(&1), Some(&current));
+    }
+
+    #[test]
+    fn a_window_at_the_park_corner_journals_its_layout_frame_instead() {
+        let (mut applier, backend, _dir) = applier(&[(1, PARKED)]);
+        let tile = Rect::new(0.0, 0.0, 500.0, 400.0);
+        applier.apply(&[Command::SetFrame { wid: 1, rect: tile }]);
+        assert_eq!(applier.journal().get(1), Some(tile));
+
+        applier.apply(&[Command::SetFrame {
+            wid: 1,
+            rect: Rect::new(500.0, 0.0, 500.0, 400.0),
+        }]);
+        // Shutdown leaves the window on screen instead of parking it for good.
+        assert_eq!(applier.restore_all(), 1);
+        assert_eq!(backend.frames().get(&1), Some(&tile));
+    }
+
+    #[test]
+    fn hiding_a_window_at_the_park_corner_does_not_journal_the_corner() {
+        let (mut applier, _backend, _dir) = applier(&[(1, PARKED)]);
+        applier.apply(&[Command::Hide { wid: 1 }]);
+        assert!(!applier.journal().contains(1));
+        // A placement at the corner is no better than the current frame.
+        applier.apply(&[Command::SetFrame {
+            wid: 1,
+            rect: PARKED,
+        }]);
+        assert!(!applier.journal().contains(1));
+
+        let tile = Rect::new(0.0, 0.0, 500.0, 400.0);
+        applier.apply(&[
+            Command::Show { wid: 1 },
+            Command::SetFrame { wid: 1, rect: tile },
+        ]);
+        assert_eq!(applier.journal().get(1), Some(tile));
     }
 
     #[test]

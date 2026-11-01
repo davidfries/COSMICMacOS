@@ -27,10 +27,14 @@
 //! 5. When even the sum of the minima does not fit, the minima are ignored for that group and
 //!    the space is divided by weight.  The application will still clamp its window, but the
 //!    layout never emits overlapping rectangles.
+//! 6. A stack reserves the top [`STACK_BAR_HEIGHT`] of its tile for the tab bar overlay.  Its
+//!    members are clamped and centred in the rest of the tile, so the bar never covers a window.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cosmic_mac_protocol::{Gaps, Orientation, Rect, Size, ToplevelInfo, WindowId};
+use cosmic_mac_protocol::{
+    Gaps, Orientation, Rect, STACK_BAR_HEIGHT, Size, ToplevelInfo, WindowId,
+};
 
 use crate::tree::{NodeId, NodeKind, Tree};
 
@@ -237,6 +241,12 @@ fn clamp_leaf(rect: Rect, limits: WindowLimits) -> Rect {
     Rect::new(snap(x), snap(y), snap(width), snap(height))
 }
 
+/// `rect` without the strip the stack tab bar occupies at its top (never below zero height).
+pub(crate) fn below_stack_bar(rect: Rect) -> Rect {
+    let bar = STACK_BAR_HEIGHT.min(rect.height.max(0.0));
+    Rect::new(rect.x, rect.y + bar, rect.width, rect.height - bar)
+}
+
 fn walk(
     tree: &Tree,
     id: NodeId,
@@ -294,10 +304,12 @@ fn walk(
             out.frames.insert(*wid, frame);
         }
         NodeKind::Stack(stack) => {
+            // The tab bar occupies the top strip of the tile; the members sit below it.
+            let below_bar = below_stack_bar(rect);
             let frame = stack
                 .active_window()
-                .map(|wid| clamp_leaf(rect, limits_for(wid, infos)))
-                .unwrap_or(rect);
+                .map(|wid| clamp_leaf(below_bar, limits_for(wid, infos)))
+                .unwrap_or(below_bar);
             out.stacks.insert(id, frame);
             for (index, wid) in stack.windows.iter().enumerate() {
                 if index == stack.active {
