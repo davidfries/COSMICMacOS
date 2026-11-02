@@ -489,12 +489,13 @@ fn key_handler(
 /// nothing below the bar.  Every other press passes, as does any press
 /// while the daemon is gone or the window-server checks fail.
 fn click_handler(click_tx: mpsc::UnboundedSender<Message>, bars: SharedBars) -> ClickHandler {
-    Box::new(move |point| {
+    Box::new(move |press| {
         let started = Instant::now();
+        let point = press.location;
         let mut checked = None;
         let click = {
             let bars = bars.read().unwrap_or_else(|error| error.into_inner());
-            tabs::claim(&bars, point.x, point.y, |overlay| {
+            tabs::claim(&bars, point.x, point.y, press.click_count, |overlay| {
                 let topmost = window::overlay_is_topmost_at(overlay, point);
                 checked = Some((overlay, topmost));
                 topmost
@@ -503,10 +504,11 @@ fn click_handler(click_tx: mpsc::UnboundedSender<Message>, bars: SharedBars) -> 
         let swallow = click.is_some_and(|click| click_tx.send(Message::BarClick(click)).is_ok());
         if let Some((overlay, topmost)) = checked {
             log::debug!(
-                "press at ({:.0}, {:.0}) on bar {overlay}: topmost {topmost}, swallowed \
-                 {swallow} ({:?})",
+                "press at ({:.0}, {:.0}) (click {}) on bar {overlay}: topmost {topmost}, \
+                 swallowed {swallow} ({:?})",
                 point.x,
                 point.y,
+                press.click_count,
                 started.elapsed()
             );
         }

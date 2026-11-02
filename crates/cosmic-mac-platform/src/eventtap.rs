@@ -472,11 +472,21 @@ impl Drop for MouseTap {
     }
 }
 
-/// Callback for [`ClickTap`]: called with the location (global top-left) of
-/// every left press; `true` swallows the press and its release.  Runs on the
-/// tap's run-loop thread and delays every click while it runs, so keep it
-/// fast and never block.
-pub type ClickHandler = Box<dyn Fn(Point) -> bool + Send + 'static>;
+/// A left press seen by [`ClickTap`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClickEvent {
+    /// Pointer location in global top-left coordinates (the AX space).
+    pub location: Point,
+    /// The press's place in a run of clicks (`kCGMouseEventClickState`): 1
+    /// for a single click, 2 for the second press of a double click, and so
+    /// on; 0 when the event does not set it (some synthetic events).
+    pub click_count: u32,
+}
+
+/// Callback for [`ClickTap`]: called with every left press; `true` swallows
+/// the press and its release.  Runs on the tap's run-loop thread and delays
+/// every click while it runs, so keep it fast and never block.
+pub type ClickHandler = Box<dyn Fn(ClickEvent) -> bool + Send + 'static>;
 
 struct ClickContext {
     handler: ClickHandler,
@@ -505,11 +515,21 @@ unsafe extern "C-unwind" fn click_callback(
         CGEventType::LeftMouseDown => {
             // SAFETY: valid event reference.
             let location = unsafe { CGEvent::location(Some(event.as_ref())) };
-            let point = Point::new(location.x, location.y);
+            // SAFETY: valid event reference.
+            let click_state = unsafe {
+                CGEvent::integer_value_field(
+                    Some(event.as_ref()),
+                    CGEventField::MouseEventClickState,
+                )
+            };
+            let press = ClickEvent {
+                location: Point::new(location.x, location.y),
+                click_count: u32::try_from(click_state).unwrap_or(0),
+            };
             // A panic must not unwind into CoreGraphics; the press passes then.
             let handler = &context.handler;
             context.swallow_up =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(point)))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(press)))
                     .unwrap_or(false);
             if context.swallow_up {
                 std::ptr::null_mut()
@@ -609,6 +629,17 @@ impl Drop for ClickTap {
 /// (`send-key --drag`); needs the Accessibility grant like every posted
 /// event.
 pub fn post_left_mouse(kind: MouseEventKind, location: Point) -> Result<()> {
+    post_left_mouse_event(kind, location, None)
+}
+
+/// [`post_left_mouse`] with the event's click count
+/// (`kCGMouseEventClickState`) set: 2 for both events of a double click's
+/// second press.
+pub fn post_left_mouse_clicks(kind: MouseEventKind, location: Point, count: u32) -> Result<()> {
+    post_left_mouse_event(kind, location, Some(count))
+}
+
+fn post_left_mouse_event(kind: MouseEventKind, location: Point, count: Option<u32>) -> Result<()> {
     let event_type = match kind {
         MouseEventKind::Down => CGEventType::LeftMouseDown,
         MouseEventKind::Dragged => CGEventType::LeftMouseDragged,
@@ -621,6 +652,13 @@ pub fn post_left_mouse(kind: MouseEventKind, location: Point) -> Result<()> {
         objc2_core_graphics::CGMouseButton::Left,
     )
     .ok_or_else(|| PlatformError::Other("CGEventCreateMouseEvent failed".into()))?;
+    if let Some(count) = count {
+        CGEvent::set_integer_value_field(
+            Some(&event),
+            CGEventField::MouseEventClickState,
+            i64::from(count),
+        );
+    }
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
     Ok(())
 }

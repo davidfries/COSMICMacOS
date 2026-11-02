@@ -533,14 +533,50 @@ impl Layout {
             self.emitted.forget(wid);
             return self.sync();
         };
+        // A maximized stack member hands the maximize to the stack's new active tab.
+        let others = if self.workspaces[index]
+            .maximized
+            .is_some_and(|max| max.wid == wid)
+        {
+            self.workspaces[index]
+                .tree
+                .stack_containing(wid)
+                .and_then(|(stack_id, _)| self.workspaces[index].tree.stack(stack_id))
+                .map(|stack| stack.windows.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.remove_window_from(index, wid);
         self.infos.remove(&wid);
         self.emitted.forget(wid);
         let workspace = &mut self.workspaces[index];
+        let was_focused = workspace.focus == Some(wid);
+        let mut heir = None;
         if workspace.maximized.is_some_and(|max| max.wid == wid) {
             workspace.maximized = None;
+            // One remaining member collapses the stack into a plain window leaf, so look the
+            // survivor up by window rather than by stack node.
+            let survivor = others
+                .into_iter()
+                .find(|other| *other != wid)
+                .and_then(|other| match workspace.tree.stack_containing(other) {
+                    Some((stack_id, _)) => workspace
+                        .tree
+                        .stack(stack_id)
+                        .and_then(|stack| stack.active_window()),
+                    None => workspace.tree.node_for_window(other).map(|_| other),
+                });
+            if let Some(wid) = survivor {
+                workspace.maximized = Some(Maximized { wid, restore: None });
+                heir = Some(wid);
+            }
         }
         workspace.cleanup_focus(wid);
+        // Focus stays on the maximized stack rather than going to a window it covers.
+        if was_focused && let Some(heir) = heir {
+            workspace.set_focus(heir);
+        }
         self.trim_workspaces();
         self.sync()
     }

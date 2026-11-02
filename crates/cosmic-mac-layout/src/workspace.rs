@@ -14,6 +14,9 @@ pub(crate) struct FloatingWindow {
 
 /// Maximize state.  `restore` is set for floating windows so unmaximizing returns them to
 /// their floating frame; tiled windows are recomputed from the tree instead.
+///
+/// A stack is one maximizable element (as in cosmic-comp): `wid` follows the stack's active
+/// tab, so switching tabs keeps the whole stack maximized.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Maximized {
     pub wid: WindowId,
@@ -32,6 +35,7 @@ pub(crate) struct Workspace {
     pub cycle: usize,
     /// Workspace-wide tiling flag (`ToggleTiling`).
     pub tiling_enabled: bool,
+    /// Maximized window.  When it lives in a stack this follows the stack's active tab.
     pub maximized: Option<Maximized>,
     /// Counter used to cascade floating windows.
     pub cascade: u32,
@@ -83,15 +87,31 @@ impl Workspace {
             .or_else(|| self.floating.first().map(|floating| floating.wid))
     }
 
+    /// Make `wid` the active tab of its stack (if it is in one).  A maximized member of that
+    /// stack hands the maximize over to `wid`, so the stack stays maximized.
+    fn activate_stack_tab(&mut self, wid: WindowId) {
+        let Some((stack_id, index)) = self.tree.stack_containing(wid) else {
+            return;
+        };
+        self.tree.set_stack_active(stack_id, index);
+        if let Some(maximized) = &mut self.maximized
+            && maximized.wid != wid
+            && self
+                .tree
+                .stack(stack_id)
+                .is_some_and(|stack| stack.position(maximized.wid).is_some())
+        {
+            maximized.wid = wid;
+        }
+    }
+
     /// Focus `wid`, making it the active stack member when it lives in a stack.
     pub fn set_focus(&mut self, wid: WindowId) {
         self.focus = Some(wid);
         self.focus_stack.retain(|entry| *entry != wid);
         self.focus_stack.insert(0, wid);
         self.cycle = 0;
-        if let Some((stack_id, index)) = self.tree.stack_containing(wid) {
-            self.tree.set_stack_active(stack_id, index);
-        }
+        self.activate_stack_tab(wid);
     }
 
     /// Cycle through the focus history.  Unlike [`Workspace::set_focus`] this does not reorder
@@ -108,9 +128,7 @@ impl Workspace {
         };
         let wid = self.focus_stack[self.cycle];
         self.focus = Some(wid);
-        if let Some((stack_id, index)) = self.tree.stack_containing(wid) {
-            self.tree.set_stack_active(stack_id, index);
-        }
+        self.activate_stack_tab(wid);
         Some(wid)
     }
 
@@ -137,8 +155,8 @@ impl Workspace {
         if let Some(focus) = self.focus {
             if !self.contains(focus) {
                 self.focus = None;
-            } else if let Some((stack_id, index)) = self.tree.stack_containing(focus) {
-                self.tree.set_stack_active(stack_id, index);
+            } else {
+                self.activate_stack_tab(focus);
             }
         }
         if self.focus.is_none()
