@@ -103,7 +103,7 @@ pub fn hit_test(bar: Rect, count: usize, x: f64, y: f64) -> Option<BarHit> {
 }
 
 /// A bar the tab-bar thread shows.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShownBar {
     /// Its overlay window (`CGWindowID`).
     pub overlay: u32,
@@ -111,14 +111,16 @@ pub struct ShownBar {
     pub frame: Rect,
     /// The stack's active tab when the bar was drawn; names the stack.
     pub stack: WindowId,
+    /// The windows of the tabs it was drawn with, in order.
+    pub tabs: Vec<WindowId>,
 }
 
 /// The bars on screen, written by the tab-bar thread and read by the click tap.
 pub type SharedBars = Arc<RwLock<Vec<ShownBar>>>;
 
 /// A press in a shown bar, for the core.  The core hit-tests it against the
-/// current layout, not against what the bar showed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// tabs the bar was drawn with ([`BarClick::tabs`]), the ones the user saw.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BarClick {
     /// Pointer location (global, top-left origin).
     pub x: f64,
@@ -126,6 +128,8 @@ pub struct BarClick {
     pub y: f64,
     /// A window of the stack whose bar was pressed ([`ShownBar::stack`]).
     pub stack: WindowId,
+    /// The windows of the tabs the bar was drawn with ([`ShownBar::tabs`]).
+    pub tabs: Vec<WindowId>,
 }
 
 /// The click for a press at `(x, y)`, when it lands in one of `bars` and that
@@ -143,6 +147,7 @@ pub fn claim(
         x,
         y,
         stack: bar.stack,
+        tabs: bar.tabs.clone(),
     })
 }
 
@@ -264,6 +269,7 @@ mod tests {
             overlay,
             frame,
             stack,
+            tabs: vec![stack, stack + 1],
         }
     }
 
@@ -281,7 +287,8 @@ mod tests {
             Some(BarClick {
                 x: 1300.0,
                 y: 30.0,
-                stack: 22
+                stack: 22,
+                tabs: vec![22, 23]
             })
         );
         assert_eq!(asked, Some(8));

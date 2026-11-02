@@ -115,9 +115,10 @@
 //! window's stack while one is maximized; none while a native full-screen
 //! Space is active).  A press in a bar is taken by the click tap before any
 //! application sees it and reaches [`Core::bar_click`], which hit-tests it
-//! against the current layout ([`tabs::hit_test`]): a tab focuses its
-//! window, which makes it the active tab; the close glyph closes the tab's
-//! window; the empty part of the bar focuses the stack's active window.  A
+//! against the tabs the bar was drawn with ([`tabs::hit_test`]): a tab focuses
+//! its window, which makes it the active tab; the close glyph closes the tab's
+//! window (a window that has left the stack since is ignored); the empty part
+//! of the bar focuses the stack's active window.  A
 //! click always sends the focus, also to a window the layout has focused
 //! already (`Core::click_focus`).
 
@@ -1693,10 +1694,12 @@ impl Core {
 
     /// Handle a press in a stack's tab bar, which the click tap swallowed.
     ///
-    /// The press is hit-tested against the current layout, not against what
-    /// the bar showed: a tab focuses its window (which makes it the active
-    /// tab), the close glyph closes the tab's window, and the empty part of
-    /// the bar focuses the stack's active window.  A hidden tab is shown
+    /// The press is hit-tested against the tabs the bar was drawn with
+    /// (`click.tabs`), the ones the user saw, so a stack that changed since
+    /// cannot redirect it to another window: a tab focuses its window (which
+    /// makes it the active tab), the close glyph closes the tab's window, and
+    /// the empty part of the bar focuses the stack's active window.  A tab
+    /// whose window has left the stack is ignored.  A hidden tab is shown
     /// before it is closed, so a save sheet appears where the user can see
     /// it.  Ignored while a native full-screen Space is active, like actions
     /// ([`Core::action`]).
@@ -1710,7 +1713,7 @@ impl Core {
                 return None;
             }
             let bar = tabs::bar_frame(stack.frame);
-            let hit = tabs::hit_test(bar, stack.tabs.len(), click.x, click.y)?;
+            let hit = tabs::hit_test(bar, click.tabs.len(), click.x, click.y)?;
             Some((stack, hit))
         });
         let Some((stack, hit)) = found else {
@@ -1722,16 +1725,32 @@ impl Core {
             );
             return;
         };
+        let drawn = |index: usize| {
+            let wid = click.tabs[index];
+            stack.tabs.iter().any(|tab| tab.wid == wid).then_some(wid)
+        };
         match hit {
             BarHit::Tab(index) => {
-                let wid = stack.tabs[index].wid;
+                let Some(wid) = drawn(index) else {
+                    log::debug!(
+                        "tab bar: tab {index} (window {}) left the stack",
+                        click.tabs[index]
+                    );
+                    return;
+                };
                 log::info!("tab bar: tab {index} clicked; focusing window {wid}");
                 self.click_focus(wid);
             }
             BarHit::Close(index) => {
-                let wid = stack.tabs[index].wid;
+                let Some(wid) = drawn(index) else {
+                    log::debug!(
+                        "tab bar: close on tab {index} (window {}) left the stack",
+                        click.tabs[index]
+                    );
+                    return;
+                };
                 log::info!("tab bar: close clicked on tab {index}; closing window {wid}");
-                if index != stack.active {
+                if stack.active_tab().is_none_or(|tab| tab.wid != wid) {
                     self.focus_window(wid);
                 }
                 self.apply(vec![Command::Close { wid }]);
@@ -5931,7 +5950,19 @@ mod tests {
 
     /// A press at `(x, y)` in the bar of the stack holding `wid`.
     fn press(core: &mut Core, wid: WindowId, (x, y): (f64, f64)) {
-        core.bar_click(BarClick { x, y, stack: wid });
+        // The tabs the bar shows now; a window in no stack draws nothing.
+        let tabs = core
+            .layout()
+            .visible_stacks()
+            .iter()
+            .find(|stack| stack.tabs.iter().any(|tab| tab.wid == wid))
+            .map_or_else(|| vec![wid], tab_wids);
+        core.bar_click(BarClick {
+            x,
+            y,
+            stack: wid,
+            tabs,
+        });
     }
 
     /// The middle of tab `index` (left of its close glyph) in the bar of the
@@ -6125,6 +6156,92 @@ mod tests {
         press(&mut core, 3, (point.0, bar.bottom() + 5.0));
         press(&mut core, 3, (bar.right() + 5.0, point.1));
         assert_eq!(backend.calls()[marker..], []);
+        assert_eq!(core.layout().focused(), Some(3));
+    }
+
+    #[test]
+    fn a_close_click_closes_the_tab_that_was_drawn_not_the_one_now_there() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        // Drawn as [1, 2, 3]; the close glyph of tab 1 (window 2).
+        let drawn = tab_wids(&core.layout().active_stack().unwrap());
+        assert_eq!(drawn, [1, 2, 3]);
+        let point = close_point(&core, 3, 1);
+        // Hidden tab 1 closes itself before the bar is redrawn: tab 1 is 3 now.
+        backend.remove_window(1);
+        core.platform_event(destroyed(1));
+        let stack = core.layout().active_stack().unwrap();
+        assert_eq!(tab_wids(&stack), [2, 3]);
+        let (_, bar) = bar_of(&core, 3);
+        // Tabs are at their maximum width either way, so the point is stable.
+        assert_eq!(
+            tabs::hit_test(bar, 2, point.0, point.1),
+            Some(BarHit::Close(1))
+        );
+        let marker = backend.calls().len();
+
+        core.bar_click(BarClick {
+            x: point.0,
+            y: point.1,
+            stack: 3,
+            tabs: drawn,
+        });
+
+        let calls = backend.calls();
+        assert!(calls[marker..].contains(&Call::Close(2)), "{calls:?}");
+        assert!(!calls[marker..].contains(&Call::Close(3)), "{calls:?}");
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_tab_that_left_the_stack_does_nothing() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        let drawn = tab_wids(&core.layout().active_stack().unwrap());
+        let tab = tab_point(&core, 3, 1);
+        let close = close_point(&core, 3, 1);
+        backend.remove_window(2);
+        core.platform_event(destroyed(2));
+        assert_eq!(tab_wids(&core.layout().active_stack().unwrap()), [1, 3]);
+        let focused = core.layout().focused();
+        let marker = backend.calls().len();
+
+        for (x, y) in [tab, close] {
+            core.bar_click(BarClick {
+                x,
+                y,
+                stack: 3,
+                tabs: drawn.clone(),
+            });
+        }
+
+        let calls = backend.calls();
+        assert!(
+            !calls[marker..].iter().any(|call| matches!(
+                call,
+                Call::Close(_) | Call::Focus(_) | Call::Park(..) | Call::Unpark(_)
+            )),
+            "{calls:?}"
+        );
+        assert_eq!(core.layout().focused(), focused);
+    }
+
+    #[test]
+    fn a_click_on_a_stale_drawn_tab_focuses_that_window() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        // Drawn as [1, 2, 3]; tab 2 (window 3) is clicked after window 1 left.
+        let drawn = tab_wids(&core.layout().active_stack().unwrap());
+        let point = tab_point(&core, 3, 2);
+        backend.remove_window(1);
+        core.platform_event(destroyed(1));
+        core.action(Action::FocusWindow { wid: 2 });
+        let marker = backend.calls().len();
+
+        core.bar_click(BarClick {
+            x: point.0,
+            y: point.1,
+            stack: 2,
+            tabs: drawn,
+        });
+
+        assert!(backend.calls()[marker..].contains(&Call::Focus(3)));
         assert_eq!(core.layout().focused(), Some(3));
     }
 

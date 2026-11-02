@@ -215,6 +215,29 @@ fn assign_slots(previous: &[Option<Vec<WindowId>>], stacks: &[StackInfo]) -> Vec
     slots
 }
 
+/// Which pool slots keep their bar exactly as published while `stacks`
+/// (assigned to `slots`) are shown: those whose overlay already has the
+/// stack's bar frame and shows a stack that shares a window with it.
+/// `previous[slot]` is the frame and windows of the stack a slot shows
+/// (`None`: ordered out).  The rest are moved, reused for another stack or
+/// ordered out, so a press on them must not be claimed until they are done.
+fn steady_slots(
+    previous: &[Option<(Rect, Vec<WindowId>)>],
+    stacks: &[StackInfo],
+    slots: &[Option<usize>],
+) -> Vec<bool> {
+    let mut steady = vec![false; previous.len()];
+    for (stack, slot) in stacks.iter().zip(slots) {
+        if let Some(index) = *slot
+            && let Some((frame, wids)) = &previous[index]
+        {
+            steady[index] = *frame == tabs::bar_frame(stack.frame)
+                && stack.tabs.iter().any(|tab| wids.contains(&tab.wid));
+        }
+    }
+    steady
+}
+
 struct TabBar {
     /// Bar overlays; the ordered-out ones wait for the next stack.
     pool: Vec<Bar>,
@@ -341,6 +364,16 @@ impl TabBar {
                 bar.hide();
             }
         }
+        // Until they are done, publish only the bars that stay as they are: a
+        // bar being moved or reused is not where the snapshot says it is.
+        let frames: Vec<Option<(Rect, Vec<WindowId>)>> = self
+            .pool
+            .iter()
+            .zip(&previous)
+            .map(|(bar, wids)| Some((bar.overlay.frame, wids.clone()?)))
+            .collect();
+        let steady = steady_slots(&frames, &stacks, &slots);
+        self.publish(|index| steady[index]);
         let palette = self.theme.palette;
         let mut errors = Vec::new();
         for (stack, slot) in stacks.into_iter().zip(slots) {
@@ -365,21 +398,25 @@ impl TabBar {
                 errors.push(error);
             }
         }
-        self.publish();
+        self.publish(|_| true);
         joined(errors)
     }
 
-    /// Tell the click tap which bars are on screen.
-    fn publish(&self) {
+    /// Tell the click tap which bars are on screen: those of the pool slots
+    /// `keep` accepts.
+    fn publish(&self, keep: impl Fn(usize) -> bool) {
         let shown: Vec<ShownBar> = self
             .pool
             .iter()
-            .filter_map(|bar| {
+            .enumerate()
+            .filter(|(index, _)| keep(*index))
+            .filter_map(|(_, bar)| {
                 let stack = bar.stack.as_ref()?;
                 Some(ShownBar {
                     overlay: bar.overlay.wid,
                     frame: bar.overlay.frame,
                     stack: stack.active_tab()?.wid,
+                    tabs: stack.tabs.iter().map(|tab| tab.wid).collect(),
                 })
             })
             .collect();
@@ -914,6 +951,47 @@ mod tests {
         );
         // No stacks: no slot is used (the caller orders every bar out).
         assert_eq!(assign_slots(&previous, &[]), Vec::<Option<usize>>::new());
+    }
+
+    #[test]
+    fn only_bars_that_stay_put_stay_published_during_an_update() {
+        let one = stack(&[1, 2], 0, true);
+        let two = stack(&[3, 4], 0, false);
+        let bar = tabs::bar_frame(one.frame);
+        let previous = [Some((bar, vec![1, 2])), Some((bar, vec![3, 4])), None];
+
+        // Same stacks, same frames (one gained a tab): both stay.
+        let grown = stack(&[3, 4, 5], 2, false);
+        let slots = assign_slots(
+            &[Some(vec![1, 2]), Some(vec![3, 4]), None],
+            &[one.clone(), grown.clone()],
+        );
+        assert_eq!(
+            steady_slots(&previous, &[one.clone(), grown], &slots),
+            [true, true, false]
+        );
+
+        // A stack that moved loses its bar until it is moved.
+        let mut moved = two.clone();
+        moved.frame.x += 10.0;
+        let slots = [Some(0), Some(1)];
+        assert_eq!(
+            steady_slots(&previous, &[one.clone(), moved], &slots),
+            [true, false, false]
+        );
+
+        // A slot reused for another stack, or taken by a new one, goes too,
+        // as does one that is ordered out (no stack left for it).
+        let new = stack(&[7, 8], 0, false);
+        assert_eq!(
+            steady_slots(&previous, &[new, one.clone()], &[Some(1), Some(2)]),
+            [false, false, false]
+        );
+        assert_eq!(
+            steady_slots(&previous, &[one], &[Some(0)]),
+            [true, false, false]
+        );
+        assert_eq!(steady_slots(&previous, &[], &[]), [false, false, false]);
     }
 
     #[test]

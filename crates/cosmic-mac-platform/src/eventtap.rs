@@ -497,6 +497,8 @@ unsafe extern "C-unwind" fn click_callback(
     // SAFETY: user_info points to the ClickContext owned by ClickTap.
     let context = unsafe { &mut *(user_info as *mut ClickContext) };
     if reenable_if_disabled(event_type, context.tap) {
+        // The press may have been delivered while the tap was off; never swallow its release.
+        context.swallow_up = false;
         return event.as_ptr();
     }
     match event_type {
