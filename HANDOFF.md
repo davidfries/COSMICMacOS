@@ -8,7 +8,9 @@
 > agents), the menu-bar status item and the resident launcher (Super tap) are
 > implemented and verified in the VM; theming is in progress. Drag to stack
 > (drop a tiled window on another tile's middle third) is implemented and
-> verified; the full VM scenario passes with 78 assertions.
+> verified. Stack tab bars are clickable (every stack on the workspace has a
+> bar; a tab click shows and focuses its window, × closes it), verified in the
+> VM; the full VM scenario passes with 80 assertions.
 > Branch `milestone-2a`: commit `18f9597` holds the R-fixes, session installer and
 > launcher spike; R11, the status item and the resident launcher are uncommitted
 > on top of it.
@@ -180,6 +182,16 @@ Pop!_OS 24.04. Our semantics documentation should cite these:
   release posted within ~3 ms move nothing. The tab bar sits above the stack's
   windows, so a stack member's own title bar (below the bar) is the drag
   handle. See "Drag to stack" for the event timing.
+- **Clicks on an ignore-events overlay go to whatever is below it.** At the
+  plain session tap (`kCGSessionEventTap`) the event's window fields (91/92)
+  are 0; at the annotated session tap they are filled, but swallowing there
+  still activates the window below (Finder for the desktop): WindowServer has
+  already routed the click. Swallowing at the head of the session tap keeps
+  the frontmost app. `SLSFindWindowAndOwner(cid, 0, 1, 0, &point, ...)` is
+  WindowServer's own hit test (~0.02 ms): it skips ignore-events overlays and
+  the Dock's transparent full-screen layer-20 window, which
+  `CGWindowListCopyWindowInfo(OnScreenAboveWindow, ...)` does list above
+  everything. An open app menu drops over the bar strip at y 25..51.
 - **Accessibility is charged per launching context.** Over ssh the grant is
   sshd's, so a hand-started WM works; started by launchd, `cosmic-mac-wm` needs
   its own entry in System Settings > Privacy & Security > Accessibility or it
@@ -314,8 +326,9 @@ Pop!_OS 24.04. Our semantics documentation should cite these:
    visible) and no neighbour can cover it. `StackInfo.frame` and `TreeNode::Stack`
    frames are the member (below-bar) frame; the tile in the tree/`nodes` stays
    full height. A maximized stacked window gets the work area minus the strip.
-   Floating a stack member keeps its current (below-bar) frame. Tab clicks and
-   the × glyph are display-only (milestone 2).
+   Floating a stack member keeps its current (below-bar) frame. Every stack on
+   the active workspace has a bar, and the bars take clicks (see "Tab-bar
+   clicks" under milestone 2).
 6. Multi-display: parking falls back to the cached main display frame; the
    layout is a single workspace pool (`assign_display` not implemented).
 7. Carbon hotkey fallback for Secure Event Input is documented
@@ -947,7 +960,10 @@ out a Super tap starts it on demand via the bundle. Not yet exercised: `find`,
   guards them): bar = `background.base` at 0.94 alpha, inactive tab =
   `background.component.base`, title = `background.component.on`, close
   glyph = `palette.neutral_7`, active tab = `accent.base` with title and
-  close glyph in `accent.on`. Dark: `#1B1B1B` bar, `#2E2E2E` tabs, accent
+  close glyph in `accent.on`. The active tab of a stack without the focus
+  is `tab_active_unfocused`: the inactive tab mixed with the accent
+  (`UNFOCUSED_ACCENT` = 0.35), with the normal title and glyph colours.
+  Dark: `#1B1B1B` bar, `#2E2E2E` tabs, accent
   `#63D0DF` with black text. Light: `#D7D7D7` bar, `#F5F5F5` tabs, accent
   `#00525A` with white text. When
   `com.system76.CosmicTheme.{Dark,Light}/v1/accent` (a cosmic-theme
@@ -1077,10 +1093,68 @@ highlight over a stack covers its window area (below the bar).
     in between.
 - **Out of scope**: split zones (a drop outside the middle third splits next
   to the target in cosmic-comp; here it snaps back, and `DropZone` has room for
-  a `Split` variant), dragging tabs out of the tab bar, tab-bar clicks.
+  a `Split` variant), dragging tabs out of the tab bar.
 - Tests: `crates/cosmic-mac-layout/tests/drag_stack.rs` (16), 10 core tests in
   `core::tests`, a tab-bar colour test; `cargo test --workspace` 801 passed.
   VM: the drag phase of `scripts/vm-test.sh` (below).
+
+### Tab-bar clicks
+
+The user report was "I can't click to change windows on the tab interface":
+the bars are overlays that ignore events, so a click fell through to the
+desktop and activated Finder, and only the focused stack had a bar.
+**Verified in the VM (2026-11-01)** with `send-key --click` on two stacks: a
+tab shows and focuses its window (also across apps: Terminal's tab makes
+Terminal frontmost, never Finder), × closes that window, the empty part of a
+bar focuses the stack's active window, a click on TextEdit's open File menu
+over a bar reaches the menu ("New" opened a window; no tab switch), window
+content clicks and drag to stack still work. The tap's decision for a press
+in a bar took 0.4–0.9 ms. Evidence: `scratch/tabclick-two-stacks.png`,
+`scratch/tabclick-after-tab-click.png`, `scratch/tabclick-menu-open.png`,
+`scratch/tabclick-menu-after-click.png`.
+
+- **Bars for every stack**: `Command::StacksChanged { stacks }` (was
+  `StackChanged { stack: Option }`) carries every stack on the active
+  workspace (`Layout::visible_stacks`), only the maximized window's own stack
+  while one is maximized; `StackInfo.focused` marks the focused one
+  (`#[serde(default)]`). The tab-bar thread keeps a pool of overlays, one per
+  stack (`assign_slots` keeps a stack in its overlay; ordered-out overlays are
+  reused, not released), each ordered just above its stack's active window.
+- **Shared geometry** (`crates/cosmic-mac-wm/src/tabs.rs`): `bar_frame`,
+  `tab_span` and `hit_test` (`Tab(i)`, `Close(i)` for a 16 pt box around the
+  × at 12 pt from the tab's right edge, `Empty`) serve both the drawing and
+  the clicks.
+- **Click tap**: an active `ClickTap` (platform `eventtap.rs`) for left down
+  and up only, at the head of the session tap, on the WM's tap thread. The
+  tab-bar thread publishes the bars it really shows (`SharedBars`, cleared
+  when they hide). A press inside one is swallowed with its release when the
+  bar is the topmost window there (`window::overlay_is_topmost_at`: the
+  `SLSFindWindowAndOwner` hit must be ordered below the overlay in the
+  on-screen list, desktop elements included). A covered bar (an open menu, a
+  floating window above it), an overlay not on screen, a failed query, a
+  panic or a gone daemon all let the press through. If the tap cannot be
+  created the WM logs a warning and the bars only show tabs.
+- **Core** (`Core::bar_click`, from `Message::BarClick`): hit-tests the click
+  against the current layout's bars, ignores it on a native full-screen
+  Space (the bars are hidden there too). `Tab(i)` focuses member i (the
+  layout's FocusWindow also makes it the active tab), `Empty` the active
+  member; both re-send the focus even when the layout already has it, as a
+  click on a window does. `Close(i)` closes member i; a hidden member is
+  shown and focused first, so a save sheet appears on a visible window.
+- **Seen in the VM, not changed**: a TextEdit window closed through the bar
+  is often still on no Space when its SkyLight destroy arrives, so the core
+  takes it for a window entering native full screen: it is suspended (and
+  forgotten when gone, often within a second) and the focus move that
+  follows a close is not sent, so TextEdit picks its next key window itself.
+  A keyboard close of a tiled window took the normal path in the same
+  session.
+- **Out of scope**: dragging tabs out of the bar, reordering, middle-click,
+  hover effects. A transparent full-screen window of another app above
+  everything would make the bars unclickable again (the press passes).
+- Tests: `tabs.rs` (geometry, `claim`), platform `is_topmost_in`, layout
+  `tests/stacks.rs` (all bars, focused flag, maximize, workspace switch),
+  core `bar_click` tests, tab-bar pool and colour tests;
+  `cargo test --workspace` 859 passed.
 
 ### VM scenario changes (`scripts/vm-test.sh`)
 
@@ -1103,6 +1177,15 @@ highlight over a stack covers its window area (below the bar).
   unstacks with `toggle-stacking`, then drags to a point a sixth into another
   tile (outside its middle third) and asserts `unstacked`,
   `geometry-unchanged` and `in-tiles` (snapped back).
+- Tab clicks (in the drag phase, while the dropped window is stacked):
+  `tab-point <wid>` (helper, from `tree --json`) finds the middle of a tab,
+  `send-key --click` clicks it; asserts `stacked-onto <target> <wid>`, then
+  back with the dropped window's tab.
+- The AX `frames` helper (the restore checks) reads every process of a name:
+  the scenario runs one TextEdit per document, and `process "TextEdit"` is
+  only the first one. The old helper passed only while the window the close
+  step removes was not in that first process; the tab clicks changed the
+  focus order, the close took test-1, and the dump came back empty.
 - Other apps' windows still take part in the tiling: an extra Terminal window
   left open made the Super+S stacking assertion pair a test window with it
   ("found 1"). Close stray windows before a run, or hide their app

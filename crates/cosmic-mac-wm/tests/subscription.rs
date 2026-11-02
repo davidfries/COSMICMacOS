@@ -120,7 +120,7 @@ impl PlatformBackend for Backend {
         windows.sort_by_key(|info| info.wid);
         windows
     }
-    fn set_stack_bar(&self, _stack: Option<StackInfo>) -> PlatformResult<()> {
+    fn set_stack_bars(&self, _stacks: Vec<StackInfo>) -> PlatformResult<()> {
         Ok(())
     }
     fn main_work_area(&self) -> Rect {

@@ -107,6 +107,9 @@ pub struct StackInfo {
     pub active: usize,
     /// Frame of the stack's visible window; the tab bar is drawn directly above it.
     pub frame: Rect,
+    /// The stack holds the focused window.
+    #[serde(default)]
+    pub focused: bool,
 }
 
 impl StackInfo {
@@ -178,7 +181,15 @@ mod tests {
             ],
             active: 1,
             frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+            focused: true,
         };
         assert_eq!(stack.active_tab().unwrap().wid, 2);
+    }
+
+    #[test]
+    fn stack_info_without_focused_reads_as_unfocused() {
+        let json = r#"{"workspace":1,"tabs":[],"active":0,"frame":{"x":0.0,"y":0.0,"width":1.0,"height":1.0}}"#;
+        let stack: StackInfo = serde_json::from_str(json).unwrap();
+        assert!(!stack.focused);
     }
 }

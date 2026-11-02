@@ -25,6 +25,11 @@
 //! [`MouseTap`] is a second, **listen-only** tap for the left mouse button
 //! (down, dragged, up). It never delays or swallows a click; the WM uses it
 //! to tell a title-bar drag from other window moves (drag-to-stack).
+//!
+//! [`ClickTap`] is an **active** tap for left presses and releases only. Its
+//! handler sees every press and may swallow it, together with the matching
+//! release; the WM uses it for clicks on its stack tab bars, which are
+//! overlays that ignore events.
 
 use std::ffi::c_void;
 
@@ -456,6 +461,136 @@ impl MouseTap {
 }
 
 impl Drop for MouseTap {
+    fn drop(&mut self) {
+        CGEvent::tap_enable(&self.tap, false);
+        // As for `EventTap`: invalidate first so no queued event reaches the
+        // callback after the context is freed.
+        self.source.invalidate();
+        self.tap.invalidate();
+        // SAFETY: the callback can no longer run.
+        unsafe { drop(Box::from_raw(self.context)) };
+    }
+}
+
+/// Callback for [`ClickTap`]: called with the location (global top-left) of
+/// every left press; `true` swallows the press and its release.  Runs on the
+/// tap's run-loop thread and delays every click while it runs, so keep it
+/// fast and never block.
+pub type ClickHandler = Box<dyn Fn(Point) -> bool + Send + 'static>;
+
+struct ClickContext {
+    handler: ClickHandler,
+    tap: *mut c_void,
+    /// The last press was swallowed, so its release must be too.
+    swallow_up: bool,
+}
+
+unsafe extern "C-unwind" fn click_callback(
+    _proxy: objc2_core_graphics::CGEventTapProxy,
+    event_type: CGEventType,
+    event: std::ptr::NonNull<CGEvent>,
+    user_info: *mut c_void,
+) -> *mut CGEvent {
+    if user_info.is_null() {
+        return event.as_ptr();
+    }
+    // SAFETY: user_info points to the ClickContext owned by ClickTap.
+    let context = unsafe { &mut *(user_info as *mut ClickContext) };
+    if reenable_if_disabled(event_type, context.tap) {
+        return event.as_ptr();
+    }
+    match event_type {
+        CGEventType::LeftMouseDown => {
+            // SAFETY: valid event reference.
+            let location = unsafe { CGEvent::location(Some(event.as_ref())) };
+            let point = Point::new(location.x, location.y);
+            // A panic must not unwind into CoreGraphics; the press passes then.
+            let handler = &context.handler;
+            context.swallow_up =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(point)))
+                    .unwrap_or(false);
+            if context.swallow_up {
+                std::ptr::null_mut()
+            } else {
+                event.as_ptr()
+            }
+        }
+        CGEventType::LeftMouseUp if std::mem::take(&mut context.swallow_up) => std::ptr::null_mut(),
+        _ => event.as_ptr(),
+    }
+}
+
+/// An installed active tap for left presses and releases.
+///
+/// Placed at the head of the session tap, before WindowServer routes the
+/// click to a window, so a swallowed press activates nothing.  Dragged
+/// events are not tapped and always pass.
+pub struct ClickTap {
+    tap: CFRetained<CFMachPort>,
+    source: CFRetained<CFRunLoopSource>,
+    context: *mut ClickContext,
+}
+
+// Only used from the run loop thread, like `EventTap`.
+unsafe impl Send for ClickTap {}
+
+impl ClickTap {
+    /// Create and enable the tap on the calling thread's run loop.
+    pub fn new(handler: ClickHandler) -> Result<Self> {
+        let context = Box::into_raw(Box::new(ClickContext {
+            handler,
+            tap: std::ptr::null_mut(),
+            swallow_up: false,
+        }));
+        let mask: u64 =
+            (1u64 << CGEventType::LeftMouseDown.0) | (1u64 << CGEventType::LeftMouseUp.0);
+        // SAFETY: callback and context outlive the tap (released in Drop).
+        let tap = unsafe {
+            CGEvent::tap_create(
+                CGEventTapLocation::SessionEventTap,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                mask,
+                Some(click_callback),
+                context.cast(),
+            )
+        }
+        .ok_or_else(|| {
+            // SAFETY: reclaim the context because the tap was never created.
+            unsafe { drop(Box::from_raw(context)) };
+            PlatformError::Other("CGEventTapCreate (mouse clicks) failed".into())
+        })?;
+        let tap_ptr = CFRetained::as_ptr(&tap).as_ptr();
+        // SAFETY: context is still alive.
+        unsafe { (*context).tap = tap_ptr.cast() };
+        let source = CFMachPort::new_run_loop_source(None, Some(&tap), 0).ok_or_else(|| {
+            tap.invalidate();
+            // SAFETY: the port is invalidated, so the callback cannot run.
+            unsafe { drop(Box::from_raw(context)) };
+            PlatformError::Other("CFMachPortCreateRunLoopSource failed".into())
+        })?;
+        let run_loop = CFRunLoop::current().ok_or_else(|| {
+            tap.invalidate();
+            // SAFETY: the port is invalidated, so the callback cannot run.
+            unsafe { drop(Box::from_raw(context)) };
+            PlatformError::Other("no current CFRunLoop".into())
+        })?;
+        run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+        CGEvent::tap_enable(&tap, true);
+        Ok(Self {
+            tap,
+            source,
+            context,
+        })
+    }
+
+    /// Whether the tap is currently enabled.
+    pub fn is_enabled(&self) -> bool {
+        CGEvent::tap_is_enabled(&self.tap)
+    }
+}
+
+impl Drop for ClickTap {
     fn drop(&mut self) {
         CGEvent::tap_enable(&self.tap, false);
         // As for `EventTap`: invalidate first so no queued event reaches the

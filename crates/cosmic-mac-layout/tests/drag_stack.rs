@@ -62,7 +62,7 @@ fn window_onto_window_creates_a_stack() {
         Some(&Rect::new(0.0, 26.0, 1000.0, 474.0))
     );
     assert_eq!(focus_command(&commands), Some(1));
-    assert!(stack_changes(&commands).last().unwrap().is_some());
+    assert!(!stack_changes(&commands).last().unwrap().is_empty());
     assert!(harness.layout.is_visible(1));
     assert!(!harness.layout.is_visible(2));
     harness.assert_synced();

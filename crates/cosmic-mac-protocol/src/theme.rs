@@ -184,6 +184,17 @@ impl Rgba {
         Rgba { alpha, ..self }
     }
 
+    /// `amount` of `other` over this colour (0 = this, 1 = `other`), alpha included.
+    pub const fn mix(self, other: Rgba, amount: f64) -> Self {
+        let keep = 1.0 - amount;
+        Rgba::new(
+            self.red * keep + other.red * amount,
+            self.green * keep + other.green * amount,
+            self.blue * keep + other.blue * amount,
+            self.alpha * keep + other.alpha * amount,
+        )
+    }
+
     /// `#RRGGBB` or `#RRGGBBAA` (the `#` is optional), as cosmic-config writes colours.
     pub fn from_hex(text: &str) -> Option<Self> {
         let hex = text.trim();
@@ -312,6 +323,9 @@ pub struct TabBarPalette {
     pub tab_inactive: Rgba,
     /// The active tab: COSMIC `accent.base`.
     pub tab_active: Rgba,
+    /// The active tab of a stack without the focus: the accent mixed into the inactive
+    /// tab ([`UNFOCUSED_ACCENT`]).  Its title and close glyph use `text` and `close`.
+    pub tab_active_unfocused: Rgba,
     /// Title on an inactive tab: COSMIC `background.component.on`.
     pub text: Rgba,
     /// Title and close glyph on the active tab: COSMIC `accent.on`.
@@ -323,12 +337,17 @@ pub struct TabBarPalette {
 /// Alpha of the bar behind the tabs.
 const BACKGROUND_ALPHA: f64 = 0.94;
 
+/// How much accent the active tab of an unfocused stack gets over the inactive tab colour.
+pub const UNFOCUSED_ACCENT: f64 = 0.35;
+
 impl TabBarPalette {
     /// From COSMIC's default dark theme.
     pub const DARK: TabBarPalette = TabBarPalette {
         background: Rgba::grey(0.1059).with_alpha(BACKGROUND_ALPHA),
         tab_inactive: Rgba::grey(0.1822),
         tab_active: Rgba::new(0.3882, 0.8157, 0.8745, 1.0),
+        tab_active_unfocused: Rgba::grey(0.1822)
+            .mix(Rgba::new(0.3882, 0.8157, 0.8745, 1.0), UNFOCUSED_ACCENT),
         text: Rgba::grey(0.7533),
         text_active: Rgba::BLACK,
         close: Rgba::grey(0.6196),
@@ -339,6 +358,8 @@ impl TabBarPalette {
         background: Rgba::grey(0.8431).with_alpha(BACKGROUND_ALPHA),
         tab_inactive: Rgba::grey(0.9602),
         tab_active: Rgba::new(0.0, 0.3216, 0.3529, 1.0),
+        tab_active_unfocused: Rgba::grey(0.9602)
+            .mix(Rgba::new(0.0, 0.3216, 0.3529, 1.0), UNFOCUSED_ACCENT),
         text: Rgba::grey(0.1529),
         text_active: Rgba::WHITE,
         close: Rgba::grey(0.1804),
@@ -358,6 +379,9 @@ impl TabBarPalette {
         let mut palette = TabBarPalette::defaults(mode);
         if let Some(accent) = accent {
             palette.tab_active = accent.base.with_alpha(1.0);
+            palette.tab_active_unfocused = palette
+                .tab_inactive
+                .mix(palette.tab_active, UNFOCUSED_ACCENT);
             palette.text_active = accent
                 .on
                 .unwrap_or_else(|| accent.base.contrasting_text())
@@ -618,6 +642,12 @@ mod tests {
             }),
         );
         assert_eq!(palette.tab_active, orange);
+        assert_eq!(
+            palette.tab_active_unfocused,
+            TabBarPalette::LIGHT
+                .tab_inactive
+                .mix(orange, UNFOCUSED_ACCENT)
+        );
         assert_eq!(palette.text_active, Rgba::BLACK);
         assert_eq!(palette.background, TabBarPalette::LIGHT.background);
         assert_eq!(palette.tab_inactive, TabBarPalette::LIGHT.tab_inactive);
@@ -648,7 +678,23 @@ mod tests {
             assert!(gap(palette.text, palette.tab_inactive) > 0.3);
             assert!(gap(palette.text_active, palette.tab_active) > 0.3);
             assert!(gap(palette.close, palette.tab_inactive) > 0.2);
+            // The unfocused stack's active tab stands out from the bar and the other tabs,
+            // and its title (`text`) stays readable.
+            let muted = palette.tab_active_unfocused;
+            assert!(gap(palette.text, muted) > 0.3);
+            assert!(gap(muted, palette.tab_inactive) > 0.08);
+            assert!(gap(muted, palette.background) > 0.1);
+            assert_ne!(muted, palette.tab_active);
         }
+    }
+
+    #[test]
+    fn mix_blends_each_channel() {
+        let black = Rgba::BLACK;
+        let white = Rgba::WHITE.with_alpha(0.0);
+        assert_eq!(black.mix(white, 0.0), black);
+        assert_eq!(black.mix(white, 1.0), white);
+        assert_eq!(black.mix(white, 0.25), Rgba::new(0.25, 0.25, 0.25, 0.75));
     }
 
     #[test]

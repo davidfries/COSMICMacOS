@@ -588,6 +588,13 @@ fn own_pid() -> libc::pid_t {
     std::process::id() as libc::pid_t
 }
 
+fn cg_dict_wid(dict: &CFDictionary<CFString, CFType>, key_number: &CFString) -> u32 {
+    dict.get(key_number)
+        .and_then(|value| value.downcast::<CFNumber>().ok())
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as u32
+}
+
 fn cg_dict_basics(dict: &CFDictionary<CFString, CFType>) -> CgWindowBasics {
     // SAFETY: the kCGWindow* statics are immutable CFStrings owned by
     // CoreGraphics and valid for the process lifetime.
@@ -599,11 +606,7 @@ fn cg_dict_basics(dict: &CFDictionary<CFString, CFType>) -> CgWindowBasics {
             kCGWindowBounds,
         )
     };
-    let wid = dict
-        .get(key_number)
-        .and_then(|value| value.downcast::<CFNumber>().ok())
-        .and_then(|value| value.as_i64())
-        .unwrap_or(0) as u32;
+    let wid = cg_dict_wid(dict, key_number);
     let pid = dict
         .get(key_pid)
         .and_then(|value| value.downcast::<CFNumber>().ok())
@@ -690,9 +693,18 @@ fn cg_dict_to_window(dict: &CFDictionary<CFString, CFType>) -> WindowInfo {
 
 /// Call `visit` for every on-screen CGWindowList record (desktop elements
 /// excluded), front to back.
-fn for_each_on_screen_record(mut visit: impl FnMut(&CFDictionary<CFString, CFType>)) -> Result<()> {
-    let options =
-        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
+fn for_each_on_screen_record(visit: impl FnMut(&CFDictionary<CFString, CFType>)) -> Result<()> {
+    for_each_record(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        visit,
+    )
+}
+
+/// Call `visit` for every CGWindowList record `options` select, front to back.
+fn for_each_record(
+    options: CGWindowListOption,
+    mut visit: impl FnMut(&CFDictionary<CFString, CFType>),
+) -> Result<()> {
     let Some(array) = CGWindowListCopyWindowInfo(options, 0) else {
         return Err(PlatformError::Os {
             context: "CGWindowListCopyWindowInfo",
@@ -753,6 +765,68 @@ pub fn list_windows_all_levels() -> Result<Vec<WindowInfo>> {
         }
     })?;
     Ok(windows)
+}
+
+/// Every on-screen window id, front to back, desktop elements included (the
+/// desktop window, the Dock, menus, our overlays).
+pub fn on_screen_order() -> Result<Vec<u32>> {
+    // SAFETY: an immutable CFString owned by CoreGraphics.
+    let key_number = unsafe { kCGWindowNumber };
+    let mut order = Vec::new();
+    for_each_record(CGWindowListOption::OptionOnScreenOnly, |dict| {
+        order.push(cg_dict_wid(dict, key_number));
+    })?;
+    Ok(order)
+}
+
+/// Whether `overlay`, a window that ignores events, is the topmost window at
+/// a point: `hit` is the window WindowServer would send a click there to
+/// ([`skylight::window_at`]), `order` the on-screen windows front to back
+/// ([`on_screen_order`]).
+///
+/// The hit is the window under the overlay, unless something covers it.  The
+/// overlay is on top when there is no hit or the hit is ordered below it (the
+/// desktop, a window the overlay covers).  A hit ordered above it (an open
+/// menu, a floating window) gets the click.  An overlay that is not on screen
+/// (another Space) or a hit missing from `order` is never on top.
+pub fn is_topmost_in(overlay: u32, hit: Option<u32>, order: &[u32]) -> bool {
+    let Some(overlay_at) = order.iter().position(|&wid| wid == overlay) else {
+        return false;
+    };
+    match hit {
+        None => true,
+        Some(hit) if hit == overlay => true,
+        Some(hit) => order
+            .iter()
+            .position(|&wid| wid == hit)
+            .is_some_and(|hit_at| hit_at > overlay_at),
+    }
+}
+
+/// Whether `overlay` (one of our event-ignoring overlays) is the topmost
+/// window at `point` (global, top-left origin), by [`is_topmost_in`].
+///
+/// `false` when either query fails, so a caller that swallows clicks on
+/// `true` never swallows one on doubt.  Talks to WindowServer only (no
+/// application), about 0.2 ms.
+pub fn overlay_is_topmost_at(overlay: u32, point: Point) -> bool {
+    let order = match on_screen_order() {
+        Ok(order) => order,
+        Err(error) => {
+            log::debug!("window order for overlay {overlay}: {error}");
+            return false;
+        }
+    };
+    if !order.contains(&overlay) {
+        return false;
+    }
+    match skylight::window_at(point) {
+        Ok(hit) => is_topmost_in(overlay, hit, &order),
+        Err(error) => {
+            log::debug!("window at {point:?}: {error}");
+            false
+        }
+    }
 }
 
 /// Owner pids of the windows [`list_windows`] would return, sorted and
@@ -1528,6 +1602,30 @@ impl ParkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overlay_is_topmost_over_the_window_below_it() {
+        // Front to back: menu 5, overlay 7, window 3, desktop 1.
+        let order = [5, 7, 3, 1];
+        // The desktop or a window under the bar receives the click.
+        assert!(is_topmost_in(7, Some(1), &order));
+        assert!(is_topmost_in(7, Some(3), &order));
+        assert!(is_topmost_in(7, None, &order));
+        assert!(is_topmost_in(7, Some(7), &order));
+    }
+
+    #[test]
+    fn a_covered_hidden_or_unknown_overlay_is_not_topmost() {
+        let order = [5, 7, 3, 1];
+        // An open menu above the bar takes the click.
+        assert!(!is_topmost_in(7, Some(5), &order));
+        // The overlay is not on screen (another Space): never ours.
+        assert!(!is_topmost_in(9, Some(1), &order));
+        assert!(!is_topmost_in(9, None, &order));
+        // A hit WindowServer reports but the list lacks: doubt, pass it on.
+        assert!(!is_topmost_in(7, Some(42), &order));
+        assert!(!is_topmost_in(7, None, &[]));
+    }
 
     #[test]
     fn parked_frames_are_recognised_at_the_park_origin() {

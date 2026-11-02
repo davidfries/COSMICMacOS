@@ -108,6 +108,18 @@
 //! ([`PlatformBackend::set_drop_hint`]).  A fast drag can deliver all of its
 //! moves after the release; a move within [`DROP_GRACE`] after a release
 //! that ended no drag is taken as a drag that ended there.
+//!
+//! # Tab bars
+//!
+//! Every stack on the active workspace has a tab bar (only the maximized
+//! window's stack while one is maximized; none while a native full-screen
+//! Space is active).  A press in a bar is taken by the click tap before any
+//! application sees it and reaches [`Core::bar_click`], which hit-tests it
+//! against the current layout ([`tabs::hit_test`]): a tab focuses its
+//! window, which makes it the active tab; the close glyph closes the tab's
+//! window; the empty part of the bar focuses the stack's active window.  A
+//! click always sends the focus, also to a window the layout has focused
+//! already (`Core::click_focus`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -127,6 +139,7 @@ use crate::journal::Journal;
 use crate::reserve;
 use crate::rules;
 use crate::session::{SessionState, SessionStore};
+use crate::tabs::{self, BarClick, BarHit};
 
 /// A detected clamp may re-tile the layout once.  Anything the re-tile
 /// reports is recorded but never retried, so a window with a frozen dimension
@@ -1107,6 +1120,10 @@ impl Core {
     fn active_space_changed(&mut self, space: Option<u64>, fullscreen: bool, captured: Instant) {
         log::debug!("active Space changed to {space:?} (full screen: {fullscreen})");
         self.on_fullscreen_space = fullscreen;
+        // The bars belong to the desktop: hidden on a full-screen Space, so the
+        // click tap does not take presses there, and back on the desktop.
+        self.applier.set_bars_hidden(fullscreen);
+        self.sync_stack_bars();
         self.mark_transition(captured);
         // A new transition: every window gets a fresh re-check budget.
         for state in self.rechecks.values_mut() {
@@ -1606,7 +1623,7 @@ impl Core {
                         command,
                         Command::Focus { .. }
                             | Command::Raise { .. }
-                            | Command::StackChanged { .. }
+                            | Command::StacksChanged { .. }
                     )
                 })
                 .unwrap_or(commands.len());
@@ -1664,11 +1681,67 @@ impl Core {
 
     fn window_ordered(&mut self, wid: u32) {
         let wid = u64::from(wid);
-        if let Some(stack) = self.layout.active_stack()
-            && stack.active_tab().is_some_and(|tab| tab.wid == wid)
-            && let Err(error) = self.applier.force_stack_bar(Some(stack))
+        let stacks = self.layout.visible_stacks();
+        if stacks
+            .iter()
+            .any(|stack| stack.active_tab().is_some_and(|tab| tab.wid == wid))
+            && let Err(error) = self.applier.force_stack_bars(stacks)
         {
-            log::debug!("re-ordering tab bar above {wid} failed: {error}");
+            log::debug!("re-ordering the tab bars above {wid} failed: {error}");
+        }
+    }
+
+    /// Handle a press in a stack's tab bar, which the click tap swallowed.
+    ///
+    /// The press is hit-tested against the current layout, not against what
+    /// the bar showed: a tab focuses its window (which makes it the active
+    /// tab), the close glyph closes the tab's window, and the empty part of
+    /// the bar focuses the stack's active window.  A hidden tab is shown
+    /// before it is closed, so a save sheet appears where the user can see
+    /// it.  Ignored while a native full-screen Space is active, like actions
+    /// ([`Core::action`]).
+    pub fn bar_click(&mut self, click: BarClick) {
+        if self.on_fullscreen_space {
+            log::debug!("ignoring a tab-bar click: a native full-screen Space is active");
+            return;
+        }
+        let found = self.layout.visible_stacks().into_iter().find_map(|stack| {
+            if !stack.tabs.iter().any(|tab| tab.wid == click.stack) {
+                return None;
+            }
+            let bar = tabs::bar_frame(stack.frame);
+            let hit = tabs::hit_test(bar, stack.tabs.len(), click.x, click.y)?;
+            Some((stack, hit))
+        });
+        let Some((stack, hit)) = found else {
+            log::debug!(
+                "tab-bar click at ({}, {}) is in no bar of the current layout (stack of {})",
+                click.x,
+                click.y,
+                click.stack
+            );
+            return;
+        };
+        match hit {
+            BarHit::Tab(index) => {
+                let wid = stack.tabs[index].wid;
+                log::info!("tab bar: tab {index} clicked; focusing window {wid}");
+                self.click_focus(wid);
+            }
+            BarHit::Close(index) => {
+                let wid = stack.tabs[index].wid;
+                log::info!("tab bar: close clicked on tab {index}; closing window {wid}");
+                if index != stack.active {
+                    self.focus_window(wid);
+                }
+                self.apply(vec![Command::Close { wid }]);
+            }
+            BarHit::Empty => {
+                if let Some(tab) = stack.active_tab() {
+                    log::info!("tab bar: empty bar clicked; focusing window {}", tab.wid);
+                    self.click_focus(tab.wid);
+                }
+            }
         }
     }
 
@@ -1808,10 +1881,10 @@ impl Core {
                     self.constraints.remove(&wid);
                     self.ignored.insert(wid);
                 }
-                // The discarded commands included the tab bar's removal; hide the
-                // overlay explicitly so it does not float over a restored window.
-                if let Err(error) = self.applier.sync_stack_bar(None) {
-                    log::debug!("hiding the tab bar after restore failed: {error}");
+                // The discarded commands included the tab bars' removal; hide the
+                // overlays explicitly so they do not float over restored windows.
+                if let Err(error) = self.applier.sync_stack_bars(Vec::new()) {
+                    log::debug!("hiding the tab bars after restore failed: {error}");
                 }
                 log::info!("restored {restored} windows on request; no longer managing them");
                 Response::Ok
@@ -1877,6 +1950,18 @@ impl Core {
         self.apply(commands);
     }
 
+    /// [`Core::focus_window`] for a click: focuses `wid` even when the layout
+    /// has it focused already, as a click on a window does.  macOS can
+    /// disagree with the layout (an app picks its next key window itself when
+    /// one of its windows closes).
+    fn click_focus(&mut self, wid: WindowId) {
+        let mut commands = self.layout.action(Action::FocusWindow { wid });
+        if !commands.contains(&Command::Focus { wid }) {
+            commands.extend([Command::Focus { wid }, Command::Raise { wid }]);
+        }
+        self.apply(commands);
+    }
+
     /// Largest visible tiled frame on the active workspace, used to keep the
     /// startup tree balanced.
     fn largest_tile(&self) -> Option<WindowId> {
@@ -1937,10 +2022,14 @@ impl Core {
         for clamp in clamps {
             self.handle_clamp(clamp, 0);
         }
-        // StackChanged is only emitted when the stack identity changes; a work
-        // area change or a re-tile can move the stack without a new command, so
-        // re-sync the tab bar after every batch.  The applier de-duplicates.
-        if let Err(error) = self.applier.sync_stack_bar(self.layout.active_stack()) {
+        // A re-tile after a clamp can move a stack without a new command, so
+        // re-sync the tab bars after every batch.  The applier de-duplicates.
+        self.sync_stack_bars();
+    }
+
+    /// Send the layout's tab bars to the applier (it skips unchanged ones).
+    fn sync_stack_bars(&mut self) {
+        if let Err(error) = self.applier.sync_stack_bars(self.layout.visible_stacks()) {
             log::debug!("tab bar update failed: {error}");
         }
     }
@@ -2170,7 +2259,7 @@ impl Core {
 /// - the **last** `Focus` only; every `Raise`/`Unfocus` is dropped except the
 ///   last `Raise` of that finally focused window;
 /// - `Hide`, `Show`, `Close` and `ActivateWorkspace` in their original order;
-/// - the **last** `StackChanged` only.
+/// - the **last** `StacksChanged` only.
 fn compact_commands(commands: Vec<Command>) -> Vec<Command> {
     let final_focus = commands.iter().rev().find_map(|command| match command {
         Command::Focus { wid } => Some(*wid),
@@ -2190,7 +2279,7 @@ fn compact_commands(commands: Vec<Command>) -> Vec<Command> {
                 final_focus == Some(*wid) && !std::mem::replace(&mut raise_kept, true)
             }
             Command::Unfocus => false,
-            Command::StackChanged { .. } => !std::mem::replace(&mut stack_kept, true),
+            Command::StacksChanged { .. } => !std::mem::replace(&mut stack_kept, true),
             Command::Hide { .. }
             | Command::Show { .. }
             | Command::Close { .. }
@@ -2226,7 +2315,9 @@ fn command_window(command: &Command) -> Option<WindowId> {
         | Command::Show { wid }
         | Command::Focus { wid }
         | Command::Close { wid } => Some(*wid),
-        Command::Unfocus | Command::ActivateWorkspace { .. } | Command::StackChanged { .. } => None,
+        Command::Unfocus | Command::ActivateWorkspace { .. } | Command::StacksChanged { .. } => {
+            None
+        }
     }
 }
 
@@ -2268,7 +2359,7 @@ mod tests {
         Close(WindowId),
         Park(WindowId, Rect),
         Unpark(WindowId),
-        StackBar(Option<StackInfo>),
+        StackBars(Vec<StackInfo>),
         DropHint(Option<DropHint>),
     }
 
@@ -2671,8 +2762,12 @@ mod tests {
                 .filter(rules::is_shell_window)
                 .collect()
         }
-        fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()> {
-            self.state.lock().unwrap().calls.push(Call::StackBar(stack));
+        fn set_stack_bars(&self, stacks: Vec<StackInfo>) -> PlatformResult<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(Call::StackBars(stacks));
             Ok(())
         }
         fn set_drop_hint(&self, hint: Option<DropHint>) -> PlatformResult<()> {
@@ -3013,15 +3108,16 @@ mod tests {
             tabs: Vec::new(),
             active: 0,
             frame: Rect::new(0.0, 0.0, 10.0, 10.0),
+            focused: false,
         };
         let compacted = compact_commands(vec![
             Command::ActivateWorkspace { index: 2 },
             Command::Hide { wid: 3 },
-            Command::StackChanged { stack: None },
+            Command::StacksChanged { stacks: Vec::new() },
             Command::Show { wid: 4 },
             Command::Close { wid: 5 },
-            Command::StackChanged {
-                stack: Some(stack.clone()),
+            Command::StacksChanged {
+                stacks: vec![stack.clone()],
             },
             Command::Hide { wid: 4 },
             Command::ActivateWorkspace { index: 1 },
@@ -3033,7 +3129,9 @@ mod tests {
                 Command::Hide { wid: 3 },
                 Command::Show { wid: 4 },
                 Command::Close { wid: 5 },
-                Command::StackChanged { stack: Some(stack) },
+                Command::StacksChanged {
+                    stacks: vec![stack]
+                },
                 Command::Hide { wid: 4 },
                 Command::ActivateWorkspace { index: 1 },
             ]
@@ -3740,7 +3838,7 @@ mod tests {
             backend
                 .calls()
                 .iter()
-                .any(|call| matches!(call, Call::StackBar(Some(_)))),
+                .any(|call| matches!(call, Call::StackBars(stacks) if !stacks.is_empty())),
             "{:?}",
             backend.calls()
         );
@@ -3749,7 +3847,7 @@ mod tests {
         assert_eq!(core.request(Request::Restore), Response::Ok);
         let calls = backend.calls();
         assert!(
-            calls[marker..].contains(&Call::StackBar(None)),
+            calls[marker..].contains(&Call::StackBars(Vec::new())),
             "the tab bar must be hidden after restore: {calls:?}"
         );
         assert!(core.layout().windows().is_empty());
@@ -4273,7 +4371,7 @@ mod tests {
                 | Call::Close(w)
                 | Call::Park(w, _)
                 | Call::Unpark(w) => *w == wid,
-                Call::StackBar(_) | Call::DropHint(_) => false,
+                Call::StackBars(_) | Call::DropHint(_) => false,
             })
             .cloned()
             .collect()
@@ -5599,7 +5697,7 @@ mod tests {
         assert!(
             calls[marker..]
                 .iter()
-                .any(|call| matches!(call, Call::StackBar(Some(_)))),
+                .any(|call| matches!(call, Call::StackBars(stacks) if !stacks.is_empty())),
             "the tab bar shows: {calls:?}"
         );
         // A late move of the drag is checked again once it has settled.
@@ -5797,5 +5895,284 @@ mod tests {
             backend.calls()[marker..],
             [Call::DropHint(None), Call::SetFrame(1, one)]
         );
+    }
+
+    // --- tab-bar clicks ----------------------------------------------------------------------
+
+    /// Windows 1..=`count` on screen, with each of `stacks` stacked onto its
+    /// first window, in order (the last window of the last stack is focused).
+    fn with_stacks(
+        count: u64,
+        stacks: &[&[WindowId]],
+    ) -> (Core, Arc<TestBackend>, tempfile::TempDir) {
+        let wids: Vec<WindowId> = (1..=count).rev().collect();
+        let (mut core, backend, dir) = started(&wids);
+        for stack in stacks {
+            for wid in &stack[1..] {
+                let commands = core.layout.stack_onto(*wid, stack[0]);
+                assert!(!commands.is_empty(), "{wid} stacks onto {}", stack[0]);
+                core.apply(commands);
+            }
+        }
+        (core, backend, dir)
+    }
+
+    /// The visible stack holding `wid`, and its bar.
+    fn bar_of(core: &Core, wid: WindowId) -> (StackInfo, Rect) {
+        let stack = core
+            .layout()
+            .visible_stacks()
+            .into_iter()
+            .find(|stack| stack.tabs.iter().any(|tab| tab.wid == wid))
+            .unwrap_or_else(|| panic!("window {wid} is in no visible stack"));
+        let bar = tabs::bar_frame(stack.frame);
+        (stack, bar)
+    }
+
+    /// A press at `(x, y)` in the bar of the stack holding `wid`.
+    fn press(core: &mut Core, wid: WindowId, (x, y): (f64, f64)) {
+        core.bar_click(BarClick { x, y, stack: wid });
+    }
+
+    /// The middle of tab `index` (left of its close glyph) in the bar of the
+    /// stack holding `wid`.
+    fn tab_point(core: &Core, wid: WindowId, index: usize) -> (f64, f64) {
+        let (stack, bar) = bar_of(core, wid);
+        let span = tabs::tab_span(bar.width, stack.tabs.len(), index);
+        let point = (bar.x + span.x + span.width / 3.0, bar.y + bar.height / 2.0);
+        assert_eq!(
+            tabs::hit_test(bar, stack.tabs.len(), point.0, point.1),
+            Some(BarHit::Tab(index))
+        );
+        point
+    }
+
+    /// The close glyph of tab `index` in the bar of the stack holding `wid`.
+    fn close_point(core: &Core, wid: WindowId, index: usize) -> (f64, f64) {
+        let (stack, bar) = bar_of(core, wid);
+        let span = tabs::tab_span(bar.width, stack.tabs.len(), index);
+        let point = (bar.x + span.close_x(), bar.y + bar.height / 2.0);
+        assert_eq!(
+            tabs::hit_test(bar, stack.tabs.len(), point.0, point.1),
+            Some(BarHit::Close(index))
+        );
+        point
+    }
+
+    fn last_bars(calls: &[Call]) -> Vec<StackInfo> {
+        calls
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                Call::StackBars(stacks) => Some(stacks.clone()),
+                _ => None,
+            })
+            .expect("a tab-bar update")
+    }
+
+    fn tab_wids(stack: &StackInfo) -> Vec<WindowId> {
+        stack.tabs.iter().map(|tab| tab.wid).collect()
+    }
+
+    #[test]
+    fn a_click_on_a_tab_activates_and_focuses_its_window() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        assert_eq!(core.layout().focused(), Some(3));
+        let tile = core.layout().frame_of(3).unwrap();
+        let marker = backend.calls().len();
+
+        let point = tab_point(&core, 3, 0);
+        press(&mut core, 3, point);
+
+        assert_eq!(core.layout().focused(), Some(1));
+        let stack = core.layout().active_stack().unwrap();
+        assert_eq!((tab_wids(&stack), stack.active), (vec![1, 2, 3], 0));
+        let calls = backend.calls();
+        assert!(
+            calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Park(3, _))),
+            "{calls:?}"
+        );
+        assert!(calls[marker..].contains(&Call::Unpark(1)), "{calls:?}");
+        assert!(calls[marker..].contains(&Call::Focus(1)), "{calls:?}");
+        assert_eq!(backend.frame(1), Some(tile), "shown in the stack's frame");
+        let bars = last_bars(&calls[marker..]);
+        assert_eq!(bars.len(), 1);
+        assert_eq!((bars[0].active, bars[0].focused), (0, true));
+        // The active tab again: only focused again, nothing moves.
+        let marker = backend.calls().len();
+        press(&mut core, 1, point);
+        assert_eq!(backend.calls()[marker..], [Call::Focus(1)]);
+    }
+
+    #[test]
+    fn a_click_on_a_tabs_close_glyph_closes_that_window() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        // The active tab closes as it is.
+        let marker = backend.calls().len();
+        let point = close_point(&core, 3, 2);
+        press(&mut core, 3, point);
+        assert_eq!(backend.calls()[marker..], [Call::Close(3)]);
+
+        // A hidden tab is shown first, so a save sheet would be visible.
+        let marker = backend.calls().len();
+        let point = close_point(&core, 3, 1);
+        press(&mut core, 3, point);
+        let calls = backend.calls();
+        let focus = calls[marker..]
+            .iter()
+            .position(|call| *call == Call::Focus(2));
+        let close = calls[marker..]
+            .iter()
+            .position(|call| *call == Call::Close(2));
+        assert!(
+            focus.is_some() && focus < close,
+            "focus, then close: {:?}",
+            &calls[marker..]
+        );
+        assert!(!calls[marker..].contains(&Call::Close(3)));
+        // Closing is the app's business: the layout keeps the window until it
+        // is reported gone.
+        assert_eq!(tab_wids(&core.layout().active_stack().unwrap()), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_click_on_the_empty_bar_focuses_the_stacks_active_window() {
+        let (mut core, backend, _dir) = with_stacks(3, &[&[1, 2]]);
+        core.action(Action::FocusWindow { wid: 3 });
+        assert_eq!(core.layout().focused(), Some(3));
+        let (stack, bar) = bar_of(&core, 2);
+        let point = (bar.right() - 5.0, bar.y + bar.height / 2.0);
+        assert_eq!(
+            tabs::hit_test(bar, stack.tabs.len(), point.0, point.1),
+            Some(BarHit::Empty),
+            "two tabs leave room in {bar:?}"
+        );
+        assert!(!stack.focused);
+        let marker = backend.calls().len();
+
+        press(&mut core, 1, point);
+
+        assert_eq!(core.layout().focused(), Some(2));
+        let calls = backend.calls();
+        assert!(calls[marker..].contains(&Call::Focus(2)), "{calls:?}");
+        assert!(
+            !calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Park(..) | Call::Unpark(_))),
+            "the active tab stays: {calls:?}"
+        );
+        assert!(last_bars(&calls[marker..])[0].focused);
+    }
+
+    #[test]
+    fn a_click_on_the_focused_window_still_focuses_it() {
+        // The layout has 2 focused; macOS may not (an app chose another key
+        // window), so a click re-sends the focus.
+        let (mut core, backend, _dir) = with_stacks(3, &[&[1, 2]]);
+        core.action(Action::FocusWindow { wid: 2 });
+        assert_eq!(core.layout().focused(), Some(2));
+        let (_, bar) = bar_of(&core, 2);
+        let empty = (bar.right() - 5.0, bar.y + bar.height / 2.0);
+        let active_tab = tab_point(&core, 2, 1);
+
+        for point in [empty, active_tab] {
+            let marker = backend.calls().len();
+            press(&mut core, 1, point);
+            let calls = backend.calls();
+            assert!(calls[marker..].contains(&Call::Focus(2)), "{calls:?}");
+            assert_eq!(core.layout().focused(), Some(2));
+        }
+    }
+
+    #[test]
+    fn a_click_on_another_stacks_tab_moves_the_focus_there() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2], &[3, 4]]);
+        assert_eq!(core.layout().focused(), Some(4));
+        assert_eq!(core.layout().visible_stacks().len(), 2);
+        let marker = backend.calls().len();
+
+        let point = tab_point(&core, 1, 0);
+        press(&mut core, 2, point);
+
+        assert_eq!(core.layout().focused(), Some(1));
+        let calls = backend.calls();
+        assert!(
+            calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Park(2, _)))
+        );
+        assert!(calls[marker..].contains(&Call::Unpark(1)));
+        assert!(calls[marker..].contains(&Call::Focus(1)));
+        let mut bars: Vec<_> = last_bars(&calls[marker..])
+            .iter()
+            .map(|stack| (tab_wids(stack), stack.active, stack.focused))
+            .collect();
+        bars.sort();
+        assert_eq!(bars, [(vec![1, 2], 0, true), (vec![3, 4], 1, false)]);
+    }
+
+    #[test]
+    fn a_click_that_matches_no_current_bar_does_nothing() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        let point = tab_point(&core, 3, 0);
+        let marker = backend.calls().len();
+        // A window in no stack, a point below the bar, a point beside it.
+        press(&mut core, 4, point);
+        press(&mut core, 99, point);
+        let (_, bar) = bar_of(&core, 3);
+        press(&mut core, 3, (point.0, bar.bottom() + 5.0));
+        press(&mut core, 3, (bar.right() + 5.0, point.1));
+        assert_eq!(backend.calls()[marker..], []);
+        assert_eq!(core.layout().focused(), Some(3));
+    }
+
+    #[test]
+    fn tab_bars_hide_and_ignore_clicks_on_a_full_screen_space() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        let point = tab_point(&core, 3, 0);
+        let marker = backend.calls().len();
+        core.platform_event(space_changed(9, true));
+        assert_eq!(
+            last_bars(&backend.calls()[marker..]),
+            [],
+            "no bar on the full-screen Space"
+        );
+        let marker = backend.calls().len();
+        press(&mut core, 3, point);
+        let calls = backend.calls();
+        assert!(
+            !calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Focus(_) | Call::Park(..) | Call::Unpark(_))),
+            "{calls:?}"
+        );
+        assert_eq!(core.layout().focused(), Some(3));
+        // A re-order on the full-screen Space keeps them hidden.
+        core.window_ordered(3);
+        assert_eq!(last_bars(&backend.calls()), []);
+
+        core.platform_event(space_changed(1, false));
+        let bars = last_bars(&backend.calls());
+        assert_eq!(bars.len(), 1, "the bars are back on the desktop");
+        press(&mut core, 3, point);
+        assert_eq!(core.layout().focused(), Some(1));
+    }
+
+    #[test]
+    fn re_ordering_any_stacks_visible_window_re_sends_the_bars() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2], &[3, 4]]);
+        let marker = backend.calls().len();
+        // 2 is the visible window of the unfocused stack.
+        core.window_ordered(2);
+        let calls = backend.calls();
+        assert_eq!(calls[marker..].len(), 1, "{calls:?}");
+        assert_eq!(last_bars(&calls[marker..]).len(), 2);
+        // A hidden tab or a plain window: nothing.
+        let marker = backend.calls().len();
+        core.window_ordered(1);
+        core.window_ordered(3);
+        assert_eq!(backend.calls()[marker..], []);
     }
 }

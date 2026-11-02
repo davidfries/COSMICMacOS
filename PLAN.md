@@ -226,7 +226,7 @@ windows between them, Super+Q closes; quitting the daemon restores every window.
    menu to switch workspaces and toggle tiling. The WM keeps its shell-strip reservation
    (`reserve.rs`) for a possible COSMIC dock later. `crates/cosmic-mac-panel` remains as Spike A
    reference code.
-   **Status (2026-11-01): implemented, host-tested, VM check pending.** `crates/cosmic-mac-status`
+   **Status (2026-11-01): implemented and verified in the VM.** `crates/cosmic-mac-status`
    is a separate AppKit process (Accessory policy, no Dock icon) that subscribes to the WM over
    IPC (`Request::Subscribe`, a stream of `ShellState` lines), sends menu actions as one-shot
    requests and reconnects with backoff when the WM is down. It runs as the

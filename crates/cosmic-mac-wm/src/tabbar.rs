@@ -1,27 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Stack tab-bar overlay.
+//! Stack tab-bar overlays.
 //!
 //! The platform crate's [`cosmic_mac_platform::OverlayWindow`] can fill and
 //! stroke, but it does not expose its `CGContext` or a text primitive.  Rather
 //! than modify another agent's crate, this module redeclares the handful of
-//! SkyLight functions needed for a raw overlay window and draws the tab bar
+//! SkyLight functions needed for a raw overlay window and draws the tab bars
 //! with Core Graphics + Core Text, following the same JankyBorders technique
 //! documented in `docs/SKYLIGHT.md`.
 //!
-//! The bar lives on its own thread because a raw SkyLight window belongs to the
-//! connection that created it.  The daemon sends it the current
-//! [`StackInfo`] whenever the focused stack or its frame changes.
+//! The bars live on their own thread because a raw SkyLight window belongs to
+//! the connection that created it.  The daemon sends the thread every stack
+//! that should have a bar ([`TabBarHandle::update`]); each gets an overlay
+//! from a pool, ordered just above the stack's visible window.  An overlay
+//! keeps the stack it showed when it can (`assign_slots`); one left over is
+//! ordered out and kept for the next stack.  The active tab of the focused
+//! stack is drawn in the accent, that of any other stack in a muted accent.
+//! Tab geometry comes from [`crate::tabs`], which the click handling uses too.
 //!
-//! Milestone 1 is display-only: tab hit-testing and the close button's click
-//! handling need a cursor tap, which is milestone-2 work.  The close glyph is
-//! drawn for affordance only.
+//! The overlays ignore events.  The thread publishes the bars it shows (after
+//! ordering them in or out) to a [`SharedBars`] snapshot
+//! ([`TabBarHandle::shown_bars`]); the click tap takes a press only where a
+//! bar is really shown, and hands it to the core.
 //!
 //! Colours come from [`TabBarPalette`]: COSMIC's default dark or light theme,
 //! with the user's COSMIC accent when configured, for the mode resolved by
 //! [`cosmic_mac_protocol::theme`] (COSMIC's `com.system76.CosmicTheme.Mode`,
-//! else the macOS appearance).  The thread resolves it when it shows the bar
-//! and, while the bar is visible, every [`THEME_RECHECK`]; a change redraws
-//! the visible bar.  Polling covers both sources (a file and a global
+//! else the macOS appearance).  The thread resolves it when it shows bars
+//! and, while any bar is visible, every [`THEME_RECHECK`]; a change redraws
+//! the visible bars.  Polling covers both sources (a file and a global
 //! default) without a run-loop observer or a file watcher in the daemon.
 //!
 //! The same thread draws the drag-to-stack highlight ([`DropHint`]): a
@@ -30,13 +36,14 @@
 //! ordered just above the target window.
 
 use std::ffi::c_int;
-use std::sync::mpsc;
+use std::sync::{Arc, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 use cosmic_mac_protocol::theme::{self, Mode, Rgba, TabBarPalette};
-use cosmic_mac_protocol::{Rect, STACK_BAR_HEIGHT, StackInfo};
+use cosmic_mac_protocol::{Rect, StackInfo, WindowId};
 
 use crate::backend::DropHint;
+use crate::tabs::{self, SharedBars, ShownBar};
 use objc2_core_foundation::{
     CFAttributedString, CFDictionary, CFPreferencesAppSynchronize, CFPreferencesCopyAppValue,
     CFRetained, CFString, CFType, CGAffineTransform, CGPoint, CGRect, CGSize,
@@ -46,8 +53,6 @@ use objc2_core_graphics::CGContext;
 use objc2_core_text::{CTFont, CTLine, kCTFontAttributeName, kCTForegroundColorAttributeName};
 
 const SKYLIGHT_PATH: &str = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight";
-const TAB_MAX_WIDTH: f64 = 220.0;
-const TAB_MIN_WIDTH: f64 = 56.0;
 const OVERLAY_TAGS: u64 = (1u64 << 1) | (1u64 << 9);
 const ORDER_ABOVE: c_int = 1;
 /// How long a resolved theme is trusted: a visible bar re-resolves it this
@@ -62,8 +67,8 @@ const HINT_STROKE_ALPHA: f64 = 0.9;
 
 /// What the daemon sends the tab-bar thread.
 enum Update {
-    /// The focused stack; `None` hides the bar.
-    Stack(Option<StackInfo>),
+    /// The stacks to show bars for; every other bar is hidden.
+    Stacks(Vec<StackInfo>),
     /// The drag-to-stack highlight; `None` hides it.
     Hint(Option<DropHint>),
 }
@@ -71,18 +76,21 @@ enum Update {
 /// Handle to the tab-bar thread.
 pub struct TabBarHandle {
     tx: mpsc::Sender<Update>,
+    shown: SharedBars,
 }
 
 impl TabBarHandle {
     /// Start the tab-bar thread.  Returns an error when SkyLight is unavailable
-    /// or the overlay window cannot be created; the daemon then runs without a
-    /// tab bar instead of failing.
+    /// or the thread cannot start; the daemon then runs without tab bars
+    /// instead of failing.
     pub fn spawn() -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let shown: SharedBars = Arc::new(RwLock::new(Vec::new()));
+        let thread_shown = shown.clone();
         std::thread::Builder::new()
             .name("stack-tab-bar".into())
-            .spawn(move || match TabBar::new() {
+            .spawn(move || match TabBar::new(thread_shown) {
                 Ok(mut bar) => {
                     let _ = ready_tx.send(Ok(()));
                     bar.run(rx);
@@ -93,16 +101,16 @@ impl TabBarHandle {
             })
             .map_err(|error| format!("cannot start tab-bar thread: {error}"))?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(TabBarHandle { tx }),
+            Ok(Ok(())) => Ok(TabBarHandle { tx, shown }),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(format!("tab-bar thread died during startup: {error}")),
         }
     }
 
-    /// Update the bar.  `None` hides it.
-    pub fn update(&self, stack: Option<StackInfo>) -> Result<(), String> {
+    /// Show a bar for each of `stacks` and hide every other one.
+    pub fn update(&self, stacks: Vec<StackInfo>) -> Result<(), String> {
         self.tx
-            .send(Update::Stack(stack))
+            .send(Update::Stacks(stacks))
             .map_err(|_| "tab-bar thread stopped".to_string())
     }
 
@@ -112,12 +120,106 @@ impl TabBarHandle {
             .send(Update::Hint(hint))
             .map_err(|_| "tab-bar thread stopped".to_string())
     }
+
+    /// The bars on screen, kept current by the thread (for the click tap).
+    pub fn shown_bars(&self) -> SharedBars {
+        self.shown.clone()
+    }
+}
+
+/// One overlay of the pool.
+struct Bar {
+    overlay: Overlay,
+    /// The stack it shows; `None` while it is ordered out.
+    stack: Option<StackInfo>,
+    /// The stack and palette it last drew, to skip identical redraws.
+    drawn: Option<(StackInfo, TabBarPalette)>,
+}
+
+impl Bar {
+    /// Show `stack`: move and order the overlay above the stack's visible
+    /// window, and draw it unless it already shows exactly this.  On failure
+    /// the overlay is ordered out, so a published bar is always on screen.
+    fn show(&mut self, stack: StackInfo, palette: &TabBarPalette) -> Result<(), String> {
+        let result = self.try_show(&stack, palette);
+        match result {
+            Ok(()) => self.stack = Some(stack),
+            Err(_) => self.hide(),
+        }
+        result
+    }
+
+    fn try_show(&mut self, stack: &StackInfo, palette: &TabBarPalette) -> Result<(), String> {
+        let frame = tabs::bar_frame(stack.frame);
+        log::debug!(
+            "tab bar {}: stack frame {:?} -> bar {:?}, {} tabs, active {}, focused {}",
+            self.overlay.wid,
+            stack.frame,
+            frame,
+            stack.tabs.len(),
+            stack.active,
+            stack.focused
+        );
+        let moved = self.overlay.set_frame(frame)?;
+        let was_shown = self.stack.is_some();
+        let active = stack.active_tab().map(|tab| tab.wid).unwrap_or(0);
+        self.overlay.order_above(active as u32)?;
+        let same = self
+            .drawn
+            .as_ref()
+            .is_some_and(|(drawn, drawn_palette)| drawn == stack && drawn_palette == palette);
+        if moved || !was_shown || !same {
+            self.overlay.draw(stack, palette)?;
+            self.drawn = Some((stack.clone(), *palette));
+        }
+        Ok(())
+    }
+
+    fn hide(&mut self) {
+        if self.stack.take().is_some()
+            && let Err(error) = self.overlay.hide()
+        {
+            log::warn!("hiding tab bar {} failed: {error}", self.overlay.wid);
+        }
+    }
+}
+
+/// Which pool slot shows each of `stacks`.  `previous[slot]` holds the
+/// windows that slot showed (`None`: ordered out).  A stack keeps the slot of
+/// a stack it shares a window with, so bars stay with their stacks; the rest
+/// take a free slot (ordered out first); `None` means a new overlay.
+fn assign_slots(previous: &[Option<Vec<WindowId>>], stacks: &[StackInfo]) -> Vec<Option<usize>> {
+    let mut taken = vec![false; previous.len()];
+    let mut slots = vec![None; stacks.len()];
+    for (stack, slot) in stacks.iter().zip(slots.iter_mut()) {
+        let same = previous.iter().enumerate().position(|(index, shown)| {
+            !taken[index]
+                && shown
+                    .as_ref()
+                    .is_some_and(|wids| stack.tabs.iter().any(|tab| wids.contains(&tab.wid)))
+        });
+        if let Some(index) = same {
+            taken[index] = true;
+            *slot = Some(index);
+        }
+    }
+    for slot in slots.iter_mut().filter(|slot| slot.is_none()) {
+        let free = (0..previous.len())
+            .filter(|index| !taken[*index])
+            .min_by_key(|index| previous[*index].is_some());
+        if let Some(index) = free {
+            taken[index] = true;
+            *slot = Some(index);
+        }
+    }
+    slots
 }
 
 struct TabBar {
-    overlay: Option<Overlay>,
-    /// The stack the visible bar shows, for a redraw after a theme change.
-    shown: Option<StackInfo>,
+    /// Bar overlays; the ordered-out ones wait for the next stack.
+    pool: Vec<Bar>,
+    /// What the click tap sees: the bars on screen.
+    shown: SharedBars,
     theme: ThemeWatch,
     /// The drop highlight's window, kept (ordered out) between drags.
     hint: Option<Overlay>,
@@ -126,20 +228,24 @@ struct TabBar {
 }
 
 impl TabBar {
-    fn new() -> Result<Self, String> {
+    fn new(shown: SharedBars) -> Result<Self, String> {
         Ok(TabBar {
-            overlay: None,
-            shown: None,
+            pool: Vec::new(),
+            shown,
             theme: ThemeWatch::new(),
             hint: None,
             hint_visible: false,
         })
     }
 
+    fn any_shown(&self) -> bool {
+        self.pool.iter().any(|bar| bar.stack.is_some())
+    }
+
     fn run(&mut self, rx: mpsc::Receiver<Update>) {
         loop {
-            // Only a visible bar wakes up to re-check the theme.
-            let update = if self.overlay.is_some() {
+            // Only visible bars wake up to re-check the theme.
+            let update = if self.any_shown() {
                 match rx.recv_timeout(self.theme.until_next(Instant::now())) {
                     Ok(update) => update,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -157,8 +263,7 @@ impl TabBar {
                 }
             };
             let result = match update {
-                Update::Stack(None) => self.hide(),
-                Update::Stack(Some(stack)) => self.show(stack),
+                Update::Stacks(stacks) => self.show_stacks(stacks),
                 Update::Hint(None) => self.hide_hint(),
                 Update::Hint(Some(hint)) => self.show_hint(hint),
             };
@@ -166,7 +271,7 @@ impl TabBar {
                 log::warn!("tab bar update failed: {error}");
             }
         }
-        let _ = self.hide();
+        let _ = self.show_stacks(Vec::new());
         let _ = self.hide_hint();
     }
 
@@ -196,50 +301,103 @@ impl TabBar {
         }
     }
 
-    /// Re-resolves the theme and redraws the visible bar if it changed.
+    /// Re-resolves the theme and redraws the visible bars if it changed.
     fn recheck_theme(&mut self) -> Result<(), String> {
         if !self.theme.refresh(Instant::now(), resolve_palette) {
             return Ok(());
         }
-        match (&self.overlay, &self.shown) {
-            (Some(overlay), Some(stack)) => overlay.draw(stack, &self.theme.palette),
-            _ => Ok(()),
+        let palette = self.theme.palette;
+        let mut errors = Vec::new();
+        for bar in &mut self.pool {
+            if let Some(stack) = &bar.stack {
+                match bar.overlay.draw(stack, &palette) {
+                    Ok(()) => bar.drawn = Some((stack.clone(), palette)),
+                    Err(error) => errors.push(error),
+                }
+            }
         }
+        joined(errors)
     }
 
-    fn hide(&mut self) -> Result<(), String> {
-        self.shown = None;
-        if let Some(overlay) = self.overlay.take() {
-            overlay.hide()?;
+    /// Show a bar for each of `stacks`, order out the rest, and publish what
+    /// is on screen.
+    fn show_stacks(&mut self, stacks: Vec<StackInfo>) -> Result<(), String> {
+        if !stacks.is_empty() {
+            self.theme.refresh(Instant::now(), resolve_palette);
         }
+        let previous: Vec<Option<Vec<WindowId>>> = self
+            .pool
+            .iter()
+            .map(|bar| {
+                bar.stack
+                    .as_ref()
+                    .map(|stack| stack.tabs.iter().map(|tab| tab.wid).collect())
+            })
+            .collect();
+        let slots = assign_slots(&previous, &stacks);
+        // Order out first, so a bar is never on screen twice in a moment.
+        for (index, bar) in self.pool.iter_mut().enumerate() {
+            if !slots.contains(&Some(index)) {
+                bar.hide();
+            }
+        }
+        let palette = self.theme.palette;
+        let mut errors = Vec::new();
+        for (stack, slot) in stacks.into_iter().zip(slots) {
+            let index = match slot {
+                Some(index) => index,
+                None => match Overlay::new(tabs::bar_frame(stack.frame)) {
+                    Ok(overlay) => {
+                        self.pool.push(Bar {
+                            overlay,
+                            stack: None,
+                            drawn: None,
+                        });
+                        self.pool.len() - 1
+                    }
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                },
+            };
+            if let Err(error) = self.pool[index].show(stack, &palette) {
+                errors.push(error);
+            }
+        }
+        self.publish();
+        joined(errors)
+    }
+
+    /// Tell the click tap which bars are on screen.
+    fn publish(&self) {
+        let shown: Vec<ShownBar> = self
+            .pool
+            .iter()
+            .filter_map(|bar| {
+                let stack = bar.stack.as_ref()?;
+                Some(ShownBar {
+                    overlay: bar.overlay.wid,
+                    frame: bar.overlay.frame,
+                    stack: stack.active_tab()?.wid,
+                })
+            })
+            .collect();
+        log::debug!("tab bars on screen: {shown:?}");
+        // A poisoned lock only means a panic elsewhere; the data is replaced whole.
+        *self
+            .shown
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = shown;
+    }
+}
+
+/// `Ok` when `errors` is empty, else all of them in one message.
+fn joined(errors: Vec<String>) -> Result<(), String> {
+    if errors.is_empty() {
         Ok(())
-    }
-
-    fn show(&mut self, stack: StackInfo) -> Result<(), String> {
-        self.theme.refresh(Instant::now(), resolve_palette);
-        let result = self.show_stack(&stack);
-        self.shown = Some(stack);
-        result
-    }
-
-    fn show_stack(&mut self, stack: &StackInfo) -> Result<(), String> {
-        let frame = bar_frame(stack.frame);
-        log::debug!(
-            "tab bar: stack frame {:?} -> bar {:?}, {} tabs, active {}",
-            stack.frame,
-            frame,
-            stack.tabs.len(),
-            stack.active
-        );
-        if self.overlay.is_none() {
-            self.overlay = Some(Overlay::new(frame)?);
-        }
-        let overlay = self.overlay.as_mut().expect("overlay just created");
-        overlay.set_frame(frame)?;
-        let active = stack.active_tab().map(|tab| tab.wid).unwrap_or(0);
-        overlay.order_above(active as u32)?;
-        overlay.draw(stack, &self.theme.palette)?;
-        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -313,19 +471,42 @@ struct TabColors {
     close: Rgba,
 }
 
-fn tab_colors(palette: &TabBarPalette, active: bool) -> TabColors {
-    if active {
-        TabColors {
+/// How a tab is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabState {
+    /// Not the stack's active tab.
+    Inactive,
+    /// The active tab of the focused stack.
+    Active,
+    /// The active tab of a stack without the focus.
+    ActiveUnfocused,
+}
+
+fn tab_state(stack: &StackInfo, index: usize) -> TabState {
+    match (index == stack.active, stack.focused) {
+        (false, _) => TabState::Inactive,
+        (true, true) => TabState::Active,
+        (true, false) => TabState::ActiveUnfocused,
+    }
+}
+
+fn tab_colors(palette: &TabBarPalette, state: TabState) -> TabColors {
+    match state {
+        TabState::Active => TabColors {
             fill: palette.tab_active,
             text: palette.text_active,
             close: palette.text_active,
-        }
-    } else {
-        TabColors {
+        },
+        TabState::ActiveUnfocused => TabColors {
+            fill: palette.tab_active_unfocused,
+            text: palette.text,
+            close: palette.close,
+        },
+        TabState::Inactive => TabColors {
             fill: palette.tab_inactive,
             text: palette.text,
             close: palette.close,
-        }
+        },
     }
 }
 
@@ -360,15 +541,6 @@ fn set_fill(context: &CGContext, color: Rgba) {
         color.blue,
         color.alpha,
     );
-}
-
-fn bar_frame(frame: Rect) -> Rect {
-    let width = frame.width.max(TAB_MIN_WIDTH);
-    let height = STACK_BAR_HEIGHT;
-    // The bar sits directly above the active member's frame.  Layout reserves
-    // that strip inside the stack's tile, so no neighbouring window can occupy
-    // it and the member's own title bar stays visible below the tabs.
-    Rect::new(frame.x, frame.y - height, width, height)
 }
 
 struct Overlay {
@@ -409,9 +581,10 @@ impl Overlay {
         Ok(overlay)
     }
 
-    fn set_frame(&mut self, frame: Rect) -> Result<(), String> {
+    /// Move and reshape the window; returns whether the frame changed.
+    fn set_frame(&mut self, frame: Rect) -> Result<bool, String> {
         if frame == self.frame {
-            return Ok(());
+            return Ok(false);
         }
         let region = ffi::region(frame)?;
         let result = ffi::set_shape(self.cid, self.wid, region);
@@ -419,7 +592,8 @@ impl Overlay {
         unsafe { ffi::cf_release(region) };
         result?;
         self.frame = frame;
-        self.move_to(frame)
+        self.move_to(frame)?;
+        Ok(true)
     }
 
     fn move_to(&self, frame: Rect) -> Result<(), String> {
@@ -457,31 +631,31 @@ impl Overlay {
         set_fill(context, palette.background);
         CGContext::fill_rect(Some(context), bounds);
 
-        let count = stack.tabs.len().max(1);
-        let tab_width = (self.frame.width / count as f64).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
+        let count = stack.tabs.len();
         for (index, tab) in stack.tabs.iter().enumerate() {
-            let x = index as f64 * tab_width;
+            // The same geometry the click handling hit-tests against.
+            let span = tabs::tab_span(self.frame.width, count, index);
             let tab_rect = CGRect::new(
-                CGPoint::new(x + 1.0, 1.0),
+                CGPoint::new(span.x + 1.0, 1.0),
                 CGSize::new(
-                    (tab_width - 2.0).max(1.0),
+                    (span.width - 2.0).max(1.0),
                     (self.frame.height - 2.0).max(1.0),
                 ),
             );
-            let colors = tab_colors(palette, index == stack.active);
+            let colors = tab_colors(palette, tab_state(stack, index));
             set_fill(context, colors.fill);
             CGContext::fill_rect(Some(context), tab_rect);
             draw_close_glyph(
                 context,
-                x + tab_width - 12.0,
+                span.close_x(),
                 self.frame.height / 2.0,
                 colors.close,
             );
-            let title = shorten(&tab.title, tab_width);
+            let title = shorten(&tab.title, span.width);
             draw_text(
                 context,
                 &title,
-                x + 8.0,
+                span.x + 8.0,
                 self.frame.height / 2.0,
                 11.0,
                 colors.text,
@@ -644,7 +818,7 @@ mod tests {
     fn active_tab_uses_the_accent() {
         for palette in [TabBarPalette::DARK, TabBarPalette::LIGHT] {
             assert_eq!(
-                tab_colors(&palette, true),
+                tab_colors(&palette, TabState::Active),
                 TabColors {
                     fill: palette.tab_active,
                     text: palette.text_active,
@@ -652,7 +826,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                tab_colors(&palette, false),
+                tab_colors(&palette, TabState::Inactive),
                 TabColors {
                     fill: palette.tab_inactive,
                     text: palette.text,
@@ -660,6 +834,86 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn an_unfocused_stacks_active_tab_is_muted() {
+        for palette in [TabBarPalette::DARK, TabBarPalette::LIGHT] {
+            assert_eq!(
+                tab_colors(&palette, TabState::ActiveUnfocused),
+                TabColors {
+                    fill: palette.tab_active_unfocused,
+                    text: palette.text,
+                    close: palette.close,
+                }
+            );
+        }
+    }
+
+    fn stack(wids: &[WindowId], active: usize, focused: bool) -> StackInfo {
+        StackInfo {
+            workspace: 1,
+            tabs: wids
+                .iter()
+                .map(|wid| cosmic_mac_protocol::TabInfo {
+                    wid: *wid,
+                    title: format!("window {wid}"),
+                })
+                .collect(),
+            active,
+            frame: Rect::new(0.0, 51.0, 800.0, 600.0),
+            focused,
+        }
+    }
+
+    #[test]
+    fn only_the_focused_stacks_active_tab_is_active() {
+        let focused = stack(&[1, 2, 3], 1, true);
+        let states: Vec<_> = (0..3).map(|index| tab_state(&focused, index)).collect();
+        assert_eq!(
+            states,
+            [TabState::Inactive, TabState::Active, TabState::Inactive]
+        );
+        let other = stack(&[4, 5], 0, false);
+        assert_eq!(tab_state(&other, 0), TabState::ActiveUnfocused);
+        assert_eq!(tab_state(&other, 1), TabState::Inactive);
+    }
+
+    #[test]
+    fn bars_keep_their_stacks_slots() {
+        let one = stack(&[1, 2], 0, true);
+        let two = stack(&[3, 4], 0, false);
+        // Nothing shown yet: every stack needs a new overlay.
+        assert_eq!(assign_slots(&[], &[one.clone(), two.clone()]), [None, None]);
+        // Same stacks, listed the other way round: each keeps its slot.
+        let previous = [Some(vec![1, 2]), Some(vec![3, 4])];
+        assert_eq!(
+            assign_slots(&previous, &[two.clone(), one.clone()]),
+            [Some(1), Some(0)]
+        );
+        // A stack that gained or lost a tab is still the same stack.
+        let grown = stack(&[3, 4, 5], 2, true);
+        assert_eq!(assign_slots(&previous, &[grown]), [Some(1)]);
+    }
+
+    #[test]
+    fn new_stacks_reuse_ordered_out_bars_first() {
+        let new = stack(&[7, 8], 0, true);
+        // Slot 0 shows a stack that is gone, slot 1 is ordered out.
+        let previous = [Some(vec![1, 2]), None];
+        assert_eq!(
+            assign_slots(&previous, std::slice::from_ref(&new)),
+            [Some(1)]
+        );
+        // Two new stacks take both; a third needs a new overlay.
+        let other = stack(&[9, 10], 0, false);
+        let third = stack(&[11, 12], 0, false);
+        assert_eq!(
+            assign_slots(&previous, &[new, other, third]),
+            [Some(1), Some(0), None]
+        );
+        // No stacks: no slot is used (the caller orders every bar out).
+        assert_eq!(assign_slots(&previous, &[]), Vec::<Option<usize>>::new());
     }
 
     #[test]
@@ -682,14 +936,16 @@ mod tests {
 
     #[test]
     fn tab_colors_follow_the_mode() {
-        let dark = tab_colors(&TabBarPalette::DARK, false);
-        let light = tab_colors(&TabBarPalette::LIGHT, false);
+        let dark = tab_colors(&TabBarPalette::DARK, TabState::Inactive);
+        let light = tab_colors(&TabBarPalette::LIGHT, TabState::Inactive);
         assert!(dark.fill.luminance() < light.fill.luminance());
         assert!(dark.text.luminance() > light.text.luminance());
-        assert_ne!(
-            tab_colors(&TabBarPalette::DARK, true).fill,
-            tab_colors(&TabBarPalette::LIGHT, true).fill
-        );
+        for state in [TabState::Active, TabState::ActiveUnfocused] {
+            assert_ne!(
+                tab_colors(&TabBarPalette::DARK, state).fill,
+                tab_colors(&TabBarPalette::LIGHT, state).fill
+            );
+        }
     }
 
     #[test]

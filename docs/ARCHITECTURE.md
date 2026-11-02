@@ -91,7 +91,7 @@ Command order is fixed:
 3. `Show` for windows that became visible (sorted by window id),
 4. `SetFrame` for changed frames (sorted by window id),
 5. `Focus` + `Raise` (or `Unfocus`),
-6. `StackChanged` (tab-bar update, `None` hides the bar).
+6. `StacksChanged` (tab-bar update: every visible stack; empty hides the bars).
 
 ### 3.2 Tiling tree
 
@@ -172,11 +172,14 @@ A stack is a first-class leaf, not a group of hidden windows:
 * Only the active member is visible. `Layout::sync` emits `Hide` for members that become
   inactive and `Show` + `SetFrame` for the newly active member. The daemon parks hidden
   members with the corner-park mechanism.
-* `Layout::active_stack()` / `Layout::stacks()` expose tab titles, the active index and the
-  frame so the daemon can draw the tab bar. `StackInfo.frame` is the visible member's frame,
-  below the bar; the bar is drawn directly above it. A maximized stacked window gets the work
-  area minus the strip, so the bar stays visible. `Command::StackChanged` is emitted when the
-  focused stack changes; `None` hides the bar.
+* `Layout::active_stack()` / `Layout::stacks()` expose tab titles, the active index, the
+  frame and whether the stack has the focus (`StackInfo.focused`) so the daemon can draw the
+  tab bars. `StackInfo.frame` is the visible member's frame, below the bar; the bar is drawn
+  directly above it. A maximized stacked window gets the work area minus the strip, so the
+  bar stays visible. `Layout::visible_stacks()` is every stack on the active workspace, or
+  only the maximized window's own stack while one is maximized; `Command::StacksChanged`
+  carries it whenever it changes (composition, active tab, frames, focus, workspace switch).
+  An empty list hides every bar.
 * Drag to stack: `Layout::drop_zone(wid, x, y)` names the tile whose middle third (both
   axes, cosmic-comp's stack region) holds the point; `wid`'s own tile is never a target and
   a stack is one target. `Layout::stack_onto(wid, target)` takes `wid` out of its tile or
@@ -307,11 +310,11 @@ pub enum Command {
     Unfocus,
     Close { wid },
     ActivateWorkspace { index },
-    StackChanged { stack: Option<StackInfo> },
+    StacksChanged { stacks: Vec<StackInfo> },
 }
 ```
 
-`Unfocus` and `StackChanged` are additions beyond the minimum in `PLAN.md`: the former clears
+`Unfocus` and `StacksChanged` are additions beyond the minimum in `PLAN.md`: the former clears
 keyboard focus when switching to an empty workspace, the latter lets the daemon drive the
 stack tab-bar overlay without polling layout state.
 
@@ -353,7 +356,9 @@ The daemon translates each `Command` into platform operations:
   `SLPSPostEventRecordTo`), falling back to activation;
 * `Close` — AX close button / terminate;
 * `ActivateWorkspace` — update the display's visible workspace, panel state and journal;
-* `StackChanged` — create/position/hide the tab-bar overlay, a 26 pt strip directly above the active member's frame.
+* `StacksChanged` — show, move or hide one tab-bar overlay per stack, a 26 pt strip directly
+  above each stack's active member's frame. The overlays ignore events; an active click tap
+  takes the presses on them (§6).
 
 The layout engine assumes the platform can move windows to arbitrary global frames and that
 parked windows are not user-visible. It does not assume anything about z-order beyond
@@ -374,6 +379,14 @@ parked windows are not user-visible. It does not assume anything about z-order b
   `Layout::drop_zone` stacks it with `Layout::stack_onto`, anything else snaps back. Moves
   that arrive just after a release (`DROP_GRACE`, 250 ms) end that drag. While the pointer
   is over a stack zone the tab-bar thread highlights the target tile.
+* **Tab-bar clicks**: the tab-bar thread publishes the bars it shows to a shared snapshot. An
+  active click tap (left down and up only, head of the session tap) swallows a press inside a
+  bar, with its release, when the bar is the topmost window at that point (SkyLight's hit
+  test, ordered below the overlay), and sends `Message::BarClick` to the core; every other
+  press passes. `Core::bar_click` hit-tests the point against the current layout's bars
+  (`tabs::hit_test`, shared with the drawing): a tab → `Action::FocusWindow` on that member
+  (it becomes the active tab), × → `Command::Close` for that member (a hidden member is
+  shown first), the empty part → focus the active member. Ignored on a full-screen Space.
 * **Keybindings**: the daemon loads COSMIC's `keybindings.ron` format (defaults embedded with
   `include_str!`) and maps actions onto `cosmic_mac_protocol::Action`. The intended mapping
   for the default set is:
@@ -490,7 +503,7 @@ These are deliberate and documented so future work can revisit them:
   clamp further when applying `SetFrame`.
 * **Fullscreen** is not a layout action. macOS fullscreen is a native Space transition, so it
   belongs to the platform/daemon; the layout only knows maximize.
-* **`Unfocus` / `StackChanged` commands** are additions for daemon ergonomics (empty
+* **`Unfocus` / `StacksChanged` commands** are additions for daemon ergonomics (empty
   workspace focus clearing and tab-bar updates).
 * **Tests use a seeded LCG**, as permitted by the task, instead of adding `proptest`.
 

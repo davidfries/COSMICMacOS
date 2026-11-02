@@ -148,7 +148,11 @@ fn update_window_title_changes_tab_titles() {
     let commands = harness.layout.update_window(updated);
     let stack = harness.layout.active_stack().unwrap();
     assert_eq!(stack.tabs[0].title, "renamed");
-    assert!(stack_changes(&commands).iter().any(Option::is_some));
+    assert!(
+        stack_changes(&commands)
+            .iter()
+            .any(|stacks| !stacks.is_empty())
+    );
 }
 
 #[test]

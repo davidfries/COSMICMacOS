@@ -32,9 +32,10 @@ pub enum Command {
     Close { wid: WindowId },
     /// The active workspace changed; the daemon updates the display assignment / panel.
     ActivateWorkspace { index: u32 },
-    /// The focused stack changed (composition, active tab, frame) or the tab bar should be
-    /// hidden.  `None` means "no stack is focused".
-    StackChanged { stack: Option<StackInfo> },
+    /// The stacks whose tab bars are on screen changed (composition, active tab, frame,
+    /// focus, workspace).  Every stack on the active workspace, or only the maximized
+    /// window's stack while a window is maximized; empty hides every bar.
+    StacksChanged { stacks: Vec<StackInfo> },
 }
 
 #[cfg(test)]
@@ -63,9 +64,9 @@ mod tests {
     }
 
     #[test]
-    fn stack_changed_round_trip() {
-        let command = Command::StackChanged {
-            stack: Some(StackInfo {
+    fn stacks_changed_round_trip() {
+        let command = Command::StacksChanged {
+            stacks: vec![StackInfo {
                 workspace: 1,
                 tabs: vec![TabInfo {
                     wid: 1,
@@ -73,11 +74,13 @@ mod tests {
                 }],
                 active: 0,
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
-            }),
+                focused: true,
+            }],
         };
-        let json = serde_json::to_string(&command).unwrap();
-        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), command);
-        let none = Command::StackChanged { stack: None };
+        let value = serde_json::to_value(&command).unwrap();
+        assert_eq!(value["command"], "stacks_changed");
+        assert_eq!(serde_json::from_value::<Command>(value).unwrap(), command);
+        let none = Command::StacksChanged { stacks: Vec::new() };
         let json = serde_json::to_string(&none).unwrap();
         assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), none);
     }

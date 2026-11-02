@@ -105,6 +105,17 @@ sl! {
     fn SLSOrderWindow(cid: ConnectionId, wid: WindowId, order: c_int, relative_to: WindowId) -> i32;
     fn SLSMoveWindow(cid: ConnectionId, wid: WindowId, point: *mut CGPoint) -> i32;
     fn SLSWindowIsOrderedIn(cid: ConnectionId, wid: WindowId, ordered: *mut u8) -> i32;
+    // yabai calls it as `(cid, 0, 1, 0, &point, &window_point, &wid, &owner)`.
+    fn SLSFindWindowAndOwner(
+        cid: ConnectionId,
+        filter: WindowId,
+        one: c_int,
+        zero: c_int,
+        point: *mut CGPoint,
+        window_point: *mut CGPoint,
+        wid: *mut WindowId,
+        owner: *mut ConnectionId,
+    ) -> i32;
     fn SLSDisableUpdate(cid: ConnectionId) -> i32;
     fn SLSReenableUpdate(cid: ConnectionId) -> i32;
 
@@ -470,6 +481,34 @@ pub fn window_is_ordered_in(wid: WindowId) -> Result<bool> {
         SLSWindowIsOrderedIn(cid, wid, &mut ordered)?
     })?;
     Ok(ordered != 0)
+}
+
+/// The window the WindowServer would send a click at `point` (global,
+/// top-left origin) to: `None` when there is none.
+///
+/// This is WindowServer's own hit test, so it skips windows that ignore
+/// events (our overlays) and fully transparent ones (the Dock's full-screen
+/// layer).  It does not wait for any application.
+pub fn window_at(point: crate::geometry::Point) -> Result<Option<WindowId>> {
+    let cid = main_connection()?;
+    let mut screen_point = CGPoint::new(point.x, point.y);
+    let mut window_point = CGPoint::default();
+    let mut wid: WindowId = 0;
+    let mut owner: ConnectionId = 0;
+    // SAFETY: valid connection and out-pointers.
+    crate::error::cg_ok("SLSFindWindowAndOwner", unsafe {
+        SLSFindWindowAndOwner(
+            cid,
+            0,
+            1,
+            0,
+            &mut screen_point,
+            &mut window_point,
+            &mut wid,
+            &mut owner,
+        )?
+    })?;
+    Ok((wid != 0).then_some(wid))
 }
 
 /// `SLSSpaceGetType` value of a native full-screen Space.

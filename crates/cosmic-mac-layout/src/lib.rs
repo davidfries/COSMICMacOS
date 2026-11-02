@@ -15,7 +15,7 @@
 //!   Only the active stack member occupies the stack's frame; the others are hidden.
 //! * Every operation mutates the model and then calls [`Layout::sync`], which diffs the
 //!   desired visible state against the last emitted state.  Commands are deterministic and
-//!   ordered: workspace activation, hides, shows, frames, focus, raise, tab bar.
+//!   ordered: workspace activation, hides, shows, frames, focus, raise, tab bars.
 //!
 //! # Example
 //!
@@ -67,7 +67,7 @@ struct Emitted {
     visible: BTreeSet<WindowId>,
     focus: Option<WindowId>,
     workspace: Option<u32>,
-    stack: Option<StackInfo>,
+    stacks: Vec<StackInfo>,
 }
 
 impl Emitted {
@@ -306,39 +306,30 @@ impl Layout {
 
     /// The stack containing the focused window, if any.
     pub fn active_stack(&self) -> Option<StackInfo> {
-        let workspace = &self.workspaces[self.active];
-        let frames = self.workspace_frames(self.active);
-        focused_stack_info(
-            workspace,
-            (self.active + 1) as u32,
-            &frames.visible,
-            &frames.nodes,
-            &self.infos,
-        )
+        self.stacks().into_iter().find(|stack| stack.focused)
     }
 
     /// Every stack in the active workspace.
     pub fn stacks(&self) -> Vec<StackInfo> {
-        let workspace = &self.workspaces[self.active];
         let frames = self.workspace_frames(self.active);
-        workspace
-            .tree
-            .stack_ids()
-            .into_iter()
-            .filter_map(|stack_id| {
-                let stack = workspace.tree.stack(stack_id)?;
-                let frame = stack
-                    .active_window()
-                    .and_then(|wid| frames.visible.get(&wid).copied())
-                    .or_else(|| frames.nodes.get(&stack_id).copied())?;
-                Some(StackInfo {
-                    workspace: (self.active + 1) as u32,
-                    tabs: tabs_for(stack, &self.infos),
-                    active: stack.active,
-                    frame,
-                })
-            })
-            .collect()
+        stack_infos(
+            &self.workspaces[self.active],
+            (self.active + 1) as u32,
+            &frames,
+            &self.infos,
+        )
+    }
+
+    /// The stacks whose tab bars are on screen: every stack in the active workspace, or,
+    /// while a window is maximized over the others, only that window's stack (if any).
+    pub fn visible_stacks(&self) -> Vec<StackInfo> {
+        let frames = self.workspace_frames(self.active);
+        visible_stack_infos(
+            &self.workspaces[self.active],
+            (self.active + 1) as u32,
+            &frames,
+            &self.infos,
+        )
     }
 
     // -------------------------------------------------------------------------------------
@@ -1559,11 +1550,10 @@ impl Layout {
         let focus = self.workspaces[self.active]
             .focus
             .filter(|wid| frames.visible.contains_key(wid));
-        let stack = focused_stack_info(
+        let stacks = visible_stack_infos(
             &self.workspaces[self.active],
             active_index,
-            &frames.visible,
-            &frames.nodes,
+            &frames,
             &self.infos,
         );
 
@@ -1624,11 +1614,11 @@ impl Layout {
             self.emitted.focus = focus;
         }
 
-        if stack != self.emitted.stack {
-            commands.push(Command::StackChanged {
-                stack: stack.clone(),
+        if stacks != self.emitted.stacks {
+            commands.push(Command::StacksChanged {
+                stacks: stacks.clone(),
             });
-            self.emitted.stack = stack;
+            self.emitted.stacks = stacks;
         }
 
         commands
@@ -1833,26 +1823,51 @@ fn tabs_for(stack: &tree::Stack, infos: &BTreeMap<WindowId, ToplevelInfo>) -> Ve
         .collect()
 }
 
-fn focused_stack_info(
+/// Every stack of `workspace`; `focused` marks the one holding the focus.
+fn stack_infos(
     workspace: &Workspace,
     workspace_index: u32,
-    visible: &BTreeMap<WindowId, Rect>,
-    nodes: &BTreeMap<NodeId, Rect>,
+    frames: &WorkspaceFrames,
     infos: &BTreeMap<WindowId, ToplevelInfo>,
-) -> Option<StackInfo> {
-    let focus = workspace.focus?;
-    let (stack_id, _) = workspace.tree.stack_containing(focus)?;
-    let stack = workspace.tree.stack(stack_id)?;
-    let frame = stack
-        .active_window()
-        .and_then(|wid| visible.get(&wid).copied())
-        .or_else(|| nodes.get(&stack_id).copied())?;
-    Some(StackInfo {
-        workspace: workspace_index,
-        tabs: tabs_for(stack, infos),
-        active: stack.active,
-        frame,
-    })
+) -> Vec<StackInfo> {
+    workspace
+        .tree
+        .stack_ids()
+        .into_iter()
+        .filter_map(|stack_id| {
+            let stack = workspace.tree.stack(stack_id)?;
+            let frame = stack
+                .active_window()
+                .and_then(|wid| frames.visible.get(&wid).copied())
+                .or_else(|| frames.nodes.get(&stack_id).copied())?;
+            Some(StackInfo {
+                workspace: workspace_index,
+                tabs: tabs_for(stack, infos),
+                active: stack.active,
+                frame,
+                focused: workspace
+                    .focus
+                    .is_some_and(|focus| stack.windows.contains(&focus)),
+            })
+        })
+        .collect()
+}
+
+/// [`stack_infos`] minus the stacks a maximized window covers: while one is maximized
+/// (and shown), only its own stack keeps a tab bar.
+fn visible_stack_infos(
+    workspace: &Workspace,
+    workspace_index: u32,
+    frames: &WorkspaceFrames,
+    infos: &BTreeMap<WindowId, ToplevelInfo>,
+) -> Vec<StackInfo> {
+    let mut stacks = stack_infos(workspace, workspace_index, frames, infos);
+    if let Some(maximized) = workspace.maximized
+        && frames.visible.contains_key(&maximized.wid)
+    {
+        stacks.retain(|stack| stack.tabs.iter().any(|tab| tab.wid == maximized.wid));
+    }
+    stacks
 }
 
 fn snapshot_node(

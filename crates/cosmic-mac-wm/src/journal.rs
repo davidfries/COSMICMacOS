@@ -599,7 +599,7 @@ mod tests {
         fn windows(&self) -> Vec<ToplevelInfo> {
             Vec::new()
         }
-        fn set_stack_bar(&self, _: Option<StackInfo>) -> Result<(), String> {
+        fn set_stack_bars(&self, _: Vec<StackInfo>) -> Result<(), String> {
             Ok(())
         }
         fn main_work_area(&self) -> Rect {

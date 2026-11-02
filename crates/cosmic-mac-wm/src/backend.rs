@@ -193,8 +193,10 @@ pub trait PlatformBackend: Send + Sync {
     fn shell_windows(&self) -> Vec<ToplevelInfo> {
         Vec::new()
     }
-    /// Show, update or hide the stack tab bar.
-    fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()>;
+    /// Show, update or hide the stack tab bars: one per stack in `stacks`, every other
+    /// bar hidden.  Called again with the same stacks to re-order the bars above their
+    /// windows.
+    fn set_stack_bars(&self, stacks: Vec<StackInfo>) -> PlatformResult<()>;
     /// Show, move or hide the drag-to-stack highlight.  `None` hides it.
     fn set_drop_hint(&self, _hint: Option<DropHint>) -> PlatformResult<()> {
         Ok(())

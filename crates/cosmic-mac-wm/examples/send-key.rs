@@ -10,6 +10,7 @@
 //! send-key --tap-super --hold-ms 600   # too long for a tap: nothing happens
 //! send-key --drag 400,35 1300,500      # drag with the left button (title bar)
 //! send-key --drag 400,35 1300,500 --steps 30 --step-ms 20 --hold-ms 3000
+//! send-key --click 300,38              # left click (a stack tab, say)
 //! ```
 //!
 //! `Super` is Command on macOS (`Cmd`/`Command` are accepted spellings).  The
@@ -33,6 +34,7 @@ const USAGE: &str = "\
 usage: send-key [--dry-run] <chord>
        send-key --tap-super [--hold-ms N]
        send-key --drag X1,Y1 X2,Y2 [--steps N] [--step-ms M] [--hold-ms H]
+       send-key --click X,Y [--hold-ms H]
        send-key --list
 
   <chord>      modifiers and a key joined by '+', e.g. Super+Shift+y, Cmd+Left
@@ -43,6 +45,8 @@ usage: send-key [--dry-run] <chord>
                to X2,Y2 in --steps N (default 20) dragged events --step-ms M
                apart (default 16), wait --hold-ms H (default 100), release;
                prints a millisecond timestamp for each phase
+  --click      press the left button at X,Y (global top-left points), hold
+               --hold-ms H (default 60), release
   --list       print every armed binding with its keycode and modifier mask";
 
 /// Default hold of `--tap-super`.
@@ -54,6 +58,9 @@ const KEY_GAP: Duration = Duration::from_millis(30);
 /// Default hold of `--drag` at the end point before the release.
 const DRAG_HOLD: Duration = Duration::from_millis(100);
 
+/// Default hold of `--click` between press and release.
+const CLICK_HOLD: Duration = Duration::from_millis(60);
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut dry_run = false;
@@ -61,6 +68,7 @@ fn main() -> ExitCode {
     let mut tap_super = false;
     let mut hold = None;
     let mut drag = None;
+    let mut click = None;
     let mut steps = 20u32;
     let mut step_ms = 16u64;
     let mut args_iter = args.iter();
@@ -87,6 +95,13 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            "--click" => match args_iter.next().and_then(|value| parse_point(value)) {
+                Some(point) => click = Some(point),
+                None => {
+                    eprintln!("--click needs a point X,Y\n{USAGE}");
+                    return ExitCode::from(64);
+                }
+            },
             "--steps" => match args_iter.next().map(|value| value.parse::<u32>()) {
                 Some(Ok(value)) if value > 0 => steps = value,
                 _ => {
@@ -116,6 +131,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+    if let Some(point) = click {
+        if chord.is_some() || tap_super || drag.is_some() {
+            eprintln!("--click takes no chord, --tap-super or --drag\n{USAGE}");
+            return ExitCode::from(64);
+        }
+        return post_click(point, hold.unwrap_or(CLICK_HOLD), dry_run);
     }
     if let Some((from, to)) = drag {
         if chord.is_some() || tap_super {
@@ -257,6 +279,31 @@ fn post_drag(
         return ExitCode::FAILURE;
     }
     stamp("up");
+    thread::sleep(KEY_GAP);
+    println!("posted");
+    ExitCode::SUCCESS
+}
+
+/// Posts a left click at `point`: down, a `hold`, up.
+fn post_click(point: Point, hold: Duration, dry_run: bool) -> ExitCode {
+    println!(
+        "click {:.0},{:.0}, hold {} ms",
+        point.x,
+        point.y,
+        hold.as_millis()
+    );
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    if let Err(error) = post_left_mouse(MouseEventKind::Down, point) {
+        eprintln!("Down failed: {error}");
+        return ExitCode::FAILURE;
+    }
+    thread::sleep(hold);
+    if let Err(error) = post_left_mouse(MouseEventKind::Up, point) {
+        eprintln!("Up failed: {error}");
+        return ExitCode::FAILURE;
+    }
     thread::sleep(KEY_GAP);
     println!("posted");
     ExitCode::SUCCESS
