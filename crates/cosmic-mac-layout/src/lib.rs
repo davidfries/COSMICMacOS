@@ -428,8 +428,12 @@ impl Layout {
         }
         self.infos.insert(wid, info);
         let workspace = &mut self.workspaces[self.active];
+        // A stack member's maximize went to the stack when it left
+        // (`window_removed`), so the stack's current state decides, and
+        // `set_focus` hands a maximize back to it.
         if let Some(restore) = slot.maximized
             && workspace.maximized.is_none()
+            && workspace.tree.stack_containing(wid).is_none()
         {
             workspace.maximized = Some(Maximized { wid, restore });
         }
