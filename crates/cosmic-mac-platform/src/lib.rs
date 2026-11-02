@@ -39,7 +39,7 @@ pub mod window;
 pub use display::DisplayInfo;
 pub use error::{PlatformError, Result};
 pub use eventtap::{
-    ClickTap, EventTap, HotkeySpec, KeyEvent, MouseEvent, MouseEventKind, MouseTap,
+    ClickEvent, ClickTap, EventTap, HotkeySpec, KeyEvent, MouseEvent, MouseEventKind, MouseTap,
 };
 pub use geometry::{Point, Rect, Size};
 pub use observers::{PlatformEvent, PlatformObserver};

@@ -588,3 +588,203 @@ fn a_workspace_switch_sends_the_new_workspaces_bars() {
     assert!(changes[0].iter().all(|stack| stack.workspace == 1));
     harness.assert_synced();
 }
+
+/// Maximize window 4 of `two_stacks()` and return the harness with 3's tile frame, which is
+/// where 3 sits when the maximize is not on it.
+fn maximized_second_stack() -> (Harness, Rect) {
+    let mut harness = two_stacks();
+    let tile_frame = harness.frame(3);
+    harness.act(Action::Maximize);
+    let below_bar = Rect::new(0.0, 26.0, 1000.0, 474.0);
+    assert_eq!(harness.frame(4), below_bar);
+    assert_ne!(tile_frame, below_bar);
+    (harness, tile_frame)
+}
+
+/// After switching the maximized stack `[3 4]` to tab 3, the whole stack is still maximized on
+/// it, and a second Maximize un-maximizes instead of re-targeting.
+fn assert_maximize_followed_to_3(mut harness: Harness, tile_frame: Rect) {
+    let below_bar = Rect::new(0.0, 26.0, 1000.0, 474.0);
+    assert_eq!(harness.layout.focused(), Some(3));
+    assert_eq!(harness.frame(3), below_bar);
+    assert!(harness.layout.is_visible(3));
+    assert!(!harness.layout.is_visible(4));
+    assert_eq!(harness.layout.active_stack().unwrap().frame, below_bar);
+    assert_eq!(
+        bar_tabs(&harness.layout.visible_stacks()),
+        [(vec![3, 4], true)]
+    );
+    harness.assert_synced();
+
+    let commands = harness.act(Action::Maximize);
+    assert_eq!(harness.frame(3), tile_frame);
+    assert_eq!(stack_changes(&commands).last().unwrap().len(), 2);
+    assert_eq!(
+        bar_tabs(&harness.layout.visible_stacks()),
+        [(vec![1, 2], false), (vec![3, 4], true)]
+    );
+    harness.assert_synced();
+}
+
+#[test]
+fn maximize_follows_the_stack_to_a_tab_focused_by_window() {
+    let (mut harness, tile_frame) = maximized_second_stack();
+    harness.act(Action::FocusWindow { wid: 3 });
+    assert_maximize_followed_to_3(harness, tile_frame);
+}
+
+#[test]
+fn maximize_follows_the_stack_to_a_tab_focused_by_focus_next() {
+    let (mut harness, tile_frame) = maximized_second_stack();
+    // Focus history is 4, 3, 2, 1.
+    harness.act(Action::FocusNext);
+    assert_maximize_followed_to_3(harness, tile_frame);
+}
+
+#[test]
+fn maximize_follows_the_stack_to_a_tab_focused_by_focus_previous() {
+    let (mut harness, tile_frame) = maximized_second_stack();
+    // Previous walks the history backwards: 1, 2, then 3.  The maximize stays on 4 until the
+    // cycle lands in its stack.
+    harness.act(Action::FocusPrevious);
+    harness.act(Action::FocusPrevious);
+    assert_eq!(harness.layout.focused(), Some(2));
+    assert_eq!(harness.frame(4), Rect::new(0.0, 26.0, 1000.0, 474.0));
+    harness.act(Action::FocusPrevious);
+    assert_maximize_followed_to_3(harness, tile_frame);
+}
+
+#[test]
+fn maximize_follows_the_stack_to_a_tab_focused_externally() {
+    let (mut harness, tile_frame) = maximized_second_stack();
+    let commands = harness.layout.focus_changed(3);
+    harness.platform.apply(&commands);
+    assert_maximize_followed_to_3(harness, tile_frame);
+}
+
+#[test]
+fn maximize_follows_the_stack_back_and_forth() {
+    let (mut harness, _) = maximized_second_stack();
+    harness.act(Action::FocusWindow { wid: 3 });
+    harness.act(Action::FocusWindow { wid: 4 });
+    let below_bar = Rect::new(0.0, 26.0, 1000.0, 474.0);
+    assert_eq!(harness.frame(4), below_bar);
+    assert!(!harness.layout.is_visible(3));
+    assert_eq!(
+        bar_tabs(&harness.layout.visible_stacks()),
+        [(vec![3, 4], true)]
+    );
+    harness.assert_synced();
+}
+
+#[test]
+fn removing_the_maximized_tab_keeps_the_stack_maximized() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    harness.act(Action::ToggleStacking);
+    harness.add();
+    harness.act(Action::ToggleStacking);
+    assert_eq!(harness.shape(), "S[1 2 3]");
+    harness.act(Action::Maximize);
+    harness.remove(3);
+    assert_eq!(harness.shape(), "S[1 2]");
+    let below_bar = Rect::new(0.0, 26.0, 1000.0, 474.0);
+    let stack = harness.layout.active_stack().unwrap();
+    assert_eq!(stack.tabs.len(), 2);
+    let active = stack.tabs[stack.active].wid;
+    assert_eq!(harness.layout.focused(), Some(active));
+    assert_eq!(harness.frame(active), below_bar);
+    harness.assert_synced();
+
+    // The maximize is on the new active tab: one more Maximize clears it.
+    harness.act(Action::Maximize);
+    harness.assert_synced();
+    harness.act(Action::Maximize);
+    assert_eq!(harness.frame(active), below_bar);
+    harness.assert_synced();
+}
+
+#[test]
+fn removing_the_maximized_tab_of_a_pair_maximizes_the_survivor() {
+    let mut harness = two_stacks();
+    let tile_frame = harness.frame(3);
+    harness.act(Action::Maximize);
+    harness.remove(4);
+    assert_eq!(harness.shape(), "H[S[1 2] 3]");
+    // 3 is now a plain window and still maximized over the other stack.
+    harness.assert_frame(3, 0.0, 0.0, 1000.0, 500.0);
+    assert!(harness.layout.visible_stacks().is_empty());
+    harness.assert_synced();
+
+    harness.act(Action::Maximize);
+    assert_ne!(harness.frame(3), Rect::new(0.0, 0.0, 1000.0, 500.0));
+    assert_eq!(harness.frame(3).x, tile_frame.x);
+    assert_eq!(
+        bar_tabs(&harness.layout.visible_stacks()),
+        [(vec![1, 2], false)]
+    );
+    harness.assert_synced();
+}
+
+#[test]
+fn removing_the_maximized_tab_keeps_focus_on_the_maximized_stack() {
+    let mut harness = two_stacks();
+    harness.act(Action::FocusWindow { wid: 2 });
+    harness.act(Action::FocusWindow { wid: 4 });
+    harness.act(Action::Maximize);
+    // 2 is next in the focus history, but it is covered by the maximized stack.
+    harness.remove(4);
+    assert_eq!(harness.layout.focused(), Some(3));
+    harness.assert_frame(3, 0.0, 0.0, 1000.0, 500.0);
+    harness.assert_synced();
+}
+
+#[test]
+fn removing_the_last_maximized_member_leaves_no_stale_maximize() {
+    let (mut harness, _) = maximized_second_stack();
+    harness.remove(4);
+    harness.remove(3);
+    assert_eq!(harness.shape(), "S[1 2]");
+    // Neither 3 nor 4 is left, so nothing stays maximized: the remaining stack is back to its
+    // tile and shows its bar.
+    assert_eq!(
+        bar_tabs(&harness.layout.visible_stacks()),
+        [(vec![1, 2], true)]
+    );
+    harness.assert_synced();
+    // Maximize now maximizes (rather than un-maximizing a stale target).
+    let focused = harness.layout.focused().unwrap();
+    harness.act(Action::Maximize);
+    harness.assert_frame(focused, 0.0, 26.0, 1000.0, 474.0);
+    harness.assert_synced();
+}
+
+#[test]
+fn focusing_another_window_does_not_move_a_plain_maximize() {
+    let mut harness = Harness::new();
+    harness.add();
+    harness.add();
+    harness.add();
+    harness.act(Action::FocusWindow { wid: 1 });
+    harness.act(Action::Maximize);
+    let tile_of_2 = harness.frame(2);
+    harness.act(Action::FocusWindow { wid: 2 });
+    harness.assert_frame(1, 0.0, 0.0, 1000.0, 500.0);
+    assert_eq!(harness.frame(2), tile_of_2);
+    harness.act(Action::FocusNext);
+    harness.act(Action::FocusPrevious);
+    harness.assert_frame(1, 0.0, 0.0, 1000.0, 500.0);
+    assert_eq!(harness.frame(2), tile_of_2);
+    harness.assert_synced();
+}
+
+#[test]
+fn focusing_a_tab_in_another_stack_does_not_move_the_maximize() {
+    let (mut harness, _) = maximized_second_stack();
+    harness.act(Action::FocusWindow { wid: 1 });
+    // The maximize stays on 4; 1 became the active tab of its own stack.
+    assert_eq!(harness.frame(4), Rect::new(0.0, 26.0, 1000.0, 474.0));
+    assert!(harness.layout.is_visible(4));
+    harness.assert_synced();
+}

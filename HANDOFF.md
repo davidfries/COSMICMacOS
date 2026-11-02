@@ -1141,13 +1141,20 @@ in a bar took 0.4–0.9 ms. Evidence: `scratch/tabclick-two-stacks.png`,
   member; both re-send the focus even when the layout already has it, as a
   click on a window does. `Close(i)` closes member i; a hidden member is
   shown and focused first, so a save sheet appears on a visible window.
-- **Seen in the VM, not changed**: a TextEdit window closed through the bar
-  is often still on no Space when its SkyLight destroy arrives, so the core
-  takes it for a window entering native full screen: it is suspended (and
-  forgotten when gone, often within a second) and the focus move that
-  follows a close is not sent, so TextEdit picks its next key window itself.
-  A keyboard close of a tiled window took the normal path in the same
-  session.
+- **Close taken for full screen** (fixed on branch `tabbar-followups`): a
+  TextEdit window closed through the bar was sometimes already on no Space
+  when its SkyLight destroy arrived, so the core took it for a window
+  entering native full screen, suspended it and dropped the focus move.
+  Now a window the core asked to close (`Command::Close`, from × or a
+  keybinding; `CLOSE_EXPECTED_FOR` = 60 s) that is on no Space at its
+  destroy takes the on-desktop path (re-check, then forgotten with the
+  normal focus move). Any other window suspended as full screen that turns
+  out to be gone gets the focus move its suspension held back
+  (`Suspended::held_focus`), unless a focus or activation event came in
+  between, the layout's focus moved, or a full-screen Space is active.
+  Nine bar closes in the VM (2026-11-02) all took the normal path (the
+  window was already gone at its destroy), so the race itself is covered
+  by unit tests only.
 - **Out of scope**: dragging tabs out of the bar, reordering, middle-click,
   hover effects. A transparent full-screen window of another app above
   everything would make the bars unclickable again (the press passes).
@@ -1155,6 +1162,27 @@ in a bar took 0.4–0.9 ms. Evidence: `scratch/tabclick-two-stacks.png`,
   `tests/stacks.rs` (all bars, focused flag, maximize, workspace switch),
   core `bar_click` tests, tab-bar pool and colour tests;
   `cargo test --workspace` 859 passed.
+
+### Tab-bar follow-ups (branch `tabbar-followups`)
+
+- **Double click on ×**: the click tap passes `kCGMouseEventClickState`
+  (`ClickEvent.click_count` → `BarClick.click_count`); `Core::bar_click`
+  ignores a Close whose count is 2 or more, so the second press no longer
+  closes the tab that slid under the pointer. Tab and empty-bar presses are
+  unaffected. `send-key --double-click X,Y` posts counts 1 and 2. VM
+  (2026-11-02): a double click on × of a 3-tab stack closed one window; two
+  single clicks at the same spot (the control) closed two.
+- **Maximize follows the stack's tab** (as in cosmic-comp, where a stack is
+  one maximized element): when a stack's active tab changes (tab click,
+  focus next/previous, focus window, external focus), a maximize on a member
+  of that stack moves to the new tab (`Workspace::activate_stack_tab`).
+  Closing the maximized tab keeps the stack maximized on the next tab (or
+  on the last window left), and the focus goes there rather than to a
+  window the maximized stack covers. Leaving the stack by other means
+  (move to workspace, float) still un-maximizes.
+- Tests: layout `tests/stacks.rs` (12 new), core `bar_click` and
+  destroy/close tests, `tabs.rs` click count; `cargo test --workspace` 884
+  passed. The full VM scenario passed on the new daemon.
 
 ### VM scenario changes (`scripts/vm-test.sh`)
 

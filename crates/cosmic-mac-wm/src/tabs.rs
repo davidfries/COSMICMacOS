@@ -130,16 +130,20 @@ pub struct BarClick {
     pub stack: WindowId,
     /// The windows of the tabs the bar was drawn with ([`ShownBar::tabs`]).
     pub tabs: Vec<WindowId>,
+    /// The press's place in a run of clicks: 2 for the second press of a
+    /// double click; 0 when the event does not say (as 1).
+    pub click_count: u32,
 }
 
-/// The click for a press at `(x, y)`, when it lands in one of `bars` and that
-/// bar is the topmost window there (`topmost(overlay)`; a menu or another
-/// window can cover a bar).  `topmost` is only called for a bar that contains
-/// the point.
+/// The click for a press at `(x, y)` (the `click_count`th of a run of
+/// clicks), when it lands in one of `bars` and that bar is the topmost window
+/// there (`topmost(overlay)`; a menu or another window can cover a bar).
+/// `topmost` is only called for a bar that contains the point.
 pub fn claim(
     bars: &[ShownBar],
     x: f64,
     y: f64,
+    click_count: u32,
     topmost: impl FnOnce(u32) -> bool,
 ) -> Option<BarClick> {
     let bar = bars.iter().find(|bar| bar.frame.contains_point(x, y))?;
@@ -148,6 +152,7 @@ pub fn claim(
         y,
         stack: bar.stack,
         tabs: bar.tabs.clone(),
+        click_count,
     })
 }
 
@@ -278,7 +283,7 @@ mod tests {
         let other = Rect::new(1200.0, 25.0, 500.0, STACK_BAR_HEIGHT);
         let bars = [shown(7, BAR, 11), shown(8, other, 22)];
         let mut asked = None;
-        let click = claim(&bars, 1300.0, 30.0, |overlay| {
+        let click = claim(&bars, 1300.0, 30.0, 1, |overlay| {
             asked = Some(overlay);
             true
         });
@@ -288,20 +293,30 @@ mod tests {
                 x: 1300.0,
                 y: 30.0,
                 stack: 22,
-                tabs: vec![22, 23]
+                tabs: vec![22, 23],
+                click_count: 1,
             })
         );
         assert_eq!(asked, Some(8));
     }
 
     #[test]
+    fn a_claimed_press_keeps_its_click_count() {
+        let bars = [shown(7, BAR, 11)];
+        for count in [0, 1, 2, 3] {
+            let click = claim(&bars, 150.0, 30.0, count, |_| true);
+            assert_eq!(click.map(|click| click.click_count), Some(count));
+        }
+    }
+
+    #[test]
     fn a_covered_bar_or_a_press_elsewhere_is_not_claimed() {
         let bars = [shown(7, BAR, 11)];
-        assert_eq!(claim(&bars, 150.0, 30.0, |_| false), None);
+        assert_eq!(claim(&bars, 150.0, 30.0, 1, |_| false), None);
         assert_eq!(
-            claim(&bars, 150.0, 60.0, |_| panic!("asked outside every bar")),
+            claim(&bars, 150.0, 60.0, 1, |_| panic!("asked outside every bar")),
             None
         );
-        assert_eq!(claim(&[], 150.0, 30.0, |_| panic!("no bars")), None);
+        assert_eq!(claim(&[], 150.0, 30.0, 1, |_| panic!("no bars")), None);
     }
 }

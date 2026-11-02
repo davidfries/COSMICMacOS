@@ -68,7 +68,11 @@
 //! Space or on a full-screen one is suspended as away in full screen instead
 //! of forgotten.  One still on the desktop's Space is most likely a close the
 //! window server has not finished: a re-check forgets it once it is gone (or
-//! suspends it if it left for full screen after all).  Reads that fail in
+//! suspends it if it left for full screen after all).  So is one on no Space
+//! that the core recently asked to close ([`CLOSE_EXPECTED_FOR`]).  A
+//! window suspended as away in full screen that turns out to be gone gets the
+//! focus move its suspension held back, unless something took the focus in
+//! the meantime (`Core::suspend`).  Reads that fail in
 //! the middle of such a transition are retried with **re-checks**: [`Core`]
 //! never sleeps; it queues `(window, delay)` requests ([`Core::take_rechecks`])
 //! that the daemon turns into timers and feeds back through [`Core::recheck`],
@@ -120,7 +124,9 @@
 //! window (a window that has left the stack since is ignored); the empty part
 //! of the bar focuses the stack's active window.  A
 //! click always sends the focus, also to a window the layout has focused
-//! already (`Core::click_focus`).
+//! already (`Core::click_focus`).  The second press of a double click on a
+//! close glyph closes nothing: the next tab has slid under the pointer by
+//! then.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -201,7 +207,24 @@ pub struct Core {
     on_fullscreen_space: bool,
     /// The left button and the drag it drives (drag to stack).
     pointer: Pointer,
+    /// Windows the core asked to close ([`Command::Close`]), and when.  A
+    /// destroy notification for one of them that finds it on no Space is
+    /// taken as its close, not as native full screen.  Kept for
+    /// [`CLOSE_EXPECTED_FOR`], until the window is forgotten.
+    closing: HashMap<WindowId, Instant>,
+    /// Platform focus and activation events seen, of any application (the
+    /// daemon's own included).  Tells whether anything took the focus since
+    /// a suspension held back a focus move ([`HeldFocus`]).
+    focus_events: u64,
 }
+
+/// How long after the core asks a window to close a destroy notification
+/// that finds it on no Space is taken as that close.  Long, because a save
+/// sheet can hold the close back for as long as the user takes.  A window
+/// that enters native full screen within it instead is only suspended a
+/// re-check later ([`RECHECK_DELAYS`]): the re-check suspends a window still
+/// on no Space as away in full screen anyway.
+pub const CLOSE_EXPECTED_FOR: Duration = Duration::from_secs(60);
 
 /// How long after a release that ended no drag a tiled window's move still
 /// counts as that drag's end.  In the VM a quick drag's first move reached
@@ -289,14 +312,28 @@ struct Suspended {
     /// minimized does not resume it: the attribute has not caught up yet.
     minimized_at: Option<Instant>,
     /// It left the desktop Space: it entered native full screen, or SkyLight
-    /// reported it destroyed while the window server still had it.  Such a
-    /// window is re-checked when the active Space changes.
+    /// reported it destroyed while the window server still had it off the
+    /// desktop's Space ([`Core::window_destroyed`]).  Such a window is
+    /// re-checked when the active Space changes.
     fullscreen: bool,
+    /// The focus move its full-screen suspension held back
+    /// ([`Core::suspend`]), sent when it turns out to be gone instead.
+    held_focus: Option<HeldFocus>,
     /// Where it sat in the layout, to put it back there.
     slot: Option<WindowSlot>,
     /// Suspension order: windows suspended together come back in reverse,
     /// so each finds the neighbours its slot names.
     seq: u64,
+}
+
+/// The focus move the layout made when a window was suspended as away in
+/// full screen, which [`Core::suspend`] did not send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldFocus {
+    /// The window the layout focused instead.
+    wid: WindowId,
+    /// [`Core::focus_events`] at the suspension.
+    focus_events: u64,
 }
 
 /// What a fresh read says about a managed window that may be away
@@ -414,6 +451,8 @@ impl Core {
             transition_until: None,
             on_fullscreen_space: false,
             pointer: Pointer::default(),
+            closing: HashMap::new(),
+            focus_events: 0,
         }
     }
 
@@ -585,6 +624,7 @@ impl Core {
             PlatformEvent::WindowTitleChanged { wid, title } => self.title_changed(wid, title),
             PlatformEvent::WindowOrdered { wid } => self.window_ordered(wid),
             PlatformEvent::FocusChanged { wid, pid } => {
+                self.focus_events += 1;
                 if let Some(wid) = wid {
                     self.external_focus(u64::from(wid), captured);
                 } else if let Some(pid) = pid {
@@ -592,6 +632,7 @@ impl Core {
                 }
             }
             PlatformEvent::AppActivated { pid } => {
+                self.focus_events += 1;
                 if let Some(pid) = pid {
                     self.app_activated(pid, captured);
                 }
@@ -779,11 +820,13 @@ impl Core {
 
     /// SkyLight reports a window as destroyed when it closes, and also when it
     /// leaves its Space for a native full-screen one.  Only a window the
-    /// window server no longer has is forgotten.  One that still exists on no
-    /// Space or on a full-screen one is suspended (or stays suspended) with
-    /// its constraints and journal entry, and a re-check follows it.  One
-    /// still on the desktop's Space is most likely closing while the window
-    /// server tears it down: it is left as it is, and a re-check decides.
+    /// window server no longer has is forgotten ([`Core::forget_gone`]).  One
+    /// that still exists on no Space or on a full-screen one is suspended (or
+    /// stays suspended) with its constraints and journal entry, and a
+    /// re-check follows it.  One still on the desktop's Space is most likely
+    /// closing while the window server tears it down, and so is a managed one
+    /// on no Space that the core recently asked to close
+    /// ([`CLOSE_EXPECTED_FOR`]): it is left as it is, and a re-check decides.
     fn window_destroyed(&mut self, wid: u32, captured: Instant) {
         let wid = u64::from(wid);
         self.ignored.remove(&wid);
@@ -800,7 +843,7 @@ impl Core {
         }
         let presence = self.applier.backend().window_presence(wid);
         if presence == WindowPresence::Gone {
-            self.stop_managing(wid);
+            self.forget_gone(wid);
             return;
         }
         if self.pending.contains(&wid) {
@@ -814,6 +857,19 @@ impl Core {
             log::debug!(
                 "window {wid}: destroy notification, but it is still on the desktop's Space; \
                  checking it again later"
+            );
+            self.schedule_recheck(wid);
+            return;
+        }
+        if managed && presence == WindowPresence::Detached && self.close_requested(wid, captured) {
+            // The core asked it to close (the tab bar's close glyph, a
+            // keybinding), and it is on no Space already: seen in the VM
+            // with TextEdit.  Taken for full screen, its close would not move
+            // the focus on.  The re-check forgets it once it is gone, or
+            // suspends it if it is still away.
+            log::debug!(
+                "window {wid}: destroy notification on no Space after the core asked it to \
+                 close; checking it again later"
             );
             self.schedule_recheck(wid);
             return;
@@ -872,6 +928,7 @@ impl Core {
         self.suspended.remove(&wid);
         self.pending.remove(&wid);
         self.rechecks.remove(&wid);
+        self.closing.remove(&wid);
         let commands = if self.layout.window_info(wid).is_some() {
             self.layout.window_removed(wid)
         } else {
@@ -880,6 +937,48 @@ impl Core {
         self.applier.forget_window(wid);
         self.constraints.remove(&wid);
         self.apply(commands);
+    }
+
+    /// Forget a window the window server no longer has
+    /// ([`Core::stop_managing`]).  One suspended as away in full screen was
+    /// closed instead (in full screen, or on no Space when its destroy
+    /// notification came), so the focus move its suspension held back is
+    /// sent now ([`Core::replay_held_focus`]).
+    fn forget_gone(&mut self, wid: WindowId) {
+        let held = self
+            .suspended
+            .get(&wid)
+            .and_then(|suspended| suspended.held_focus);
+        self.stop_managing(wid);
+        if let Some(held) = held {
+            self.replay_held_focus(wid, held);
+        }
+    }
+
+    /// Send the focus move [`Core::suspend`] held back when `gone` left, as
+    /// its close would have, unless something chose the focus since: a focus
+    /// or activation event arrived (the user, or the application picking its
+    /// next key window), the layout's focus moved on, or a full-screen Space
+    /// is active.
+    fn replay_held_focus(&mut self, gone: WindowId, held: HeldFocus) {
+        let target = held.wid;
+        if self.focus_events != held.focus_events
+            || self.on_fullscreen_space
+            || self.layout.focused() != Some(target)
+            || self.layout.window_info(target).is_none()
+        {
+            log::debug!(
+                "window {gone} is gone; the focus moved since it left (or a full-screen Space \
+                 is active), so {target} is not focused for it"
+            );
+            return;
+        }
+        log::debug!("window {gone} is gone; focusing {target}, which the layout moved on to");
+        // The layout's own order ([`Layout::window_removed`]).
+        self.apply(vec![
+            Command::Focus { wid: target },
+            Command::Raise { wid: target },
+        ]);
     }
 
     /// A window was hidden or minimized, according to the platform.
@@ -955,7 +1054,9 @@ impl Core {
     /// A window that left for a full-screen Space keeps the keyboard: the
     /// layout's focus moves on, but no window is focused or raised, since
     /// macOS makes a desktop window key even while its Space is inactive
-    /// (seen in the VM: the next Ctrl+Cmd+F then went to that window).
+    /// (seen in the VM: the next Ctrl+Cmd+F then went to that window).  The
+    /// focus move is remembered ([`Suspended::held_focus`]): a window taken
+    /// for full screen may turn out to be closed ([`Core::forget_gone`]).
     fn suspend(&mut self, wid: WindowId, reason: &str, kind: SuspendKind) {
         let Some(info) = self.layout.window_info(wid).cloned() else {
             return;
@@ -966,7 +1067,15 @@ impl Core {
         );
         let slot = self.layout.slot_of(wid);
         let mut commands = self.layout.window_removed(wid);
+        let mut held_focus = None;
         if kind == SuspendKind::FullScreen {
+            held_focus = commands.iter().find_map(|command| match command {
+                Command::Focus { wid } => Some(HeldFocus {
+                    wid: *wid,
+                    focus_events: self.focus_events,
+                }),
+                _ => None,
+            });
             commands.retain(|command| {
                 !matches!(command, Command::Focus { .. } | Command::Raise { .. })
             });
@@ -980,6 +1089,7 @@ impl Core {
                 app_hidden: kind == SuspendKind::AppHidden,
                 minimized_at: None,
                 fullscreen: kind == SuspendKind::FullScreen,
+                held_focus,
                 slot,
                 seq: self.suspend_seq,
             },
@@ -1256,7 +1366,7 @@ impl Core {
         let presence = self.applier.backend().window_presence(wid);
         if presence == WindowPresence::Gone {
             log::info!("suspended window {wid} is gone; forgetting it");
-            self.stop_managing(wid);
+            self.forget_gone(wid);
             return;
         }
         if self.schedule_recheck(wid) {
@@ -1701,8 +1811,10 @@ impl Core {
     /// the empty part of the bar focuses the stack's active window.  A tab
     /// whose window has left the stack is ignored.  A hidden tab is shown
     /// before it is closed, so a save sheet appears where the user can see
-    /// it.  Ignored while a native full-screen Space is active, like actions
-    /// ([`Core::action`]).
+    /// it.  The second (or later) press of a double click on a close glyph is
+    /// ignored: the first one closed a window, and the next tab slides under
+    /// the pointer.  Ignored while a native full-screen Space is active, like
+    /// actions ([`Core::action`]).
     pub fn bar_click(&mut self, click: BarClick) {
         if self.on_fullscreen_space {
             log::debug!("ignoring a tab-bar click: a native full-screen Space is active");
@@ -1742,6 +1854,15 @@ impl Core {
                 self.click_focus(wid);
             }
             BarHit::Close(index) => {
+                if click.click_count >= 2 {
+                    log::debug!(
+                        "tab bar: close on tab {index} (window {}) is click {} of a run; \
+                         ignoring it",
+                        click.tabs[index],
+                        click.click_count
+                    );
+                    return;
+                }
                 let Some(wid) = drawn(index) else {
                     log::debug!(
                         "tab bar: close on tab {index} (window {}) left the stack",
@@ -2031,6 +2152,8 @@ impl Core {
         if !commands.is_empty() {
             log::debug!("commands: {commands:?}");
         }
+        // A batch is applied through here as well when it ends.
+        self.note_closes(&commands);
         let clamps = self.applier.apply(&commands);
         if let Some(wid) = focused {
             // The focus call can come after a long run of `set_frame` calls in
@@ -2044,6 +2167,38 @@ impl Core {
         // A re-tile after a clamp can move a stack without a new command, so
         // re-sync the tab bars after every batch.  The applier de-duplicates.
         self.sync_stack_bars();
+    }
+
+    /// Remember the windows `commands` close, for their destroy notifications
+    /// ([`Core::close_requested`]), and drop the records that have expired.
+    fn note_closes(&mut self, commands: &[Command]) {
+        if !commands
+            .iter()
+            .any(|command| matches!(command, Command::Close { .. }))
+        {
+            return;
+        }
+        let now = Instant::now();
+        self.closing
+            .retain(|_, asked| now < *asked + CLOSE_EXPECTED_FOR);
+        for command in commands {
+            if let Command::Close { wid } = command {
+                self.closing.insert(*wid, now);
+            }
+        }
+    }
+
+    /// Whether the core asked `wid` to close less than
+    /// [`CLOSE_EXPECTED_FOR`] before `at`.  An expired record is dropped.
+    fn close_requested(&mut self, wid: WindowId, at: Instant) -> bool {
+        let Some(&asked) = self.closing.get(&wid) else {
+            return false;
+        };
+        if at < asked + CLOSE_EXPECTED_FOR {
+            return true;
+        }
+        self.closing.remove(&wid);
+        false
     }
 
     /// Send the layout's tab bars to the applier (it skips unchanged ones).
@@ -5610,6 +5765,236 @@ mod tests {
         assert_tiles_cover(&backend, &[2], WORK_AREA);
     }
 
+    fn focus_calls(calls: &[Call], marker: usize) -> Vec<Call> {
+        calls[marker..]
+            .iter()
+            .filter(|call| matches!(call, Call::Focus(_)))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_window_closed_through_the_tab_bar_and_on_no_space_when_destroyed_is_forgotten() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        core.take_rechecks();
+        assert_eq!(core.layout().focused(), Some(3));
+        let point = close_point(&core, 3, 2);
+        press(&mut core, 3, point);
+        let t0 = Instant::now();
+        let marker = backend.calls().len();
+
+        // Seen in the VM with TextEdit: the window is on no Space by the time
+        // SkyLight reports it destroyed.
+        backend.set_unlisted(3, true);
+        core.platform_event_at(destroyed(3), t0);
+
+        assert!(!core.is_suspended(3), "not taken for full screen");
+        assert!(
+            core.layout().window_info(3).is_some(),
+            "nothing decided yet"
+        );
+        assert_eq!(backend.calls()[marker..], []);
+        assert_eq!(core.take_rechecks(), [(3, RECHECK_DELAYS[0])]);
+
+        // Gone by the re-check: forgotten, and the focus moves on.
+        backend.remove_window(3);
+        core.recheck_at(3, after(t0, 500));
+
+        assert!(!core.is_suspended(3));
+        assert!(core.layout().window_info(3).is_none());
+        let next = core.layout().focused().expect("a window is focused");
+        assert_ne!(next, 3);
+        assert_eq!(focus_calls(&backend.calls(), marker), [Call::Focus(next)]);
+        assert_eq!(core.take_rechecks(), []);
+
+        // No Space transition was taken: a new window is managed at once.
+        backend.add_window(9, START);
+        core.platform_event_at(created(9), after(t0, 600));
+        assert!(core.layout().window_info(9).is_some());
+    }
+
+    #[test]
+    fn a_window_closed_by_a_keybinding_and_on_no_space_when_destroyed_is_forgotten() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.take_rechecks();
+        assert_eq!(core.layout().focused(), Some(1));
+        core.action(Action::Close);
+        assert!(backend.calls().contains(&Call::Close(1)));
+        let t0 = Instant::now();
+        let marker = backend.calls().len();
+
+        backend.set_unlisted(1, true);
+        core.platform_event_at(destroyed(1), t0);
+        assert!(!core.is_suspended(1));
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+
+        backend.remove_window(1);
+        core.recheck_at(1, after(t0, 500));
+
+        assert!(core.layout().window_info(1).is_none());
+        assert_eq!(core.layout().focused(), Some(2));
+        assert_eq!(focus_calls(&backend.calls(), marker), [Call::Focus(2)]);
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+    }
+
+    #[test]
+    fn a_window_the_core_closed_that_still_leaves_for_full_screen_is_suspended() {
+        // On a full-screen Space when its destroy notification arrives.
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.action(Action::Close);
+        backend.set_presence(1, WindowPresence::OnSpace { fullscreen: true });
+        core.platform_event(destroyed(1));
+        assert!(core.is_suspended(1));
+        assert_tiles_cover(&backend, &[2], WORK_AREA);
+
+        // Still on no Space when its re-check runs (the close was cancelled
+        // and the window went to full screen): suspended then.
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.take_rechecks();
+        core.action(Action::Close);
+        let t0 = Instant::now();
+        backend.set_unlisted(1, true);
+        core.platform_event_at(destroyed(1), t0);
+        assert!(!core.is_suspended(1));
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[0])]);
+        let marker = backend.calls().len();
+
+        core.recheck_at(1, after(t0, 500));
+
+        assert!(core.is_suspended(1));
+        assert_eq!(focus_calls(&backend.calls(), marker), []);
+        assert_eq!(core.take_rechecks(), [(1, RECHECK_DELAYS[1])]);
+    }
+
+    #[test]
+    fn a_close_the_core_asked_for_long_ago_does_not_count() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.action(Action::Close);
+        let t0 = Instant::now();
+
+        // The close was cancelled; much later the window enters full screen.
+        backend.set_unlisted(1, true);
+        core.platform_event_at(
+            destroyed(1),
+            t0 + CLOSE_EXPECTED_FOR + Duration::from_secs(1),
+        );
+
+        assert!(core.is_suspended(1));
+    }
+
+    #[test]
+    fn a_window_taken_for_full_screen_that_turns_out_closed_moves_the_focus_on() {
+        // Found gone by its re-check, or by a second destroy notification.
+        for second_destroy in [false, true] {
+            let (mut core, backend, _dir) = started(&[1, 2]);
+            core.take_rechecks();
+            assert_eq!(core.layout().focused(), Some(1));
+            let t0 = Instant::now();
+            let marker = backend.calls().len();
+
+            // Closed with its own button (no close from the core), on no Space
+            // when its destroy notification arrives: taken for full screen.
+            backend.set_unlisted(1, true);
+            core.platform_event_at(destroyed(1), t0);
+            assert!(core.is_suspended(1));
+            assert_eq!(core.layout().focused(), Some(2));
+            assert_eq!(focus_calls(&backend.calls(), marker), []);
+
+            backend.remove_window(1);
+            if second_destroy {
+                core.platform_event_at(destroyed(1), after(t0, 300));
+            } else {
+                core.recheck_at(1, after(t0, 500));
+            }
+
+            assert!(!core.is_suspended(1));
+            assert_eq!(
+                focus_calls(&backend.calls(), marker),
+                [Call::Focus(2)],
+                "second destroy: {second_destroy}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_back_focus_move_is_dropped_once_anything_took_the_focus() {
+        type TakeFocus = fn(&mut Core, WindowId, Instant);
+        let cases: [(&str, TakeFocus); 4] = [
+            // The application picked its next key window (the layout's pick
+            // here, so only the event tells).
+            ("focus event", |core, next, at| {
+                core.platform_event_at(focused_on(next), at)
+            }),
+            // The launcher opened.
+            ("own activation", |core, _, at| {
+                let pid = Some(std::process::id() as i32);
+                core.platform_event_at(PlatformEvent::AppActivated { pid }, at)
+            }),
+            // The user focused another window through the core.
+            ("layout focus", |core, next, _| {
+                let other = if next == 2 { 3 } else { 2 };
+                core.action(Action::FocusWindow { wid: other })
+            }),
+            ("full-screen Space", |core, _, at| {
+                core.platform_event_at(space_changed(5, true), at)
+            }),
+        ];
+        for (case, take_focus) in cases {
+            let (mut core, backend, _dir) = started(&[1, 2, 3]);
+            let t0 = Instant::now();
+            backend.set_unlisted(1, true);
+            core.platform_event_at(destroyed(1), t0);
+            assert!(core.is_suspended(1), "{case}");
+            let next = core.layout().focused().expect("a window is focused");
+            take_focus(&mut core, next, after(t0, 100));
+            let marker = backend.calls().len();
+
+            backend.remove_window(1);
+            core.recheck_at(1, after(t0, 500));
+
+            assert!(!core.is_suspended(1), "{case}");
+            let calls = backend.calls();
+            assert_eq!(focus_calls(&calls, marker), [], "{case}: {calls:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_back_from_full_screen_gets_no_held_back_focus_move() {
+        let (mut core, backend, _dir) = started(&[1, 2]);
+        core.applier.set_debounce(Duration::ZERO);
+        let t0 = Instant::now();
+        // Entering full screen: on no Space when SkyLight reports it destroyed,
+        // then on the full-screen Space.
+        backend.set_unlisted(1, true);
+        core.platform_event_at(destroyed(1), t0);
+        core.platform_event_at(space_changed(5, true), after(t0, 550));
+        backend.set_unlisted(1, false);
+        backend.set_fullscreen(1, true);
+        assert!(core.is_suspended(1));
+        assert_eq!(core.layout().focused(), Some(2));
+
+        // Leaving it: between Spaces when the desktop's Space is active
+        // again, back by its re-check.  Only the window that is back is
+        // focused.
+        let t1 = after(t0, 10_000);
+        backend.set_unlisted(1, true);
+        core.platform_event_at(destroyed(1), t1);
+        core.platform_event_at(space_changed(1, false), after(t1, 500));
+        assert!(core.is_suspended(1));
+        let marker = backend.calls().len();
+        backend.set_unlisted(1, false);
+        backend.set_fullscreen(1, false);
+        core.recheck_at(1, after(t1, 1000));
+        assert!(!core.is_suspended(1));
+        assert_eq!(focus_calls(&backend.calls(), marker), [Call::Focus(1)]);
+
+        // Closed later, like any managed window: one focus move.
+        let marker = backend.calls().len();
+        backend.remove_window(1);
+        core.platform_event_at(destroyed(1), after(t1, 2000));
+        assert_eq!(focus_calls(&backend.calls(), marker), [Call::Focus(2)]);
+    }
+
     // --- drag to stack -----------------------------------------------------------------------
 
     fn mouse(kind: MouseEventKind, (x, y): (f64, f64)) -> MouseEvent {
@@ -5948,8 +6333,14 @@ mod tests {
         (stack, bar)
     }
 
-    /// A press at `(x, y)` in the bar of the stack holding `wid`.
-    fn press(core: &mut Core, wid: WindowId, (x, y): (f64, f64)) {
+    /// A single press at `(x, y)` in the bar of the stack holding `wid`.
+    fn press(core: &mut Core, wid: WindowId, point: (f64, f64)) {
+        press_nth(core, wid, point, 1);
+    }
+
+    /// [`press`] as press `click_count` of a run of clicks (2: the second
+    /// press of a double click).
+    fn press_nth(core: &mut Core, wid: WindowId, (x, y): (f64, f64), click_count: u32) {
         // The tabs the bar shows now; a window in no stack draws nothing.
         let tabs = core
             .layout()
@@ -5962,6 +6353,7 @@ mod tests {
             y,
             stack: wid,
             tabs,
+            click_count,
         });
     }
 
@@ -6066,6 +6458,63 @@ mod tests {
         // Closing is the app's business: the layout keeps the window until it
         // is reported gone.
         assert_eq!(tab_wids(&core.layout().active_stack().unwrap()), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_double_click_on_a_close_glyph_closes_one_window() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        // The first press closes the active tab's window.
+        let marker = backend.calls().len();
+        let point = close_point(&core, 3, 2);
+        press_nth(&mut core, 3, point, 1);
+        assert_eq!(backend.calls()[marker..], [Call::Close(3)]);
+        backend.remove_window(3);
+        core.platform_event(destroyed(3));
+        let stack = core.layout().active_stack().unwrap();
+        assert_eq!(tab_wids(&stack), [1, 2]);
+
+        // The second press of the double click lands on the tab that slid
+        // under the pointer: it closes nothing, nor does a third.
+        let point = close_point(&core, 2, stack.active);
+        let marker = backend.calls().len();
+        press_nth(&mut core, 2, point, 2);
+        press_nth(&mut core, 2, point, 3);
+        let calls = backend.calls();
+        assert!(
+            !calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Close(_))),
+            "{calls:?}"
+        );
+        assert_eq!(tab_wids(&core.layout().active_stack().unwrap()), [1, 2]);
+
+        // A later single click closes it; so does a press that does not say
+        // which click it is (a synthetic event).
+        for count in [1, 0] {
+            let marker = backend.calls().len();
+            press_nth(&mut core, 2, point, count);
+            assert_eq!(backend.calls()[marker..], [Call::Close(2)], "click {count}");
+        }
+    }
+
+    #[test]
+    fn a_double_click_on_a_tab_still_focuses_its_window() {
+        let (mut core, backend, _dir) = with_stacks(4, &[&[1, 2, 3]]);
+        assert_eq!(core.layout().focused(), Some(3));
+        let marker = backend.calls().len();
+
+        let point = tab_point(&core, 3, 0);
+        press_nth(&mut core, 3, point, 2);
+
+        assert_eq!(core.layout().focused(), Some(1));
+        let calls = backend.calls();
+        assert!(calls[marker..].contains(&Call::Focus(1)), "{calls:?}");
+        assert!(
+            !calls[marker..]
+                .iter()
+                .any(|call| matches!(call, Call::Close(_))),
+            "{calls:?}"
+        );
     }
 
     #[test]
@@ -6184,6 +6633,7 @@ mod tests {
             y: point.1,
             stack: 3,
             tabs: drawn,
+            click_count: 1,
         });
 
         let calls = backend.calls();
@@ -6209,6 +6659,7 @@ mod tests {
                 y,
                 stack: 3,
                 tabs: drawn.clone(),
+                click_count: 1,
             });
         }
 
@@ -6239,6 +6690,7 @@ mod tests {
             y: point.1,
             stack: 2,
             tabs: drawn,
+            click_count: 1,
         });
 
         assert!(backend.calls()[marker..].contains(&Call::Focus(3)));

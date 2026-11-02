@@ -220,6 +220,55 @@ fn a_maximized_window_comes_back_maximized() {
     harness.assert_synced();
 }
 
+/// `1 | S[2 3]` with 3, the active tab, maximized.
+fn maximized_stack_tab() -> Harness {
+    let mut harness = three();
+    harness.act(Action::FocusWindow { wid: 3 });
+    harness.act(Action::ToggleStacking);
+    assert_eq!(harness.shape(), "H[1 S[2 3]]");
+    harness.act(Action::Maximize);
+    assert_eq!(harness.frame(3).width, BIG_WORK.width);
+    harness
+}
+
+#[test]
+fn a_maximized_stack_tab_comes_back_to_its_still_maximized_stack() {
+    let mut harness = maximized_stack_tab();
+    let slot = take_out(&mut harness, 3);
+    // The stack stayed maximized on 2 while 3 was away.
+    assert_eq!(harness.frame(2).width, BIG_WORK.width);
+
+    put_back(&mut harness, 3, &slot);
+
+    assert_eq!(harness.layout.focused(), Some(3));
+    assert_eq!(harness.frame(3).width, BIG_WORK.width);
+    assert!(!harness.layout.is_visible(2));
+    harness.assert_synced();
+}
+
+#[test]
+fn a_stack_tab_does_not_re_maximize_a_stack_un_maximized_while_it_was_away() {
+    let mut harness = maximized_stack_tab();
+    let tile = {
+        let mut probe = three();
+        probe.act(Action::FocusWindow { wid: 3 });
+        probe.act(Action::ToggleStacking);
+        probe.frame(3)
+    };
+    let slot = take_out(&mut harness, 3);
+    harness.act(Action::FocusWindow { wid: 2 });
+    harness.act(Action::Maximize);
+    // 2 is alone in its tile now (the stack of two collapsed), back from maximized.
+    assert_eq!(harness.frame(2).x, tile.x);
+    assert_ne!(harness.frame(2).width, BIG_WORK.width);
+
+    put_back(&mut harness, 3, &slot);
+
+    assert_eq!(harness.layout.focused(), Some(3));
+    assert_eq!(harness.frame(3), tile);
+    harness.assert_synced();
+}
+
 #[test]
 fn a_slot_on_another_workspace_adds_the_window_to_the_active_one() {
     let mut harness = three();

@@ -11,6 +11,7 @@
 //! send-key --drag 400,35 1300,500      # drag with the left button (title bar)
 //! send-key --drag 400,35 1300,500 --steps 30 --step-ms 20 --hold-ms 3000
 //! send-key --click 300,38              # left click (a stack tab, say)
+//! send-key --double-click 300,38       # double click (click counts 1 and 2)
 //! ```
 //!
 //! `Super` is Command on macOS (`Cmd`/`Command` are accepted spellings).  The
@@ -23,7 +24,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use cosmic_mac_platform::eventtap::{post_flags_changed, post_left_mouse};
+use cosmic_mac_platform::eventtap::{post_flags_changed, post_left_mouse, post_left_mouse_clicks};
 use cosmic_mac_platform::overlay::post_key;
 use cosmic_mac_platform::{HotkeySpec, MouseEventKind, Point};
 use cosmic_mac_wm::keybindings::{Binding, KeyMap, Modifier};
@@ -35,6 +36,7 @@ usage: send-key [--dry-run] <chord>
        send-key --tap-super [--hold-ms N]
        send-key --drag X1,Y1 X2,Y2 [--steps N] [--step-ms M] [--hold-ms H]
        send-key --click X,Y [--hold-ms H]
+       send-key --double-click X,Y [--hold-ms H]
        send-key --list
 
   <chord>      modifiers and a key joined by '+', e.g. Super+Shift+y, Cmd+Left
@@ -47,6 +49,8 @@ usage: send-key [--dry-run] <chord>
                prints a millisecond timestamp for each phase
   --click      press the left button at X,Y (global top-left points), hold
                --hold-ms H (default 60), release
+  --double-click  two such clicks DOUBLE_CLICK_GAP apart, with click counts
+               1 and 2 (what the window server gives a real double click)
   --list       print every armed binding with its keycode and modifier mask";
 
 /// Default hold of `--tap-super`.
@@ -61,6 +65,10 @@ const DRAG_HOLD: Duration = Duration::from_millis(100);
 /// Default hold of `--click` between press and release.
 const CLICK_HOLD: Duration = Duration::from_millis(60);
 
+/// Pause between the two clicks of `--double-click`, well inside the
+/// default double-click interval.
+const DOUBLE_CLICK_GAP: Duration = Duration::from_millis(80);
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut dry_run = false;
@@ -69,6 +77,7 @@ fn main() -> ExitCode {
     let mut hold = None;
     let mut drag = None;
     let mut click = None;
+    let mut double = false;
     let mut steps = 20u32;
     let mut step_ms = 16u64;
     let mut args_iter = args.iter();
@@ -95,13 +104,18 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            "--click" => match args_iter.next().and_then(|value| parse_point(value)) {
-                Some(point) => click = Some(point),
-                None => {
-                    eprintln!("--click needs a point X,Y\n{USAGE}");
-                    return ExitCode::from(64);
+            "--click" | "--double-click" => {
+                match args_iter.next().and_then(|value| parse_point(value)) {
+                    Some(point) => {
+                        click = Some(point);
+                        double = arg == "--double-click";
+                    }
+                    None => {
+                        eprintln!("{arg} needs a point X,Y\n{USAGE}");
+                        return ExitCode::from(64);
+                    }
                 }
-            },
+            }
             "--steps" => match args_iter.next().map(|value| value.parse::<u32>()) {
                 Some(Ok(value)) if value > 0 => steps = value,
                 _ => {
@@ -137,7 +151,8 @@ fn main() -> ExitCode {
             eprintln!("--click takes no chord, --tap-super or --drag\n{USAGE}");
             return ExitCode::from(64);
         }
-        return post_click(point, hold.unwrap_or(CLICK_HOLD), dry_run);
+        let counts: &[u32] = if double { &[1, 2] } else { &[] };
+        return post_click(point, hold.unwrap_or(CLICK_HOLD), counts, dry_run);
     }
     if let Some((from, to)) = drag {
         if chord.is_some() || tap_super {
@@ -284,10 +299,12 @@ fn post_drag(
     ExitCode::SUCCESS
 }
 
-/// Posts a left click at `point`: down, a `hold`, up.
-fn post_click(point: Point, hold: Duration, dry_run: bool) -> ExitCode {
+/// Posts a left click at `point`: down, a `hold`, up.  With `counts`, one
+/// such click per count, each event carrying that click count; without, a
+/// single click whose count the event leaves unset.
+fn post_click(point: Point, hold: Duration, counts: &[u32], dry_run: bool) -> ExitCode {
     println!(
-        "click {:.0},{:.0}, hold {} ms",
+        "click {:.0},{:.0}, hold {} ms, counts {counts:?}",
         point.x,
         point.y,
         hold.as_millis()
@@ -295,14 +312,28 @@ fn post_click(point: Point, hold: Duration, dry_run: bool) -> ExitCode {
     if dry_run {
         return ExitCode::SUCCESS;
     }
-    if let Err(error) = post_left_mouse(MouseEventKind::Down, point) {
-        eprintln!("Down failed: {error}");
-        return ExitCode::FAILURE;
-    }
-    thread::sleep(hold);
-    if let Err(error) = post_left_mouse(MouseEventKind::Up, point) {
-        eprintln!("Up failed: {error}");
-        return ExitCode::FAILURE;
+    let post = |kind, count: Option<u32>| match count {
+        Some(count) => post_left_mouse_clicks(kind, point, count),
+        None => post_left_mouse(kind, point),
+    };
+    let presses: Vec<Option<u32>> = if counts.is_empty() {
+        vec![None]
+    } else {
+        counts.iter().copied().map(Some).collect()
+    };
+    for (index, count) in presses.into_iter().enumerate() {
+        if index > 0 {
+            thread::sleep(DOUBLE_CLICK_GAP);
+        }
+        if let Err(error) = post(MouseEventKind::Down, count) {
+            eprintln!("Down failed: {error}");
+            return ExitCode::FAILURE;
+        }
+        thread::sleep(hold);
+        if let Err(error) = post(MouseEventKind::Up, count) {
+            eprintln!("Up failed: {error}");
+            return ExitCode::FAILURE;
+        }
     }
     thread::sleep(KEY_GAP);
     println!("posted");
