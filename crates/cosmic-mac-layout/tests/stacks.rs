@@ -204,7 +204,7 @@ fn stacking_emits_hide_for_inactive_member() {
         Some(&cosmic_mac_protocol::Rect::new(0.0, 26.0, 1000.0, 474.0))
     );
     let changes = stack_changes(&commands);
-    assert!(changes.last().unwrap().is_some());
+    assert_eq!(bar_tabs(changes.last().unwrap()), [(vec![1, 2], true)]);
 }
 
 #[test]
@@ -451,5 +451,140 @@ fn unstacking_restores_full_height_tiles() {
     harness.assert_frame(1, 0.0, 0.0, 500.0, 500.0);
     harness.assert_frame(2, 500.0, 0.0, 500.0, 500.0);
     assert_tiles(WORK, &visible_tiles(&harness.layout));
+    harness.assert_synced();
+}
+
+/// Two stacks side by side, `H[S[1 2] S[3 4]]`, with 4 focused.
+fn two_stacks() -> Harness {
+    let mut harness = stacked_pair();
+    harness.add();
+    harness.add();
+    harness.act(Action::ToggleStacking);
+    assert_eq!(harness.shape(), "H[S[1 2] S[3 4]]");
+    assert_eq!(harness.layout.focused(), Some(4));
+    harness
+}
+
+#[test]
+fn every_stack_on_the_workspace_has_a_tab_bar() {
+    let harness = two_stacks();
+    let stacks = harness.layout.visible_stacks();
+    assert_eq!(bar_tabs(&stacks), [(vec![1, 2], false), (vec![3, 4], true)]);
+    assert_eq!(stacks, harness.layout.stacks());
+    assert_eq!(stack_with(&stacks, 1).frame, harness.frame(2));
+    assert_eq!(stack_with(&stacks, 3).frame, harness.frame(4));
+    assert_eq!(
+        harness.layout.active_stack().as_ref(),
+        Some(stack_with(&stacks, 3))
+    );
+    harness.assert_synced();
+}
+
+#[test]
+fn moving_focus_between_stacks_moves_the_focused_flag() {
+    let mut harness = two_stacks();
+    let commands = harness.act(Action::FocusWindow { wid: 1 });
+    let changes = stack_changes(&commands);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        bar_tabs(&changes[0]),
+        [(vec![1, 2], true), (vec![3, 4], false)]
+    );
+    assert_eq!(
+        stack_with(&changes[0], 1).active,
+        0,
+        "tab 1 is the active one now"
+    );
+    assert_eq!(
+        stack_with(&changes[0], 3).active,
+        1,
+        "the other stack keeps its tab"
+    );
+    harness.assert_synced();
+
+    // Focus on a plain window leaves every bar unfocused.
+    harness.act(Action::Unstack);
+    let stacks = harness.layout.visible_stacks();
+    assert_eq!(bar_tabs(&stacks), [(vec![3, 4], false)]);
+    harness.assert_synced();
+}
+
+#[test]
+fn a_change_in_one_stack_resends_every_bar() {
+    let mut harness = two_stacks();
+    let mut renamed = info(1);
+    renamed.title = "renamed".into();
+    let commands = harness.update(renamed);
+    let changes = stack_changes(&commands);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].len(), 2);
+    assert_eq!(stack_with(&changes[0], 1).tabs[0].title, "renamed");
+    // Nothing changed: no bar update.
+    assert!(stack_changes(&harness.act(Action::FocusWindow { wid: 4 })).is_empty());
+}
+
+#[test]
+fn a_maximized_window_keeps_only_its_own_stacks_bar() {
+    let mut harness = two_stacks();
+    let commands = harness.act(Action::Maximize);
+    assert_eq!(
+        bar_tabs(stack_changes(&commands).last().unwrap()),
+        [(vec![3, 4], true)]
+    );
+    assert_eq!(
+        bar_tabs(&harness.layout.visible_stacks()),
+        [(vec![3, 4], true)]
+    );
+    // `stacks` still lists both.
+    assert_eq!(harness.layout.stacks().len(), 2);
+    harness.assert_synced();
+
+    let commands = harness.act(Action::Maximize);
+    assert_eq!(stack_changes(&commands).last().unwrap().len(), 2);
+    harness.assert_synced();
+}
+
+#[test]
+fn a_maximized_plain_window_hides_every_bar() {
+    let mut harness = stacked_pair();
+    harness.add();
+    assert_eq!(harness.shape(), "H[S[1 2] 3]");
+    let commands = harness.act(Action::Maximize);
+    assert_eq!(stack_changes(&commands), [Vec::new()]);
+    assert!(harness.layout.visible_stacks().is_empty());
+    harness.assert_synced();
+    let commands = harness.act(Action::Maximize);
+    assert_eq!(
+        bar_tabs(&stack_changes(&commands)[0]),
+        [(vec![1, 2], false)]
+    );
+    harness.assert_synced();
+}
+
+#[test]
+fn a_workspace_switch_sends_the_new_workspaces_bars() {
+    let mut harness = two_stacks();
+    let commands = harness.act(Action::Workspace { index: 2 });
+    assert_eq!(stack_changes(&commands), [Vec::new()]);
+    harness.assert_synced();
+
+    // A stack on workspace 2.
+    harness.add();
+    harness.add();
+    harness.act(Action::ToggleStacking);
+    assert_eq!(
+        bar_tabs(&harness.layout.visible_stacks()),
+        [(vec![5, 6], true)]
+    );
+    harness.assert_synced();
+
+    let commands = harness.act(Action::Workspace { index: 1 });
+    let changes = stack_changes(&commands);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        bar_tabs(&changes[0]),
+        [(vec![1, 2], false), (vec![3, 4], true)]
+    );
+    assert!(changes[0].iter().all(|stack| stack.workspace == 1));
     harness.assert_synced();
 }

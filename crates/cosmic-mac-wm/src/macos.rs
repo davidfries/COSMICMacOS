@@ -13,6 +13,7 @@ use crate::backend::{
 };
 use crate::rules;
 use crate::tabbar::TabBarHandle;
+use crate::tabs::SharedBars;
 
 /// The production backend.
 pub struct MacPlatform {
@@ -66,6 +67,11 @@ impl MacPlatform {
             *self.work_area.lock().expect("work area poisoned"),
             *self.main_frame.lock().expect("main frame poisoned"),
         )
+    }
+
+    /// The tab bars on screen, for the click tap; `None` without tab bars.
+    pub fn shown_bars(&self) -> Option<SharedBars> {
+        self.tab_bar.as_ref().map(TabBarHandle::shown_bars)
     }
 
     fn info(&self, wid: WindowId) -> Option<ToplevelInfo> {
@@ -219,9 +225,9 @@ impl PlatformBackend for MacPlatform {
             })
     }
 
-    fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()> {
+    fn set_stack_bars(&self, stacks: Vec<StackInfo>) -> PlatformResult<()> {
         match &self.tab_bar {
-            Some(tab_bar) => tab_bar.update(stack),
+            Some(tab_bar) => tab_bar.update(stacks),
             None => Ok(()),
         }
     }

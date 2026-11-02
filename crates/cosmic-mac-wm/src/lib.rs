@@ -15,7 +15,8 @@
 //! * [`daemon`] — the tokio event loop joining platform, keyboard and IPC.
 //! * [`ipc`] / [`shell_state`] — the Unix-socket server and the shell-state
 //!   stream behind `Request::Subscribe` (the menu-bar status item).
-//! * [`macos`] / [`tabbar`] — the real backend and the Core Graphics tab bar.
+//! * [`macos`] / [`tabbar`] — the real backend and the Core Graphics tab bars.
+//! * [`tabs`] — tab-bar geometry and hit-testing, shared by drawing and clicks.
 //! * [`super_tap`] / [`launcher`] — Super-tap detection and the launcher's
 //!   socket client (toggle, or start it on demand).
 
@@ -36,3 +37,4 @@ pub mod session;
 pub mod shell_state;
 pub mod super_tap;
 pub mod tabbar;
+pub mod tabs;

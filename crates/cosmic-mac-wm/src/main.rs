@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cosmic_mac_platform::eventtap::{self, TapHandler};
-use cosmic_mac_platform::{EventTap, KeyEvent, MouseTap, PlatformObserver, ax, display, tcc};
+use cosmic_mac_platform::eventtap::{self, ClickHandler, TapHandler};
+use cosmic_mac_platform::{
+    ClickTap, EventTap, KeyEvent, MouseTap, PlatformObserver, ax, display, tcc, window,
+};
 use cosmic_mac_protocol::{Config, Rect};
 use objc2_app_kit::NSWorkspace;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
@@ -20,6 +22,7 @@ use cosmic_mac_wm::keybindings::{self, KeyMap};
 use cosmic_mac_wm::launcher::{LauncherClient, SocketPort};
 use cosmic_mac_wm::macos::{self, DisplayUpdate, MacPlatform};
 use cosmic_mac_wm::super_tap::{self, SuperTap, TapEvent};
+use cosmic_mac_wm::tabs::{self, SharedBars};
 use cosmic_mac_wm::{daemon, ipc, journal, paths};
 
 fn main() {
@@ -332,7 +335,14 @@ fn start_observers(
     // away in full screen and re-asserts the tiles on every change.
     observer.start_space_observer();
 
-    let tap_thread = spawn_event_tap(tx.clone(), keymap, passthrough, launcher, shutdown)?;
+    let tap_thread = spawn_event_tap(
+        tx.clone(),
+        keymap,
+        passthrough,
+        launcher,
+        backend.shown_bars(),
+        shutdown,
+    )?;
 
     let display_tx = tx.clone();
     display::set_display_change_handler(Arc::new(move || {
@@ -367,12 +377,15 @@ fn start_observers(
 /// startup.
 ///
 /// The listen-only mouse tap for drag to stack shares the thread.  Without it
-/// the daemon still runs; tiled windows then always snap back.
+/// the daemon still runs; tiled windows then always snap back.  So does the
+/// click tap for the tab bars `bars` (none without tab bars); without it the
+/// bars only show the tabs.
 fn spawn_event_tap(
     tx: mpsc::UnboundedSender<Message>,
     keymap: Arc<KeyMap>,
     passthrough: Arc<Vec<String>>,
     launcher: Option<LauncherClient>,
+    bars: Option<SharedBars>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -382,6 +395,7 @@ fn spawn_event_tap(
             // `EventTap::new` adds its source to the *current* run loop, which
             // is this thread's.
             let mouse_tx = tx.clone();
+            let click_tx = tx.clone();
             let handler = key_handler(tx, keymap, passthrough, launcher);
             let tap = match EventTap::new(Vec::new(), handler) {
                 Ok(tap) => tap,
@@ -395,6 +409,11 @@ fn spawn_event_tap(
             }))
             .map_err(|error| log::warn!("mouse tap: {error}; drag to stack is off"))
             .ok();
+            let click = bars.and_then(|bars| {
+                ClickTap::new(click_handler(click_tx, bars))
+                    .map_err(|error| log::warn!("click tap: {error}; tab-bar clicks are off"))
+                    .ok()
+            });
             let _ = ready_tx.send(Ok(()));
             while !shutdown.load(Ordering::SeqCst) {
                 let mode = unsafe { kCFRunLoopDefaultMode };
@@ -404,6 +423,7 @@ fn spawn_event_tap(
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
+            drop(click);
             drop(mouse);
             drop(tap);
         })
@@ -461,6 +481,36 @@ fn key_handler(
         }
         // Swallow both down and up so the app never sees a stuck key.
         true
+    })
+}
+
+/// The click-tap callback: a press on a tab bar that nothing covers goes to
+/// the daemon and is swallowed (with its release), so the click activates
+/// nothing below the bar.  Every other press passes, as does any press
+/// while the daemon is gone or the window-server checks fail.
+fn click_handler(click_tx: mpsc::UnboundedSender<Message>, bars: SharedBars) -> ClickHandler {
+    Box::new(move |point| {
+        let started = Instant::now();
+        let mut checked = None;
+        let click = {
+            let bars = bars.read().unwrap_or_else(|error| error.into_inner());
+            tabs::claim(&bars, point.x, point.y, |overlay| {
+                let topmost = window::overlay_is_topmost_at(overlay, point);
+                checked = Some((overlay, topmost));
+                topmost
+            })
+        };
+        let swallow = click.is_some_and(|click| click_tx.send(Message::BarClick(click)).is_ok());
+        if let Some((overlay, topmost)) = checked {
+            log::debug!(
+                "press at ({:.0}, {:.0}) on bar {overlay}: topmost {topmost}, swallowed \
+                 {swallow} ({:?})",
+                point.x,
+                point.y,
+                started.elapsed()
+            );
+        }
+        swallow
     })
 }
 

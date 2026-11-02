@@ -48,8 +48,10 @@ pub struct CommandApplier {
     programmed: HashMap<WindowId, Programmed>,
     visible: HashSet<WindowId>,
     active_workspace: u32,
-    last_stack: Option<StackInfo>,
-    stack_initialised: bool,
+    last_stacks: Vec<StackInfo>,
+    stacks_initialised: bool,
+    /// Every tab bar stays hidden (a native full-screen Space is active).
+    bars_hidden: bool,
     debounce: Duration,
     /// Clamps discovered while applying the current batch.
     clamps: Vec<ClampNotice>,
@@ -65,8 +67,9 @@ impl CommandApplier {
             programmed: HashMap::new(),
             visible: HashSet::new(),
             active_workspace: 1,
-            last_stack: None,
-            stack_initialised: false,
+            last_stacks: Vec::new(),
+            stacks_initialised: false,
+            bars_hidden: false,
             debounce: DEFAULT_DEBOUNCE,
             clamps: Vec::new(),
         }
@@ -163,7 +166,7 @@ impl CommandApplier {
                 self.active_workspace = *index;
                 Ok(())
             }
-            Command::StackChanged { stack } => self.sync_stack_bar(stack.clone()),
+            Command::StacksChanged { stacks } => self.sync_stack_bars(stacks.clone()),
         }
     }
 
@@ -392,21 +395,33 @@ impl CommandApplier {
         }
     }
 
-    /// Update the tab bar, only calling the backend when something changed.
-    pub fn sync_stack_bar(&mut self, stack: Option<StackInfo>) -> PlatformResult<()> {
-        if self.stack_initialised && self.last_stack == stack {
+    /// Update the tab bars, only calling the backend when something changed.
+    pub fn sync_stack_bars(&mut self, stacks: Vec<StackInfo>) -> PlatformResult<()> {
+        let stacks = self.unless_hidden(stacks);
+        if self.stacks_initialised && self.last_stacks == stacks {
             return Ok(());
         }
-        self.stack_initialised = true;
-        self.last_stack = stack.clone();
-        self.backend.set_stack_bar(stack)
+        self.force_stack_bars(stacks)
     }
 
-    /// Force a tab-bar update (used when the active member is re-ordered).
-    pub fn force_stack_bar(&mut self, stack: Option<StackInfo>) -> PlatformResult<()> {
-        self.stack_initialised = true;
-        self.last_stack = stack.clone();
-        self.backend.set_stack_bar(stack)
+    /// Send the tab bars even when unchanged (an active member was re-ordered and its
+    /// bar must follow it).
+    pub fn force_stack_bars(&mut self, stacks: Vec<StackInfo>) -> PlatformResult<()> {
+        let stacks = self.unless_hidden(stacks);
+        self.stacks_initialised = true;
+        self.last_stacks = stacks.clone();
+        self.backend.set_stack_bars(stacks)
+    }
+
+    /// Keep every tab bar hidden while `hidden` (a native full-screen Space is active:
+    /// the bars belong to the desktop, and the click tap must not take presses where
+    /// they would be).  Takes effect with the next bar update.
+    pub fn set_bars_hidden(&mut self, hidden: bool) {
+        self.bars_hidden = hidden;
+    }
+
+    fn unless_hidden(&self, stacks: Vec<StackInfo>) -> Vec<StackInfo> {
+        if self.bars_hidden { Vec::new() } else { stacks }
     }
 
     /// Restore every frame the daemon ever changed.
@@ -470,7 +485,7 @@ mod tests {
         Unpark(WindowId),
         Forget(WindowId),
         RestoreAll,
-        StackBar(Option<StackInfo>),
+        StackBars(Vec<StackInfo>),
     }
 
     struct MockState {
@@ -627,8 +642,12 @@ mod tests {
             windows.sort_by_key(|window| window.wid);
             windows
         }
-        fn set_stack_bar(&self, stack: Option<StackInfo>) -> PlatformResult<()> {
-            self.state.lock().unwrap().calls.push(Call::StackBar(stack));
+        fn set_stack_bars(&self, stacks: Vec<StackInfo>) -> PlatformResult<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(Call::StackBars(stacks));
             Ok(())
         }
         fn main_work_area(&self) -> Rect {
@@ -663,6 +682,7 @@ mod tests {
             }],
             active: 0,
             frame: rect,
+            focused: true,
         };
         applier.apply(&[
             Command::ActivateWorkspace { index: 2 },
@@ -672,8 +692,8 @@ mod tests {
             Command::Focus { wid: 1 },
             Command::Raise { wid: 1 },
             Command::Close { wid: 1 },
-            Command::StackChanged {
-                stack: Some(stack.clone()),
+            Command::StacksChanged {
+                stacks: vec![stack.clone()],
             },
             Command::Unfocus,
         ]);
@@ -688,7 +708,7 @@ mod tests {
                 Call::Focus(1),
                 Call::Raise(1),
                 Call::Close(1),
-                Call::StackBar(Some(stack)),
+                Call::StackBars(vec![stack]),
             ]
         );
         assert_eq!(backend.frames().get(&1), Some(&rect));
@@ -856,22 +876,27 @@ mod tests {
             }],
             active: 0,
             frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+            focused: false,
         };
-        applier.sync_stack_bar(Some(stack.clone())).unwrap();
-        applier.sync_stack_bar(Some(stack.clone())).unwrap();
-        applier.force_stack_bar(Some(stack.clone())).unwrap();
-        applier.sync_stack_bar(None).unwrap();
+        // The first update is sent even when it is empty.
+        applier.sync_stack_bars(Vec::new()).unwrap();
+        applier.sync_stack_bars(Vec::new()).unwrap();
+        applier.sync_stack_bars(vec![stack.clone()]).unwrap();
+        applier.sync_stack_bars(vec![stack.clone()]).unwrap();
+        applier.force_stack_bars(vec![stack.clone()]).unwrap();
+        applier.sync_stack_bars(Vec::new()).unwrap();
         let bars: Vec<_> = backend
             .calls()
             .into_iter()
-            .filter(|call| matches!(call, Call::StackBar(_)))
+            .filter(|call| matches!(call, Call::StackBars(_)))
             .collect();
         assert_eq!(
             bars,
             vec![
-                Call::StackBar(Some(stack.clone())),
-                Call::StackBar(Some(stack)),
-                Call::StackBar(None),
+                Call::StackBars(Vec::new()),
+                Call::StackBars(vec![stack.clone()]),
+                Call::StackBars(vec![stack]),
+                Call::StackBars(Vec::new()),
             ]
         );
     }

@@ -512,9 +512,10 @@ case "${1:-}" in
         out="$(osascript <<'APPLESCRIPT'
 set output to ""
 tell application "System Events"
+    -- Every process of the name: the scenario runs one TextEdit per document.
     repeat with appName in {"TextEdit", "Terminal"}
-        if exists process appName then
-            tell process appName
+        repeat with proc in (every process whose name is (appName as text))
+            tell proc
                 repeat with w in windows
                     try
                         set p to position of w
@@ -523,7 +524,7 @@ tell application "System Events"
                     end try
                 end repeat
             end tell
-        end if
+        end repeat
     end repeat
 end tell
 return output
@@ -988,6 +989,27 @@ def main():
             fail("windows %s and %s do not share a stack frame" % (wid, target))
         return
 
+    if mode == "tab-point":
+        # tab-point <wid> (reads `tree --json`): "X,Y" a third into <wid>'s tab in its
+        # stack's bar, left of the close glyph (crates/cosmic-mac-wm/src/tabs.rs geometry).
+        wid = int(sys.argv[2])
+        stacks, nodes = [], [read()]
+        while nodes:
+            node = nodes.pop()
+            if node.get("kind") == "stack":
+                stacks.append(node)
+            nodes.extend(node.get("children", []))
+        for stack in stacks:
+            wids = [tab["wid"] for tab in stack["tabs"]]
+            if wid not in wids:
+                continue
+            x, y, width, _ = frame(stack)
+            bar_width = max(width, 56.0)
+            tab = min(max(bar_width / len(wids), 56.0), 220.0)
+            print("%.0f,%.0f" % (x + wids.index(wid) * tab + tab / 3.0, y - 26.0 + 13.0))
+            return
+        fail("window %s is in no stack" % wid)
+
     if mode == "visible":
         want = int(sys.argv[2])
         visible = [
@@ -1198,6 +1220,11 @@ key() {
 drag() {
     run_remote "drag: $1 -> $2" \
         "$REMOTE_SENDKEY --drag $1 $2 --steps 20 --step-ms 16 --hold-ms 300 && sleep 1"
+}
+
+# Click the left button at $1 ("X,Y" global points), then let the daemon act on it.
+click() {
+    run_remote "click: $1" "$REMOTE_SENDKEY --click $1 && sleep 1.5"
 }
 
 snapshot_geometry() {
@@ -1433,6 +1460,17 @@ if (( COUNT >= 2 )) && remote_ok "send-key is deployed" "test -x \"\$HOME/$REMOT
         "stacked-onto $DRAG_WID $DRAG_TARGET"
     assert_windows "the new stack tiles with the other windows" "tiled $((COUNT - 1))"
     screenshot "vm-test-09-drag-stack"
+    # The stack's tab bar takes clicks: each tab shows (and focuses) its window.
+    TAB="$(remote_capture "find the tab of $DRAG_TARGET in the stack's bar" \
+        "$REMOTE_CTL tree --json | python3 $ASSERT tab-point $DRAG_TARGET" "0,0")"
+    click "$TAB"
+    assert_windows "a click on its tab shows $DRAG_TARGET in the stack" \
+        "stacked-onto $DRAG_TARGET $DRAG_WID"
+    TAB="$(remote_capture "find the tab of $DRAG_WID in the stack's bar" \
+        "$REMOTE_CTL tree --json | python3 $ASSERT tab-point $DRAG_WID" "0,0")"
+    click "$TAB"
+    assert_windows "a click on its tab shows $DRAG_WID again" \
+        "stacked-onto $DRAG_WID $DRAG_TARGET"
     action toggle-stacking
     assert_windows "toggle-stacking takes the dropped window out again" "unstacked"
     assert_windows "windows tile again after the unstack" "tiled $COUNT"

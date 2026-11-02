@@ -13,6 +13,8 @@ use crate::backend::SharedBackend;
 use crate::core::Core;
 use crate::ipc;
 use crate::shell_state;
+use crate::tabs::BarClick;
+
 /// A message for the layout owner.
 pub enum Message {
     /// A window/application/display event from the platform observers, with
@@ -25,6 +27,8 @@ pub enum Message {
     /// A left-button event from the listen-only mouse tap, with the time the
     /// tap saw it (drag to stack).
     Mouse(MouseEvent, Instant),
+    /// A press in a stack's tab bar, swallowed by the click tap.
+    BarClick(BarClick),
     /// The main display's work area changed.
     WorkArea(Rect),
     /// An IPC request and the channel for its reply.
@@ -110,6 +114,7 @@ pub async fn run(
             }
             Message::Key(action) => core.action(action),
             Message::Mouse(event, captured) => core.mouse_event_at(event, captured),
+            Message::BarClick(click) => core.bar_click(click),
             Message::WorkArea(rect) => core.set_work_area(rect),
             Message::Ipc(request, response) => {
                 let reply = core.request(request);

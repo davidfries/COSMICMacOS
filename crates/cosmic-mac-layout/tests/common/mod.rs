@@ -48,7 +48,7 @@ pub struct FakePlatform {
     pub hidden: BTreeSet<WindowId>,
     pub focus: Option<WindowId>,
     pub workspace: Option<u32>,
-    pub stack: Option<StackInfo>,
+    pub stacks: Vec<StackInfo>,
     pub closed: Vec<WindowId>,
 }
 
@@ -76,7 +76,7 @@ impl FakePlatform {
                 Command::Unfocus => self.focus = None,
                 Command::Close { wid } => self.closed.push(*wid),
                 Command::ActivateWorkspace { index } => self.workspace = Some(*index),
-                Command::StackChanged { stack } => self.stack = stack.clone(),
+                Command::StacksChanged { stacks } => self.stacks = stacks.clone(),
             }
         }
     }
@@ -210,9 +210,9 @@ impl Harness {
             "platform workspace diverged from layout"
         );
         assert_eq!(
-            self.platform.stack,
-            self.layout.active_stack(),
-            "platform stack diverged from layout"
+            self.platform.stacks,
+            self.layout.visible_stacks(),
+            "platform tab bars diverged from layout"
         );
     }
 }
@@ -322,14 +322,37 @@ pub fn workspace_activations(commands: &[Command]) -> Vec<u32> {
         .collect()
 }
 
-pub fn stack_changes(commands: &[Command]) -> Vec<Option<StackInfo>> {
+pub fn stack_changes(commands: &[Command]) -> Vec<Vec<StackInfo>> {
     commands
         .iter()
         .filter_map(|command| match command {
-            Command::StackChanged { stack } => Some(stack.clone()),
+            Command::StacksChanged { stacks } => Some(stacks.clone()),
             _ => None,
         })
         .collect()
+}
+
+/// The tabs (window ids) of each stack in a bar update with its focused flag, sorted.
+pub fn bar_tabs(stacks: &[StackInfo]) -> Vec<(Vec<WindowId>, bool)> {
+    let mut tabs: Vec<_> = stacks
+        .iter()
+        .map(|stack| {
+            (
+                stack.tabs.iter().map(|tab| tab.wid).collect(),
+                stack.focused,
+            )
+        })
+        .collect();
+    tabs.sort();
+    tabs
+}
+
+/// The stack in `stacks` whose first tab is `wid`.
+pub fn stack_with(stacks: &[StackInfo], wid: WindowId) -> &StackInfo {
+    stacks
+        .iter()
+        .find(|stack| stack.tabs.first().is_some_and(|tab| tab.wid == wid))
+        .unwrap_or_else(|| panic!("no stack starts with window {wid}: {stacks:?}"))
 }
 
 /// Assert that `rects` exactly tile `area` (no overlap, no gaps).
